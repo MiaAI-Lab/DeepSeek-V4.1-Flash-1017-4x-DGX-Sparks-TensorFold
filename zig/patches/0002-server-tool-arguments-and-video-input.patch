@@ -1,0 +1,324 @@
+diff --git a/zig/src/server/hf_text.zig b/zig/src/server/hf_text.zig
+index b7358b41..b99417dd 100644
+--- a/zig/src/server/hf_text.zig
++++ b/zig/src/server/hf_text.zig
+@@ -265,7 +265,9 @@ pub const HfText = struct {
+         } else if (options.reasoning_effort) |e| try context.put(a, "reasoning_effort", .{ .string = e });
+         var diag: template.Diag = .{};
+         const tools: std.json.Value = if (options.tools) |tl| try toStd(a, tl) else .null;
+-        const out = template.render(a, compiled, try toStd(a, messages), tools, .{ .object = context }, options.add_generation_prompt, &diag) catch |e| {
++        const msgs = try toStd(a, messages);
++        parseToolArguments(a, msgs);
++        const out = template.render(a, compiled, msgs, tools, .{ .object = context }, options.add_generation_prompt, &diag) catch |e| {
+             if (e == error.OutOfMemory) return error.OutOfMemory;
+             problem.* = diag.msg;
+             return error.Template;
+@@ -313,3 +315,38 @@ pub fn toStd(a: Allocator, v: Value) Allocator.Error!std.json.Value {
+         },
+     };
+ }
++
++/// Each assistant tool call's `arguments` given as a JSON string (the OpenAI wire form) parsed into its object, in
++/// place, as a model's own encoder does before rendering (DeepSeek-V4.1's encoding.py); a string that is not a JSON
++/// object stays a string. Templates then render the call's parameters, not one parameter holding the whole string.
++fn parseToolArguments(a: Allocator, messages: std.json.Value) void {
++    if (messages != .array) return;
++    for (messages.array.items) |*m| {
++        if (m.* != .object) continue;
++        const calls = m.object.getPtr("tool_calls") orelse continue;
++        if (calls.* != .array) continue;
++        for (calls.array.items) |*call| {
++            if (call.* != .object) continue;
++            const f = call.object.getPtr("function") orelse continue;
++            if (f.* != .object) continue;
++            const args = f.object.getPtr("arguments") orelse continue;
++            if (args.* != .string) continue;
++            const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, args.string, .{}) catch continue;
++            if (parsed == .object) args.* = parsed;
++        }
++    }
++}
++
++test "tool call arguments sent as JSON strings render as objects" {
++    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const v = try std.json.parseFromSliceLeaky(std.json.Value, a,
++        \\[{"role": "assistant", "tool_calls": [{"function": {"name": "f", "arguments": "{\"x\": 1}"}},
++        \\  {"function": {"name": "g", "arguments": "not json"}}]}]
++    , .{});
++    parseToolArguments(a, v);
++    const calls = v.array.items[0].object.get("tool_calls").?.array.items;
++    try std.testing.expect(calls[0].object.get("function").?.object.get("arguments").? == .object);
++    try std.testing.expect(calls[1].object.get("function").?.object.get("arguments").? == .string);
++}
+diff --git a/zig/src/server/messages.zig b/zig/src/server/messages.zig
+index b6223e5e..4b33342e 100644
+--- a/zig/src/server/messages.zig
++++ b/zig/src/server/messages.zig
+@@ -3,6 +3,7 @@ const std = @import("std");
+ const json = @import("json.zig");
+ const errors = @import("errors.zig");
+ const fields = @import("fields.zig");
++const video = @import("video.zig");
+ const Value = json.Value;
+ const Cx = errors.Cx;
+ 
+@@ -26,6 +27,8 @@ fn withField(cx: *Cx, o: *const json.Object, key: []const u8, value: Value) !*js
+ pub const Images = struct {
+     placeholder: []const u8,
+     list: std.ArrayList([]const u8) = .empty,
++    /// The server's io, for video parts (video.zig decodes them into frames); without it a video part is refused.
++    io: ?std.Io = null,
+ };
+ 
+ pub const image_text_refusal = "image input: message text must not contain the image placeholder token";
+@@ -36,7 +39,7 @@ const text_only_refusal = "this server accepts text parts only; image, audio and
+ fn isImagePart(part: Value) bool {
+     if (part != .object) return false;
+     const t = part.get("type") orelse return false;
+-    return t == .string and std.mem.eql(u8, t.string, "image_url");
++    return t == .string and (std.mem.eql(u8, t.string, "image_url") or std.mem.eql(u8, t.string, video.frame_type));
+ }
+ 
+ /// Whether any message's content list holds an image part.
+@@ -53,6 +56,7 @@ fn hasImages(list: Value) bool {
+ /// An ``image_url`` part's bytes: its URL (the part's string, or its object's ``url``) a base64 data URL, the base64 as
+ /// Python's b64decode reads it; the served lane's refusals otherwise.
+ fn imageBytes(cx: *Cx, part: Value) errors.Refused![]const u8 {
++    if (part.get(video.frame_bytes)) |b| if (b == .string) return b.string;
+     const url: []const u8 = blk: {
+         const r = part.get("image_url") orelse break :blk "";
+         if (r == .string) break :blk r.string;
+@@ -73,12 +77,12 @@ fn imageBytes(cx: *Cx, part: Value) errors.Refused![]const u8 {
+     };
+ }
+ 
+-const B64 = union(enum) { ok: []u8, short: usize, padding, oom };
++pub const B64 = union(enum) { ok: []u8, short: usize, padding, oom };
+ 
+ /// binascii.a2b_base64 as base64.b64decode calls it (not strict): characters outside the alphabet skipped, the input
+ /// read until a complete padding, an incomplete last quad an error (one character over: "short", with the data
+ /// characters it counts; two or three: "padding").
+-fn b64decode(a: std.mem.Allocator, s: []const u8) B64 {
++pub fn b64decode(a: std.mem.Allocator, s: []const u8) B64 {
+     const out = a.alloc(u8, s.len / 4 * 3 + 3) catch return .oom;
+     var n: usize = 0;
+     var quad: u8 = 0;
+@@ -152,8 +156,10 @@ pub fn normalize(cx: *Cx, messages: ?Value, late_system: []const u8, needs_user_
+ /// renders it (the reference's process_image_messages): every message's content list joined with blank lines, each
+ /// image part its placeholder (its bytes into `images`), no message text holding the placeholder.
+ pub fn normalizeImages(cx: *Cx, messages: ?Value, late_system: []const u8, needs_user_after_tool: bool, images: ?*Images) errors.Refused!Value {
+-    const list = messages orelse return cx.refuse("messages must be a non-empty list");
+-    if (list != .array or list.array.len == 0) return cx.refuse("messages must be a non-empty list");
++    const given = messages orelse return cx.refuse("messages must be a non-empty list");
++    if (given != .array or given.array.len == 0) return cx.refuse("messages must be a non-empty list");
++    // video parts become their frames (each a timestamp text part and a picture) before the image path reads them
++    const list = if (images) |im| if (im.io) |io| try video.expand(cx, io, given) else given else given;
+     const with_images = images != null and hasImages(list);
+     var out: std.ArrayList(Value) = .empty;
+     var instructions: std.ArrayList(*json.Object) = .empty;
+diff --git a/zig/src/server/openai.zig b/zig/src/server/openai.zig
+index de52b3a4..96d004a5 100644
+--- a/zig/src/server/openai.zig
++++ b/zig/src/server/openai.zig
+@@ -122,7 +122,7 @@ fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Plan {
+     if (srv.config.request_log) |path| request_log.append(cx.a, path, body);
+     var input: chat.Input = .{ .fields = undefined };
+     // an engine with vision takes image parts: their placeholders in the text, their bytes in input.images
+-    var images: messages.Images = .{ .placeholder = if (srv.info.vision) |v| v.placeholder else "" };
++    var images: messages.Images = .{ .placeholder = if (srv.info.vision) |v| v.placeholder else "", .io = srv.io };
+     const take: ?*messages.Images = if (srv.info.vision != null) &images else null;
+     if (is_chat) {
+         input.messages = try messages.normalizeImages(cx, body.get("messages"), "system", srv.needs_user_after_tool, take);
+diff --git a/zig/src/server/video.zig b/zig/src/server/video.zig
+new file mode 100644
+index 00000000..3dbbf9a6
+--- /dev/null
++++ b/zig/src/server/video.zig
+@@ -0,0 +1,185 @@
++//! Video input for a vision checkpoint whose model reads pictures only (DeepSeek-V4.1's vision tower): each
++//! ``video_url`` part (a base64 data URL) becomes its sampled frames, in order, each a text part naming its time and a
++//! picture, before the image path sees the message. Frames are decoded by a one-shot `python3 -I` child with PyAV
++//! (the image's own Python): TF_VIDEO_FPS frames a second (default 2), at most TF_VIDEO_MAX_FRAMES (default 32; a
++//! longer clip's frames spread evenly over it), each scaled to at most TF_VIDEO_MAX_SIDE pixels a side (default 768),
++//! as PNG. Without python3 or PyAV a video part is refused.
++const std = @import("std");
++const json = @import("json.zig");
++const errors = @import("errors.zig");
++const messages = @import("messages.zig");
++
++const Value = json.Value;
++const Cx = errors.Cx;
++
++/// The internal part a frame becomes: its PNG bytes under `frame_bytes` (messages.zig reads them as an image's).
++pub const frame_type = "_video_frame";
++pub const frame_bytes = "_bytes";
++
++const script =
++    \\import io, struct, sys
++    \\try:
++    \\    import av
++    \\    from PIL import Image
++    \\except Exception as e:
++    \\    sys.stdout.buffer.write(b"E" + ("video input needs PyAV and Pillow in the server's Python: %s" % e).encode()); sys.exit(0)
++    \\fps, cap, side = float(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])
++    \\data = sys.stdin.buffer.read()
++    \\try:
++    \\    c = av.open(io.BytesIO(data))
++    \\    s = c.streams.video[0]
++    \\    dur = float(s.duration * s.time_base) if s.duration else (c.duration / 1e6 if c.duration else None)
++    \\    if dur and dur * fps > cap:
++    \\        want = [i * dur / cap for i in range(cap)]
++    \\    else:
++    \\        want = [i / fps for i in range(cap)]
++    \\    out, k = [], 0
++    \\    for f in c.decode(s):
++    \\        t = float(f.pts * f.time_base) if f.pts is not None else 0.0
++    \\        if k < len(want) and t + 1e-6 >= want[k]:
++    \\            im = f.to_image().convert("RGB")
++    \\            im.thumbnail((side, side))
++    \\            b = io.BytesIO(); im.save(b, "PNG")
++    \\            out.append((t, b.getvalue()))
++    \\            while k < len(want) and t + 1e-6 >= want[k]: k += 1
++    \\        if k >= len(want): break
++    \\    if not out: raise ValueError("the video has no decodable frames")
++    \\except Exception as e:
++    \\    sys.stdout.buffer.write(b"E" + ("video input: %s" % e).encode()); sys.exit(0)
++    \\w = sys.stdout.buffer
++    \\w.write(b"F" + struct.pack("<Q", len(out)))
++    \\for t, png in out: w.write(struct.pack("<dQ", t, len(png)) + png)
++;
++
++fn envInt(name: [:0]const u8, default: usize) usize {
++    const v = std.c.getenv(name) orelse return default;
++    return std.fmt.parseInt(usize, std.mem.span(v), 10) catch default;
++}
++
++fn envFloat(name: [:0]const u8, default: f64) f64 {
++    const v = std.c.getenv(name) orelse return default;
++    return std.fmt.parseFloat(f64, std.mem.span(v)) catch default;
++}
++
++fn isVideoPart(part: Value) bool {
++    if (part != .object) return false;
++    const t = part.get("type") orelse return false;
++    return t == .string and std.mem.eql(u8, t.string, "video_url");
++}
++
++/// Whether any message's content list holds a video part.
++pub fn hasVideos(list: Value) bool {
++    if (list != .array) return false;
++    for (list.array) |m| {
++        if (m != .object) continue;
++        const content = m.get("content") orelse continue;
++        if (content != .array) continue;
++        for (content.array) |p| if (isVideoPart(p)) return true;
++    }
++    return false;
++}
++
++/// A ``video_url`` part's bytes: its URL (the part's string, or its object's ``url``) a base64 data URL.
++fn videoBytes(cx: *Cx, part: Value) errors.Refused![]const u8 {
++    const url: []const u8 = blk: {
++        const r = part.get("video_url") orelse break :blk "";
++        if (r == .string) break :blk r.string;
++        if (r == .object) if (r.get("url")) |u| if (u == .string) break :blk u.string;
++        break :blk "";
++    };
++    if (url.len == 0) return cx.refuse("video input: a video_url part needs a url");
++    if (!std.mem.startsWith(u8, url, "data:")) return cx.refuse("video input: video_url must be a base64 data: URL (remote URLs are off on this server)");
++    const comma = std.mem.indexOfScalar(u8, url, ',') orelse url.len;
++    if (std.mem.indexOf(u8, url[0..comma], ";base64") == null) return cx.refuse("video input: video data URLs must be base64");
++    return switch (messages.b64decode(cx.a, if (comma < url.len) url[comma + 1 ..] else "")) {
++        .ok => |b| b,
++        .short, .padding => cx.refuse("video input: the base64 data is malformed"),
++        .oom => error.OutOfMemory,
++    };
++}
++
++const Frame = struct { t: f64, png: []const u8 };
++
++/// The frames of a video's bytes, by the PyAV child.
++fn frames(cx: *Cx, io: std.Io, data: []const u8) errors.Refused![]Frame {
++    var fb: [32]u8 = undefined;
++    var cb: [16]u8 = undefined;
++    var sb: [16]u8 = undefined;
++    const fps = std.fmt.bufPrint(&fb, "{d}", .{envFloat("TF_VIDEO_FPS", 2)}) catch unreachable;
++    const cap = std.fmt.bufPrint(&cb, "{d}", .{@max(envInt("TF_VIDEO_MAX_FRAMES", 32), 1)}) catch unreachable;
++    const side = std.fmt.bufPrint(&sb, "{d}", .{@max(envInt("TF_VIDEO_MAX_SIDE", 768), 32)}) catch unreachable;
++    var child = std.process.spawn(io, .{ .argv = &.{ "python3", "-I", "-c", script, fps, cap, side }, .stdin = .pipe, .stdout = .pipe, .stderr = .inherit }) catch
++        return cx.refuse("video input needs python3 in the server's environment");
++    defer _ = child.wait(io) catch {};
++    // write the bytes on a thread: the child streams frames back while it reads
++    const Feeder = struct {
++        fn run(f: std.Io.File, i: std.Io, d: []const u8) void {
++            f.writeStreamingAll(i, d) catch {};
++            f.close(i);
++        }
++    };
++    const in = child.stdin.?;
++    child.stdin = null;
++    const th = std.Thread.spawn(.{}, Feeder.run, .{ in, io, data }) catch {
++        in.close(io);
++        return cx.refuse("video input: could not start the decoder");
++    };
++    defer th.join();
++    var buf: [64 << 10]u8 = undefined;
++    var r = child.stdout.?.readerStreaming(io, &buf);
++    const all = r.interface.allocRemaining(cx.a, .limited(1 << 30)) catch return cx.refuse("video input: the decoder's reply could not be read");
++    if (all.len == 0) return cx.refuse("video input: the decoder gave no reply");
++    if (all[0] == 'E') return cx.refuse(try cx.a.dupe(u8, all[1..]));
++    if (all[0] != 'F' or all.len < 9) return cx.refuse("video input: the decoder's reply is malformed");
++    const n: usize = @intCast(std.mem.readInt(u64, all[1..9], .little));
++    const out = try cx.a.alloc(Frame, n);
++    var at: usize = 9;
++    for (out) |*f| {
++        if (at + 16 > all.len) return cx.refuse("video input: the decoder's reply is short");
++        f.t = @bitCast(std.mem.readInt(u64, all[at..][0..8], .little));
++        const len: usize = @intCast(std.mem.readInt(u64, all[at + 8 ..][0..8], .little));
++        at += 16;
++        if (at + len > all.len) return cx.refuse("video input: the decoder's reply is short");
++        f.png = all[at..][0..len];
++        at += len;
++    }
++    return out;
++}
++
++/// The messages with every video part replaced by its frames: a text part "Video frame at <t> s:" and a frame part
++/// before each picture, in time order.
++pub fn expand(cx: *Cx, io: std.Io, list: Value) errors.Refused!Value {
++    if (!hasVideos(list)) return list;
++    const out = try cx.a.alloc(Value, list.array.len);
++    for (list.array, 0..) |m, i| {
++        out[i] = m;
++        if (m != .object) continue;
++        const content = m.get("content") orelse continue;
++        if (content != .array) continue;
++        var parts: std.ArrayList(Value) = .empty;
++        var any = false;
++        for (content.array) |p| {
++            if (!isVideoPart(p)) {
++                try parts.append(cx.a, p);
++                continue;
++            }
++            any = true;
++            const bytes = try videoBytes(cx, p);
++            for (try frames(cx, io, bytes)) |f| {
++                const txt = try json.newObject(cx.a);
++                try txt.put(cx.a, "type", .{ .string = "text" });
++                try txt.put(cx.a, "text", .{ .string = try std.fmt.allocPrint(cx.a, "Video frame at {d:.1} s:", .{f.t}) });
++                try parts.append(cx.a, .{ .object = txt });
++                const fr = try json.newObject(cx.a);
++                try fr.put(cx.a, "type", .{ .string = frame_type });
++                try fr.put(cx.a, frame_bytes, .{ .string = f.png });
++                try parts.append(cx.a, .{ .object = fr });
++            }
++        }
++        if (!any) continue;
++        const copy = try json.copyObject(cx.a, m.object);
++        try copy.put(cx.a, "content", .{ .array = parts.items });
++        out[i] = .{ .object = copy };
++    }
++    return .{ .array = out };
++}

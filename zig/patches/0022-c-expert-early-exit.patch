@@ -1,0 +1,178 @@
+diff --git a/tools/dsv41-zig/native/check_native.py b/tools/dsv41-zig/native/check_native.py
+index 4a30bb4c..f6216733 100644
+--- a/tools/dsv41-zig/native/check_native.py
++++ b/tools/dsv41-zig/native/check_native.py
+@@ -494,6 +494,20 @@ def check_experts(lib, sh, layer, n_exp=24):
+         check(f"experts R={R} swap-AB: vs MoE.forward", r < 2e-2, f"max rel {r:.2e}")
+         close = ((ares[1] - y).abs() <= 2 ** -6 * y.abs() + 1e-3 * hmax).float().mean().item()
+         check(f"experts R={R} swap-AB: elements within a bf16 rounding", close > 0.999, f"{close:.5f}")
++        # Track C (TF_DS_EXPERT_EXIT): the decode kernels' rows past the active experts leaving at once give the
++        # same bits (R = 5: 24 grid rows for fewer active experts)
++        lib.dsn_set_expert_exit(1)
++        for nm_, dres in (("dec1", d1res), ("dec2", d2res), ("dec4", d4res)):
++            scr["out"].zero_()
++            assert lib.dsn_experts(ptr(x), R, D, ptr(pick), ptr(wts), S, E, ptr(t1), ptr(t3),
++                                   ptr(ts1), ptr(ts3), w1[0].shape[1], s1[0].shape[1], ptr(t2),
++                                   ptr(ts2), w2[0].shape[1], s2[0].shape[1], 1, I_, ptr(cols), I_ // 32, N,
++                                   F(10.0), *[ptr(scr[k]) for k in ("q", "s", "cnt", "off", "fill", "act", "nact", "ent",
++                                                                     "erow", "h", "hq", "hs", "out", "y")], 1,
++                                   code(nm_, gs), code(nm_, ds), ptr(z)) == 0
++            na = int(scr["nact"].item())
++            check(f"experts R={R} {nm_}: the early exit ({min(E, RS) - na} of {min(E, RS)} grid rows idle) gives the same bits", torch.equal(scr["y"], dres[1]))
++        lib.dsn_set_expert_exit(0)
+         for nm_, dres in (("dec1", d1res), ("dec2", d2res), ("dec4", d4res)):
+             r = rel(dres[1], y.double())
+             check(f"experts R={R} {nm_}: vs MoE.forward", r < 2e-2, f"max rel {r:.2e}")
+@@ -678,6 +692,7 @@ def main():
+     lib.dsn_pf_bf16.argtypes = [P, L, L, P, L, L, I, I, I, I, P, L, L, I, F, I]
+     lib.dsn_experts_pf.argtypes = [P, I, I, P, P, I, I, P, P, P, P, L, L, P, P, L, L, I, I, F, I, L, L, L, L] + [P] * 14 + [I, I]
+     lib.dsn_dec_dense.argtypes = [I, P, P, P, L, L, P, P, L, L, I, I, I, I, I, P, P, P, L, I, I, F, I, I]
++    lib.dsn_set_expert_exit.argtypes = [I]
+     lib.dsn_dec_dense_g.argtypes = [I, P, P, P, L, L, P, P, L, L, I, I, I, I, P, P, P, L, I, I, I, L, L]
+     sh = Shards(root, sys.argv[3] if len(sys.argv) > 3 else None)
+     check_act_quant(lib)
+diff --git a/tools/dsv41-zig/native/native_host.cu b/tools/dsv41-zig/native/native_host.cu
+index 2fb17d2e..49af7a3e 100644
+--- a/tools/dsv41-zig/native/native_host.cu
++++ b/tools/dsv41-zig/native/native_host.cu
+@@ -119,6 +119,10 @@ int dsn_mx_gemm(const uint8_t* q, const float* s, const int* rows, long ldq, lon
+     return int(cudaDeviceSynchronize());
+ }
+ 
++// Track C: the decode expert kernels' early exit (GuArgs / DnArgs early_exit) for dsn_experts' launches
++static int g_expert_exit = 0;
++extern "C" void dsn_set_expert_exit(int v) { g_expert_exit = v; }
++
+ // the grouped experts of one layer: x [R, D] bf16 -> y [R, N] fp32 (routed sum), every expert's tensors in tables
+ int dsn_experts(const __nv_bfloat16* x, int R, int D, const int* pick, const float* wts, int S, int E,
+                 const uint64_t* w1, const uint64_t* w3, const uint64_t* s1, const uint64_t* s3, long ldw_gu,
+@@ -146,6 +150,7 @@ int dsn_experts(const __nv_bfloat16* x, int R, int D, const int* pick, const flo
+     g.shared = -1; g.owner = nullptr; g.n_tiles = n_tiles; g.rest_tiles = 0; g.wts = wts; g.limit = limit; g.h = h; g.ldh = I;
+     (void)cols;
+     g.P = RS; g.splits = gu_splits > 1 ? gu_splits : 1; g.kblocks = (D / 32 + g.splits - 1) / g.splits; g.z = z;
++    g.early_exit = g_expert_exit;
+     dim3 gg((n_tiles + 3) / 4, E < RS ? E : RS, g.splits);
+     if (gu_splits <= -10) {  // the decode tensor-core kernel, -10 - gu_splits warps a tile and matrix
+         g.splits = -10 - gu_splits;
+@@ -161,6 +166,7 @@ int dsn_experts(const __nv_bfloat16* x, int R, int D, const int* pick, const flo
+     d.w2 = w2; d.s2 = s2; d.ldw = ldw_d; d.ldws = ldws_d; d.fmt = fmt; d.shared = -1; d.I = I; d.N = N; d.round_bf16 = 1;
+     d.out = out; d.ldo = N;
+     d.splits = dn_splits > 1 ? dn_splits : 1; d.kblocks = (I / 32 + d.splits - 1) / d.splits; d.z = z; d.P = RS;
++    d.early_exit = g_expert_exit;
+     dim3 gd((N / 32 + 3) / 4, E < RS ? E : RS, d.splits);
+     if (dn_splits <= -10) {
+         d.splits = -10 - dn_splits;
+diff --git a/zig/kernels/cuda/dsv41/native.cu b/zig/kernels/cuda/dsv41/native.cu
+index 4fc5da9b..f602f169 100644
+--- a/zig/kernels/cuda/dsv41/native.cu
++++ b/zig/kernels/cuda/dsv41/native.cu
+@@ -337,6 +337,7 @@ struct GuArgs {
+     // tf_dsn_gu_finish sums them in split order and applies the epilogue; splits 1: the epilogue here
+     int splits, kblocks;
+     float* z;
++    int early_exit;     // Track C (TF_DS_EXPERT_EXIT): the decode kernel's rows past the active experts leave at once
+ };
+ 
+ __device__ __forceinline__ float silu_f(float v) { return v / (1.0f + expf(-v)); }
+@@ -458,6 +459,7 @@ struct DnArgs {
+     int splits, kblocks;
+     float* z;
+     int P;              // the entries (z's row count)
++    int early_exit;     // Track C (TF_DS_EXPERT_EXIT): as GuArgs'
+ };
+ 
+ template <int MT>
+@@ -2151,6 +2153,10 @@ __device__ __forceinline__ void dec_gu(const GuArgs& a) {
+     const int ks = a.splits, per_tile = 2 * ks;
+     // the experts in reverse id order: the shared expert (the last id, the L2 prefetch's) first
+     const int na = a.nact[0];
++    // Track C (docs/UNIFIED-DECODE-IMPROVEMENTS.md, TF_DS_EXPERT_EXIT=1): the grid's rows past the active experts
++    // (it is sized min(experts, rows x slots) on the host, which cannot see the count) leave at once, the whole CTA
++    // together (no barrier is entered, nothing is written, no other CTA waits on them)
++    if (a.early_exit && int(blockIdx.y) >= na) return;
+     const bool live = int(blockIdx.y) < na;
+     const int e = live ? a.act[na - 1 - blockIdx.y] : 0;
+     const int tiles_cta = (blockDim.x >> 5) / per_tile;
+@@ -2225,6 +2231,7 @@ __device__ __forceinline__ void dec_dn(const DnArgs& a) {
+     extern __shared__ __align__(16) uint8_t dsm[];
+     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+     const int wb = dec::warpBytes<dec::kRbE, dec::kNsE>(1, RG);
++    if (a.early_exit && int(blockIdx.y) >= a.nact[0]) return;  // Track C: as dec_gu
+     const bool live = int(blockIdx.y) < a.nact[0];
+     const int e = live ? a.act[blockIdx.y] : 0;
+     const int tiles_cta = (blockDim.x >> 5) / a.splits;
+@@ -2434,8 +2441,8 @@ extern "C" __global__ void __launch_bounds__(1024) tf_dsn_dec_group_kernel(const
+ 
+ // the layouts mx.zig passes (its extern structs assert the same offsets)
+ static_assert(sizeof(MxArgs) == 128 && offsetof(MxArgs, z) == 96, "MxArgs layout");
+-static_assert(offsetof(GuArgs, sldw) == 136 && offsetof(GuArgs, owner) == 152 && offsetof(GuArgs, z) == 216 && sizeof(GuArgs) == 224, "GuArgs layout");
+-static_assert(offsetof(DnArgs, sldw) == 104 && offsetof(DnArgs, out) == 136 && offsetof(DnArgs, z) == 160 && sizeof(DnArgs) == 176, "DnArgs layout");
++static_assert(offsetof(GuArgs, sldw) == 136 && offsetof(GuArgs, owner) == 152 && offsetof(GuArgs, z) == 216 && offsetof(GuArgs, early_exit) == 224 && sizeof(GuArgs) == 232, "GuArgs layout");
++static_assert(offsetof(DnArgs, sldw) == 104 && offsetof(DnArgs, out) == 136 && offsetof(DnArgs, z) == 160 && offsetof(DnArgs, early_exit) == 172 && sizeof(DnArgs) == 176, "DnArgs layout");
+ static_assert(sizeof(DecMulti) == 4 * 168 + 24 && offsetof(DecMulti, cta0) == 676, "DecMulti layout");
+ static_assert(sizeof(DecArgs) == 168 && offsetof(DecArgs, gq) == 152 && offsetof(DecArgs, z) == 96 && offsetof(DecArgs, y) == 112, "DecArgs layout");
+ static_assert(offsetof(BfArgs, y) == 64 && offsetof(BfArgs, z) == 112 && sizeof(BfArgs) == 120, "BfArgs layout");
+diff --git a/zig/src/families/dsv41/mx.zig b/zig/src/families/dsv41/mx.zig
+index 8d24b095..81c09d3e 100644
+--- a/zig/src/families/dsv41/mx.zig
++++ b/zig/src/families/dsv41/mx.zig
+@@ -69,6 +69,7 @@ pub const GuArgs = extern struct {
+     splits: c_int = 1,
+     kblocks: c_int = 0,
+     z: u64 = 0,
++    early_exit: c_int = 0, // Track C (TF_DS_EXPERT_EXIT)
+ };
+ 
+ /// native.cu's DnArgs.
+@@ -98,6 +99,7 @@ pub const DnArgs = extern struct {
+     kblocks: c_int = 0,
+     z: u64 = 0,
+     P: c_int = 0,
++    early_exit: c_int = 0, // Track C (TF_DS_EXPERT_EXIT)
+ };
+ 
+ /// native.cu's BfArgs.
+@@ -187,8 +189,8 @@ const dec_counters = 16384;
+ comptime {
+     // the layouts native.cu was compiled with (pointers and int64 8 bytes, ints and floats 4, C padding)
+     std.debug.assert(@sizeOf(MxArgs) == 128 and @offsetOf(MxArgs, "z") == 96);
+-    std.debug.assert(@offsetOf(GuArgs, "sldw") == 136 and @offsetOf(GuArgs, "owner") == 152 and @offsetOf(GuArgs, "z") == 216 and @sizeOf(GuArgs) == 224);
+-    std.debug.assert(@offsetOf(DnArgs, "sldw") == 104 and @offsetOf(DnArgs, "out") == 136 and @offsetOf(DnArgs, "z") == 160 and @sizeOf(DnArgs) == 176);
++    std.debug.assert(@offsetOf(GuArgs, "sldw") == 136 and @offsetOf(GuArgs, "owner") == 152 and @offsetOf(GuArgs, "z") == 216 and @offsetOf(GuArgs, "early_exit") == 224 and @sizeOf(GuArgs) == 232);
++    std.debug.assert(@offsetOf(DnArgs, "sldw") == 104 and @offsetOf(DnArgs, "out") == 136 and @offsetOf(DnArgs, "z") == 160 and @offsetOf(DnArgs, "early_exit") == 172 and @sizeOf(DnArgs) == 176);
+     std.debug.assert(@offsetOf(BfArgs, "y") == 64 and @offsetOf(BfArgs, "z") == 112 and @sizeOf(BfArgs) == 120);
+ }
+ 
+@@ -223,6 +225,8 @@ pub const Kernels = struct {
+     // TF_DS_DEC_PDL=0: the decode tensor-core kernels (dense, gate / up, down) as ordinary launches, the same kernels (the
+     // decode plan's G0.2 control (a)); unset or any other value: programmatic dependent launches as served
+     dec_pdl: bool,
++    // TF_DS_EXPERT_EXIT=1 (Track C): the decode expert kernels' grid rows past the active experts return at once
++    expert_exit: bool,
+     counters: cuda.DeviceBuffer,
+     combine: cuda.Function,
+     bf16: cuda.Function,
+@@ -258,6 +262,7 @@ pub const Kernels = struct {
+             .dec_l2pf = try m.function("tf_dsn_dec_l2pf_kernel"),
+             .dec_on = if (std.c.getenv("TF_DS_DECODE_DEC")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true,
+             .dec_pdl = if (std.c.getenv("TF_DS_DEC_PDL")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true,
++            .expert_exit = if (std.c.getenv("TF_DS_EXPERT_EXIT")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false,
+             .counters = counters,
+             .module = m,
+             .act_quant = try m.function("tf_dsn_act_quant_kernel"),
+@@ -1088,6 +1093,7 @@ pub fn gateUp(k: *const Kernels, s: cuda.Stream, d: *const cuda.Driver, ex: weig
+             // the decode tensor-core kernel: a tile's gate and up each on decGuSplit warps
+             var b = a;
+             b.splits = @intCast(dec_gu_ks);
++            b.early_exit = @intFromBool(k.expert_exit);
+             ga.add(b);
+             const tpc = dec_warps / (2 * dec_gu_ks);
+             const rg = decRg(r);
+@@ -1167,6 +1173,7 @@ pub fn down(k: *const Kernels, s: cuda.Stream, ex: weights.Experts, sc: ExpertSc
+     if (split and k.dec_on and i % 128 == 0 and n % 16 == 0) {
+         var b = a;
+         b.splits = @intCast(dec_dn_ks);
++        b.early_exit = @intFromBool(k.expert_exit);
+         var da: cuda.Args = .{};
+         da.add(b);
+         const tpc = dec_warps / dec_dn_ks;

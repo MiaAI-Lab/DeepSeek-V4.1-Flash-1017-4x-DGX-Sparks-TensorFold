@@ -1,0 +1,25 @@
+diff --git a/zig/src/server/cli.zig b/zig/src/server/cli.zig
+index d0e8c022..287a5fd8 100644
+--- a/zig/src/server/cli.zig
++++ b/zig/src/server/cli.zig
+@@ -50,7 +50,9 @@ pub const flags = [_]Flag{
+     .{ .name = "--min-p", .native = true },
+     .{ .name = "--thinking", .kind = .store_true, .native = true },
+     .{ .name = "--no-thinking", .kind = .store_true, .native = true },
+-    .{ .name = "--reasoning-effort", .choices = &.{ "low", "medium", "high", "xhigh" }, .native = true },
++    // max: the effort a template names past xhigh (DeepSeek-V4.1's "low" / "high" / "max"); fields.coerceEffort maps
++    // each name to the nearest one the served template knows, as it does a request's
++    .{ .name = "--reasoning-effort", .choices = &.{ "low", "medium", "high", "xhigh", "max" }, .native = true },
+     .{ .name = "--thinking-budget", .native = true },
+     .{ .name = "--loop-guard", .kind = .store_true, .native = true },
+     .{ .name = "--no-drafts", .kind = .store_true, .native = true },
+@@ -310,7 +312,8 @@ test "parse and capabilities share the table" {
+     try std.testing.expectEqual(@as(usize, 2), args.api_key.len);
+     try std.testing.expect(!args.thinking);
+     try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--drafter", "x" }, &u));
+-    try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--reasoning-effort", "max" }, &u));
++    try std.testing.expectEqualStrings("max", (try parse(a, &.{ "m", "--reasoning-effort", "max" }, &u)).reasoning_effort.?);
++    try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--reasoning-effort", "ultra" }, &u));
+     try std.testing.expectEqual(@as(?f64, 12.5), (try parse(a, &.{ "m", "--prompt-cache-gib", "12.5" }, &u)).prompt_cache_gib);
+     try std.testing.expectEqual(@as(?f64, 0), (try parse(a, &.{ "m", "--prompt-cache-gib", "0" }, &u)).prompt_cache_gib);
+     try std.testing.expect(!(try parse(a, &.{ "m", "--prompt-cache-gib", "16" }, &u)).prompt_cache_over_cap);

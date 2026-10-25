@@ -1,0 +1,1449 @@
+diff --git a/zig/build/cuda.zig b/zig/build/cuda.zig
+index 8c3ec31..9a5f12c 100644
+--- a/zig/build/cuda.zig
++++ b/zig/build/cuda.zig
+@@ -32,6 +32,7 @@ const kernels = [_]Kernel{
+     .{ .name = "dsv41_rdma", .src = "dsv41/rdma_gather", .flags = &.{"-O3"} }, // ours: the decode gathers' RDMA kernel pair
+     .{ .name = "dsv41_experts_par", .src = "dsv41/experts_par", .flags = &.{ "-O3", "-lineinfo" } }, // ours: the exl3 extension's gate / up with the parity split's rest in its grid (tensorfold_exl3_experts_v19's flags)
+     .{ .name = "dsv41_native", .src = "dsv41/native", .flags = &.{"-O3"} }, // DeepSeek's own FP8 / MXFP4 checkpoint (mx.zig)
++    .{ .name = "dsv41_engram", .src = "dsv41/engram", .flags = torch_ops }, // Engram's packed records to bf16 rows (engram_gpu.zig)
+ };
+ 
+ /// torch.utils.cpp_extension's own nvcc flags (torch 2.13): C++20 and which half/bf16 operators the headers define.
+@@ -137,6 +138,10 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
+     const ds_engram = b.createModule(.{ .root_source_file = b.path("zig/src/families/dsv41/engram_check_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
+     ds_engram.addImport("dsv41", ds_check.import_table.get("dsv41").?);
+     b.installArtifact(b.addExecutable(.{ .name = "tf-dsv41-engram-check", .root_module = ds_engram }));
++    // each node's packed Engram shards (a row's values and scales in one record) from the checkpoint's tables
++    const ds_engram_pack = b.createModule(.{ .root_source_file = b.path("zig/src/families/dsv41/engram_pack_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
++    ds_engram_pack.addImport("dsv41", ds_check.import_table.get("dsv41").?);
++    b.installArtifact(b.addExecutable(.{ .name = "tf-dsv41-engram-pack", .root_module = ds_engram_pack }));
+     // the vision tower's input of each image as the served lane makes it (picture.zig), by sha256 against the fixtures
+     const ds_picture = b.createModule(.{ .root_source_file = b.path("zig/src/families/dsv41/picture_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
+     ds_picture.addImport("dsv41", ds_check.import_table.get("dsv41").?);
+diff --git a/zig/kernels/cuda/dsv41/engram.cu b/zig/kernels/cuda/dsv41/engram.cu
+new file mode 100644
+index 0000000..8514de8
+--- /dev/null
++++ b/zig/kernels/cuda/dsv41/engram.cu
+@@ -0,0 +1,46 @@
++// Engram's packed records (each row's FP8 E4M3 values, then its E8M0 scales, one per 32) to bf16 rows on the GPU, value
++// for value as engram.zig's decodeRow computes them on the host: the E4M3 value exactly in fp32, times
++// 2^(scale - 127), rounded to the nearest even bf16, NaN as 0x7fc0. Built with --ftz=false: subnormals stay.
++#include <stdint.h>
++
++// 2^e as fp32: subnormal below 2^-126, infinity from 2^128 (engram.zig pow2).
++__device__ __forceinline__ float tf_dse_pow2(int e) {
++    if (e >= 128) return __int_as_float(0x7f800000);
++    if (e >= -126) return __int_as_float((e + 127) << 23);
++    if (e >= -149) return __int_as_float(1 << (e + 149));
++    return 0.0f;
++}
++
++// An E4M3 (fn) byte as fp32, exactly (engram.zig e4m3): 0x7f and 0xff are NaN.
++__device__ __forceinline__ float tf_dse_e4m3(uint32_t b) {
++    const uint32_t exp = (b >> 3) & 0xfu;
++    const uint32_t man = b & 7u;
++    if (exp == 15u && man == 7u) return __int_as_float(0x7fc00000);
++    const float mag = exp == 0u ? __fmul_rn((float)man, 0x1p-9f)
++                                : __fmul_rn(__fadd_rn(1.0f, __fmul_rn((float)man, 0.125f)), tf_dse_pow2((int)exp - 7));
++    return (b & 0x80u) ? -mag : mag;
++}
++
++// fp32 to bf16 bits, round to nearest even (engram.zig bf16).
++__device__ __forceinline__ uint16_t tf_dse_bf16(float x) {
++    const uint32_t u = __float_as_uint(x);
++    if ((u & 0x7f800000u) == 0x7f800000u && (u & 0x007fffffu) != 0u) return 0x7fc0;
++    return (uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
++}
++
++// One thread a value: record (r, lo + c) of rec ([rows][slots] records of dim + dim / 32 bytes) into bf16 row (r, c)
++// of out ([rows][k][dim]).
++extern "C" __global__ void tf_dse_decode_kernel(const uint8_t* __restrict__ rec, uint16_t* __restrict__ out, int rows,
++                                                int slots, int lo, int k, int dim) {
++    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
++    const long long n = (long long)rows * k * dim;
++    if (i >= n) return;
++    const int v = (int)(i % dim);
++    const long long rc = i / dim;
++    const int c = (int)(rc % k);
++    const long long r = rc / k;
++    const long long width = dim + dim / 32;
++    const uint8_t* src = rec + (r * slots + lo + c) * width;
++    const float x = __fmul_rn(tf_dse_e4m3(src[v]), tf_dse_pow2((int)src[dim + v / 32] - 127));
++    out[i] = tf_dse_bf16(x);
++}
+diff --git a/zig/src/cuda/abi.zig b/zig/src/cuda/abi.zig
+index 97e048c..df48a87 100644
+--- a/zig/src/cuda/abi.zig
++++ b/zig/src/cuda/abi.zig
+@@ -137,6 +137,9 @@ const Ptr = ?*anyopaque;
+ const CPtr = ?*const anyopaque;
+ const Params = ?[*]?*anyopaque;
+ 
++/// CUhostFn: run on a driver thread in a stream's order; it must make no CUDA call.
++pub const HostFn = *const fn (?*anyopaque) callconv(.c) void;
++
+ /// Each field is the exact exported symbol, so the ABI is the one that symbol version documents.
+ pub const Api = struct {
+     cuInit: *const fn (c_uint) callconv(.c) R,
+@@ -172,6 +175,7 @@ pub const Api = struct {
+     cuStreamSynchronize: *const fn (Stream) callconv(.c) R,
+     cuStreamWaitEvent: *const fn (Stream, Event, c_uint) callconv(.c) R,
+     cuStreamQuery: *const fn (Stream) callconv(.c) R,
++    cuLaunchHostFunc: *const fn (Stream, HostFn, Ptr) callconv(.c) R,
+     cuEventCreate: *const fn (*Event, c_uint) callconv(.c) R,
+     cuEventDestroy_v2: *const fn (Event) callconv(.c) R,
+     cuEventRecord: *const fn (Event, Stream) callconv(.c) R,
+diff --git a/zig/src/cuda/kernels.zig b/zig/src/cuda/kernels.zig
+index c633981..fdc1b10 100644
+--- a/zig/src/cuda/kernels.zig
++++ b/zig/src/cuda/kernels.zig
+@@ -35,6 +35,7 @@ pub const dsv41_torch: []const u8 = if (available) &Blob("fatbin_dsv41_torch").b
+ pub const dsv41_rdma: []const u8 = if (available) &Blob("fatbin_dsv41_rdma").bytes else &.{};
+ pub const dsv41_experts_par: []const u8 = if (available) &Blob("fatbin_dsv41_experts_par").bytes else &.{};
+ pub const dsv41_native: []const u8 = if (available) &Blob("fatbin_dsv41_native").bytes else &.{};
++pub const dsv41_engram: []const u8 = if (available) &Blob("fatbin_dsv41_engram").bytes else &.{};
+ 
+ /// Symbols in the gdn image as cuobjdump lists them for the built fatbin (named namespace tf_gdn).
+ pub const gdn_symbols = struct {
+diff --git a/zig/src/cuda/stream.zig b/zig/src/cuda/stream.zig
+index dcf2d20..1e08bf6 100644
+--- a/zig/src/cuda/stream.zig
++++ b/zig/src/cuda/stream.zig
+@@ -36,6 +36,12 @@ pub const Stream = struct {
+     pub fn wait(self: Stream, event: Event) Error!void {
+         try self.d.check(self.d.api.cuStreamWaitEvent(self.handle, event.handle, 0), "cuStreamWaitEvent");
+     }
++
++    /// `f(data)` on a driver thread once the work queued before it is done; the work queued after it waits for its
++    /// return. `f` makes no CUDA call.
++    pub fn hostFunc(self: Stream, f: abi.HostFn, data: ?*anyopaque) Error!void {
++        try self.d.check(self.d.api.cuLaunchHostFunc(self.handle, f, data), "cuLaunchHostFunc");
++    }
+ };
+ 
+ pub const Event = struct {
+diff --git a/zig/src/families/dsv41/comm.zig b/zig/src/families/dsv41/comm.zig
+index 8f7f1d0..4d05605 100644
+--- a/zig/src/families/dsv41/comm.zig
++++ b/zig/src/families/dsv41/comm.zig
+@@ -88,6 +88,12 @@ pub const Comm = struct {
+         try c.lib.check(c.lib.api.ncclAllGather(send, recv, count, dtype, c.comm, stream.handle), "ncclAllGather");
+     }
+ 
++    /// `count` bytes every rank holds in `buf`, each made the largest of the ranks' (NCCL max over u8): exact for Engram's
++    /// owned records, where one rank holds a slot's bytes and the others zeros, whatever the order.
++    pub fn maxBytes(c: Comm, buf: u64, count: usize, stream: cuda.Stream) !void {
++        try c.lib.check(c.lib.api.ncclAllReduce(buf, buf, count, .u8, .max, c.comm, stream.handle), "ncclAllReduce (max)");
++    }
++
+     /// `count` elements of `dtype` to rank `peer` and `rcount` from it, in one NCCL group (point to point).
+     pub fn exchange(c: Comm, send: u64, count: usize, recv: u64, rcount: usize, dtype: nccl.DataType, peer: u32, stream: cuda.Stream) !void {
+         try c.lib.check(c.lib.api.ncclGroupStart(), "ncclGroupStart");
+diff --git a/zig/src/families/dsv41/dsv41.zig b/zig/src/families/dsv41/dsv41.zig
+index b19b195..97fd785 100644
+--- a/zig/src/families/dsv41/dsv41.zig
++++ b/zig/src/families/dsv41/dsv41.zig
+@@ -15,6 +15,10 @@ pub const checkpoint = @import("checkpoint.zig");
+ pub const weights = @import("weights.zig");
+ pub const engram_io = @import("engram_io.zig");
+ pub const engram_aio = @import("engram_aio.zig");
++pub const engram_pack = @import("engram_pack.zig");
++pub const engram_cache = @import("engram_cache.zig");
++pub const engram_gpu = @import("engram_gpu.zig");
++pub const engram_rows = @import("engram_rows.zig");
+ pub const link = @import("link.zig");
+ pub const comm = @import("comm.zig");
+ pub const tri = @import("tri.zig");
+@@ -62,6 +66,10 @@ test {
+     refAll(weights);
+     refAll(engram_io);
+     refAll(engram_aio);
++    refAll(engram_pack);
++    refAll(engram_cache);
++    refAll(engram_gpu);
++    refAll(engram_rows);
+     refAll(link);
+     refAll(comm);
+     refAll(tri);
+diff --git a/zig/src/families/dsv41/engram_aio.zig b/zig/src/families/dsv41/engram_aio.zig
+index 2225ad3..970a062 100644
+--- a/zig/src/families/dsv41/engram_aio.zig
++++ b/zig/src/families/dsv41/engram_aio.zig
+@@ -218,6 +218,87 @@ pub const Aio = struct {
+         return id;
+     }
+ 
++    /// The submission of a packed shard's records (`mutex` held): one read a row, ids[i]'s record copied into dsts[i]
++    /// as it completes. Returns the batch id.
++    fn submitRecordsLocked(a: *Aio, pk: engram_io.Packed, ids: []const i64, dsts: []const [*]u8) !u64 {
++        const reads = ids.len;
++        if (reads > a.slots or reads >= 1 << 20) return error.TooManyRows;
++        if (pk.rec + block > slot) return error.RowTooWide;
++        for (ids) |x| if (x < 0 or @as(u64, @intCast(x)) < pk.lo or @as(u64, @intCast(x)) >= pk.hi) return error.RowOutOfRange;
++        const fd = if (pk.fd_d >= 0) pk.fd_d else pk.fd;
++        // the ring's slots [head, head + reads) must be free: reap until no live batch of the last lap holds them
++        while (true) {
++            var busy = false;
++            for (a.live.items) |l| {
++                const b = a.batches.get(l[0]) orelse continue;
++                const lap_lo = a.head -| a.slots;
++                const lap_hi = (a.head + reads) -| a.slots;
++                if (b.left > 0 and l[1] < lap_hi and l[1] + b.n > lap_lo) {
++                    busy = true;
++                    break;
++                }
++            }
++            if (!busy) break;
++            a.reap();
++        }
++        const id = a.next_id;
++        a.next_id += 1;
++        var b: Batch = .{
++            .first = a.head,
++            .n = reads,
++            .left = reads,
++            .dst = try a.gpa.alloc(?[*]u8, reads),
++            .skew = try a.gpa.alloc(usize, reads),
++            .bytes = try a.gpa.alloc(usize, reads),
++        };
++        const cbs = try a.gpa.alloc(Iocb, reads);
++        defer a.gpa.free(cbs);
++        const ptrs = try a.gpa.alloc(*Iocb, reads);
++        defer a.gpa.free(ptrs);
++        for (0..reads) |j| {
++            const row: u64 = @intCast(ids[j]);
++            const off = pk.base + (row - pk.lo) * pk.rec;
++            const lo = std.mem.alignBackward(u64, off, block);
++            b.skew[j] = @intCast(off - lo);
++            b.bytes[j] = pk.rec;
++            b.dst[j] = dsts[j];
++            cbs[j] = .{
++                .data = (id << 20) | j,
++                .lio_opcode = cmd_pread,
++                .fildes = @intCast(fd),
++                .buf = @intFromPtr(a.ring[((a.head + j) % a.slots) * slot ..].ptr),
++                .nbytes = std.mem.alignForward(u64, off + pk.rec - lo, block),
++                .offset = @intCast(lo),
++            };
++            ptrs[j] = &cbs[j];
++        }
++        a.head += reads;
++        try a.batches.put(a.gpa, id, b);
++        try a.live.append(a.gpa, .{ id, b.first });
++        var sent: usize = 0;
++        while (sent < reads) {
++            const r = ioSubmit(a.ctx, reads - sent, ptrs[sent..].ptr);
++            if (r <= 0) {
++                const bp = a.batches.getPtr(id).?;
++                bp.left -= reads - sent; // never submitted
++                bp.failed = true;
++                break;
++            }
++            sent += @intCast(r);
++        }
++        return id;
++    }
++
++    /// Submit the records of `ids` from packed shard `pk`, ids[i]'s landing in dsts[i] (pk.rec bytes) as it completes
++    /// (keep them alive until `wait` returns). Returns the batch id; an empty `ids` returns 0, which `wait` passes.
++    pub fn startRecords(a: *Aio, pk: engram_io.Packed, ids: []const i64, dsts: []const [*]u8) !u64 {
++        if (dsts.len != ids.len) return error.BadSize;
++        if (ids.len == 0) return 0;
++        a.mutex.lockUncancelable(a.io);
++        defer a.mutex.unlock(a.io);
++        return a.submitRecordsLocked(pk, ids, dsts);
++    }
++
+     /// Submit rows `ids` of table `t` (weight and scale rows), landing in out_w ([ids.len, row_w]) and out_s as they
+     /// complete (keep both alive until `wait` returns). Returns the batch id.
+     pub fn start(a: *Aio, t: engram_io.Table, ids: []const i64, out_w: []u8, out_s: []u8) !u64 {
+diff --git a/zig/src/families/dsv41/engram_cache.zig b/zig/src/families/dsv41/engram_cache.zig
+new file mode 100644
+index 0000000..ac9df11
+--- /dev/null
++++ b/zig/src/families/dsv41/engram_cache.zig
+@@ -0,0 +1,100 @@
++//! Engram rows kept in host memory: a set-associative cache of packed records by row id, shared by every reader
++//! thread. It holds the bytes a read returned, so a hit is the row a read would give.
++const std = @import("std");
++
++pub const Cache = struct {
++    rec: usize,
++    ways: usize,
++    sets: usize,
++    keys: []u64, // a way's row id + 1 (0: empty)
++    data: []u8, // [sets * ways] records
++    next: []u8, // each set's next way to fill
++    locks: []std.atomic.Value(u32), // one a set
++    hits: std.atomic.Value(u64) = .init(0),
++    misses: std.atomic.Value(u64) = .init(0),
++
++    /// About `bytes` of records of `rec` bytes, `ways` a set (bytes too few for one set: error.CacheTooSmall).
++    pub fn init(gpa: std.mem.Allocator, bytes: usize, rec: usize, ways: usize) !Cache {
++        if (rec == 0 or ways == 0 or ways > 255) return error.BadCache;
++        const sets = bytes / rec / ways;
++        if (sets == 0) return error.CacheTooSmall;
++        const keys = try gpa.alloc(u64, sets * ways);
++        errdefer gpa.free(keys);
++        const data = try gpa.alloc(u8, sets * ways * rec);
++        errdefer gpa.free(data);
++        const next = try gpa.alloc(u8, sets);
++        errdefer gpa.free(next);
++        const locks = try gpa.alloc(std.atomic.Value(u32), sets);
++        @memset(keys, 0);
++        @memset(next, 0);
++        @memset(locks, .init(0));
++        return .{ .rec = rec, .ways = ways, .sets = sets, .keys = keys, .data = data, .next = next, .locks = locks };
++    }
++
++    pub fn deinit(c: *Cache, gpa: std.mem.Allocator) void {
++        gpa.free(c.keys);
++        gpa.free(c.data);
++        gpa.free(c.next);
++        gpa.free(c.locks);
++        c.* = undefined;
++    }
++
++    fn lock(c: *Cache, s: usize) void {
++        while (c.locks[s].cmpxchgWeak(0, 1, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
++    }
++
++    fn unlock(c: *Cache, s: usize) void {
++        c.locks[s].store(0, .release);
++    }
++
++    /// Row `id`'s record into `out` (rec bytes) when held.
++    pub fn get(c: *Cache, id: u64, out: []u8) bool {
++        const s: usize = @intCast(id % c.sets);
++        c.lock(s);
++        defer c.unlock(s);
++        for (0..c.ways) |w| {
++            const k = s * c.ways + w;
++            if (c.keys[k] == id + 1) {
++                @memcpy(out[0..c.rec], c.data[k * c.rec ..][0..c.rec]);
++                _ = c.hits.fetchAdd(1, .monotonic);
++                return true;
++            }
++        }
++        _ = c.misses.fetchAdd(1, .monotonic);
++        return false;
++    }
++
++    /// Row `id`'s record (rec bytes) kept, over the set's oldest fill (a row held already stays as it is).
++    pub fn put(c: *Cache, id: u64, row: []const u8) void {
++        const s: usize = @intCast(id % c.sets);
++        c.lock(s);
++        defer c.unlock(s);
++        for (0..c.ways) |i| if (c.keys[s * c.ways + i] == id + 1) return;
++        const w: usize = c.next[s] % c.ways;
++        c.next[s] = @intCast((w + 1) % c.ways);
++        const k = s * c.ways + w;
++        @memcpy(c.data[k * c.rec ..][0..c.rec], row[0..c.rec]);
++        c.keys[k] = id + 1;
++    }
++};
++
++test "a cached record is the one put, and a full set gives up its oldest fill" {
++    const a = std.testing.allocator;
++    var c = try Cache.init(a, 2 * 2 * 4, 4, 2); // two sets of two ways
++    defer c.deinit(a);
++    var out: [4]u8 = undefined;
++    try std.testing.expect(!c.get(6, &out));
++    c.put(6, &.{ 1, 2, 3, 4 });
++    try std.testing.expect(c.get(6, &out));
++    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, &out);
++    c.put(6, &.{ 9, 9, 9, 9 }); // held already: unchanged
++    try std.testing.expect(c.get(6, &out));
++    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, &out);
++    // set 0 holds 6; 8 and 10 fill it again, the first over 6
++    c.put(8, &.{ 5, 5, 5, 5 });
++    c.put(10, &.{ 7, 7, 7, 7 });
++    try std.testing.expect(!c.get(6, &out));
++    try std.testing.expect(c.get(8, &out) and c.get(10, &out));
++    try std.testing.expectEqual(@as(u64, 4), c.hits.load(.monotonic));
++    try std.testing.expectError(error.CacheTooSmall, Cache.init(a, 7, 4, 2));
++}
+diff --git a/zig/src/families/dsv41/engram_gpu.zig b/zig/src/families/dsv41/engram_gpu.zig
+new file mode 100644
+index 0000000..dfa3cb5
+--- /dev/null
++++ b/zig/src/families/dsv41/engram_gpu.zig
+@@ -0,0 +1,36 @@
++//! Engram's packed records to bf16 rows on the GPU (zig/kernels/cuda/dsv41/engram.cu, cuda.kernels.dsv41_engram), each
++//! value as engram.decodeRow gives it on the host, so the rows a layer reads are the host decode's bits.
++const std = @import("std");
++const cuda = @import("cuda");
++
++pub const Kernels = struct {
++    module: cuda.Module,
++    decode: cuda.Function,
++
++    pub fn load(d: *const cuda.Driver, image: []const u8) !Kernels {
++        var m = try cuda.Module.load(d, image);
++        errdefer m.unload();
++        return .{ .module = m, .decode = try m.function("tf_dse_decode_kernel") };
++    }
++
++    pub fn unload(k: *Kernels) void {
++        k.module.unload();
++    }
++
++    /// Records (r, lo + c) of `rec` ([rows][slots] records of dim + dim / 32 bytes) into bf16 rows (r, c) of `out`
++    /// ([rows][k][dim]) for c below k.
++    pub fn decodeRows(k: *const Kernels, s: cuda.Stream, rec: u64, out: u64, rows: usize, slots: usize, lo: usize, n: usize, dim: usize) !void {
++        const total = rows * n * dim;
++        if (total == 0) return;
++        if (lo + n > slots or dim % 32 != 0) return error.BadEngramRows;
++        var a: cuda.Args = .{};
++        a.add(rec);
++        a.add(out);
++        a.add(@as(c_int, @intCast(rows)));
++        a.add(@as(c_int, @intCast(slots)));
++        a.add(@as(c_int, @intCast(lo)));
++        a.add(@as(c_int, @intCast(n)));
++        a.add(@as(c_int, @intCast(dim)));
++        try cuda.launch.launch(k.decode, .{ .grid = .{ .x = @intCast((total + 255) / 256) }, .block = .{ .x = 256 } }, s, &a);
++    }
++};
+diff --git a/zig/src/families/dsv41/engram_io.zig b/zig/src/families/dsv41/engram_io.zig
+index 5d8bd84..5d6f0ef 100644
+--- a/zig/src/families/dsv41/engram_io.zig
++++ b/zig/src/families/dsv41/engram_io.zig
+@@ -10,6 +10,10 @@ const dio = @import("core").direct_io;
+ /// files through O_DIRECT (-1 where the file system refuses it: the buffered ones serve).
+ pub const Table = struct { fd_w: std.c.fd_t, base_w: u64, row_w: usize, fd_s: std.c.fd_t, base_s: u64, row_s: usize, rows: u64, fd_wd: std.c.fd_t = -1, fd_sd: std.c.fd_t = -1 };
+ 
++/// One layer's packed shard (engram_pack.zig): table rows [lo, hi) of `rows`, each a record of its weights then its
++/// scales, `rec` bytes at base + (id - lo) * rec, so a row is one read; fd_d the same file through O_DIRECT (-1: none).
++pub const Packed = struct { fd: std.c.fd_t, fd_d: std.c.fd_t = -1, base: u64, rec: usize, rows: u64, lo: u64, hi: u64 };
++
+ pub const Tables = struct {
+     gpa: std.mem.Allocator,
+     fds: std.ArrayList(std.c.fd_t) = .empty,
+@@ -124,7 +128,7 @@ fn readDirect(fd: std.c.fd_t, bounce: []align(dio.alignment) u8, out: []u8, at:
+     @memcpy(out, try f.read(bounce, at, out.len));
+ }
+ 
+-fn preadAll(fd: std.c.fd_t, out: []u8, at: u64) !void {
++pub fn preadAll(fd: std.c.fd_t, out: []u8, at: u64) !void {
+     var done: usize = 0;
+     while (done < out.len) {
+         const n = std.c.pread(fd, out.ptr + done, out.len - done, @intCast(at + done));
+@@ -159,6 +163,9 @@ pub const Pool = struct {
+         finished: std.atomic.Value(usize) = .init(0),
+         failed: std.atomic.Value(bool) = .init(false),
+         direct: bool = false,
++        // a packed shard's records instead (gatherRecords): ids[i]'s record into dsts[i]
++        pk: ?Packed = null,
++        dsts: []const [*]u8 = &.{},
+     };
+ 
+     pub fn init(gpa: std.mem.Allocator, io: std.Io, n: usize) !*Pool {
+@@ -220,8 +227,15 @@ pub const Pool = struct {
+             const i = j.next.fetchAdd(1, .monotonic);
+             if (i >= j.ids.len) return;
+             const id: u64 = @intCast(j.ids[i]);
+-            const ok = id < j.t.rows;
+-            if (ok) {
++            if (j.pk) |pk| {
++                if (id >= pk.lo and id < pk.hi) {
++                    const dst = j.dsts[i][0..pk.rec];
++                    const at = pk.base + (id - pk.lo) * pk.rec;
++                    if (pk.fd_d >= 0) {
++                        readDirect(pk.fd_d, &bounce, dst, at) catch j.failed.store(true, .monotonic);
++                    } else preadAll(pk.fd, dst, at) catch j.failed.store(true, .monotonic);
++                } else j.failed.store(true, .monotonic);
++            } else if (id < j.t.rows) {
+                 const w = j.out_w[i * j.t.row_w ..][0..j.t.row_w];
+                 const s = j.out_s[i * j.t.row_s ..][0..j.t.row_s];
+                 if (j.direct and j.t.fd_wd >= 0) {
+@@ -250,18 +264,30 @@ pub const Pool = struct {
+         return p.run(t, ids, out_w, out_s, true);
+     }
+ 
++    /// Records of `ids` from packed shard `pk` (each id in [pk.lo, pk.hi)), ids[i]'s into dsts[i] (pk.rec bytes).
++    pub fn gatherRecords(p: *Pool, pk: Packed, ids: []const i64, dsts: []const [*]u8) !void {
++        if (dsts.len != ids.len or pk.rec > direct_row_max) return error.BadSize;
++        if (ids.len == 0) return;
++        var job: Job = .{ .t = undefined, .ids = ids, .out_w = &.{}, .out_s = &.{}, .pk = pk, .dsts = dsts };
++        return p.runJob(&job);
++    }
++
+     fn run(p: *Pool, t: Table, ids: []const i64, out_w: []u8, out_s: []u8, direct: bool) !void {
+         if (out_w.len != ids.len * t.row_w or out_s.len != ids.len * t.row_s) return error.BadSize;
+         if (ids.len == 0) return;
+         var job: Job = .{ .t = t, .ids = ids, .out_w = out_w, .out_s = out_s, .direct = direct };
++        return p.runJob(&job);
++    }
++
++    fn runJob(p: *Pool, job: *Job) !void {
+         p.mutex.lockUncancelable(p.io);
+-        p.job = &job;
++        p.job = job;
+         p.gen += 1;
+         p.cond.broadcast(p.io);
+         p.mutex.unlock(p.io);
+-        p.work(&job);
++        p.work(job);
+         p.mutex.lockUncancelable(p.io);
+-        while (job.finished.load(.acquire) < ids.len or p.active > 0) p.done_cond.waitUncancelable(p.io, &p.mutex);
++        while (job.finished.load(.acquire) < job.ids.len or p.active > 0) p.done_cond.waitUncancelable(p.io, &p.mutex);
+         p.job = null;
+         p.mutex.unlock(p.io);
+         if (job.failed.load(.monotonic)) return error.ReadFailed;
+diff --git a/zig/src/families/dsv41/engram_pack.zig b/zig/src/families/dsv41/engram_pack.zig
+new file mode 100644
+index 0000000..09784d7
+--- /dev/null
++++ b/zig/src/families/dsv41/engram_pack.zig
+@@ -0,0 +1,201 @@
++//! Engram's packed shards: one file a layer and node with rows [lo, hi) of the layer's table, each row's FP8 values then
++//! its E8M0 scales (one record), after a 4 KiB header, so a row is one read. Node g of n holds rows
++//! [rows * g / n, rows * (g + 1) / n); n = 1 is the whole table. The records are the tables' own bytes.
++const std = @import("std");
++const dio = @import("core").direct_io;
++const engram_io = @import("engram_io.zig");
++
++pub const magic = "TFENGRM1".*;
++pub const version: u32 = 1;
++pub const header_bytes = 4096;
++
++/// A shard's layer, its table's rows and row widths, and its own rows [lo, hi).
++pub const Header = struct { layer: u32, rows: u64, lo: u64, hi: u64, row_w: u32, row_s: u32 };
++
++pub fn encode(h: Header, out: *[header_bytes]u8) void {
++    @memset(out, 0);
++    @memcpy(out[0..8], &magic);
++    std.mem.writeInt(u32, out[8..12], version, .little);
++    std.mem.writeInt(u32, out[12..16], h.layer, .little);
++    std.mem.writeInt(u64, out[16..24], h.rows, .little);
++    std.mem.writeInt(u64, out[24..32], h.lo, .little);
++    std.mem.writeInt(u64, out[32..40], h.hi, .little);
++    std.mem.writeInt(u32, out[40..44], h.row_w, .little);
++    std.mem.writeInt(u32, out[44..48], h.row_s, .little);
++}
++
++pub fn decode(b: *const [header_bytes]u8) !Header {
++    if (!std.mem.eql(u8, b[0..8], &magic)) return error.NotAPackedShard;
++    if (std.mem.readInt(u32, b[8..12], .little) != version) return error.PackedShardVersion;
++    const h: Header = .{
++        .layer = std.mem.readInt(u32, b[12..16], .little),
++        .rows = std.mem.readInt(u64, b[16..24], .little),
++        .lo = std.mem.readInt(u64, b[24..32], .little),
++        .hi = std.mem.readInt(u64, b[32..40], .little),
++        .row_w = std.mem.readInt(u32, b[40..44], .little),
++        .row_s = std.mem.readInt(u32, b[44..48], .little),
++    };
++    if (h.lo > h.hi or h.hi > h.rows) return error.BadPackedShard;
++    return h;
++}
++
++/// Node `node` of `nodes`'s rows of a table of `rows`.
++pub fn range(rows: u64, node: u32, nodes: u32) [2]u64 {
++    return .{ rows * node / nodes, rows * (node + 1) / nodes };
++}
++
++/// Layer `layer`'s shard file for node `node` of `nodes`.
++pub fn name(buf: []u8, layer: u32, node: u32, nodes: u32) ![]u8 {
++    return std.fmt.bufPrint(buf, "engram-l{d}-n{d}of{d}.tfe", .{ layer, node, nodes });
++}
++
++/// A node's shards, one a layer, open for its readers.
++pub const Shards = struct {
++    gpa: std.mem.Allocator,
++    fds: std.ArrayList(std.c.fd_t) = .empty,
++    layers: std.AutoHashMapUnmanaged(u32, engram_io.Packed) = .empty,
++
++    /// Node `node` of `nodes`'s shard of every layer of `tables` from `dir`.
++    pub fn open(gpa: std.mem.Allocator, dir: []const u8, tables: *const engram_io.Tables, node: u32, nodes: u32) !Shards {
++        var s: Shards = .{ .gpa = gpa };
++        errdefer s.close();
++        var it = tables.layers.iterator();
++        while (it.next()) |kv| {
++            const t = kv.value_ptr.*;
++            const pk = try openOne(gpa, &s.fds, dir, kv.key_ptr.*, t.rows, t.row_w, t.row_s, node, nodes);
++            try s.layers.put(gpa, kv.key_ptr.*, pk);
++        }
++        return s;
++    }
++
++    pub fn close(s: *Shards) void {
++        for (s.fds.items) |fd| _ = std.c.close(fd);
++        s.fds.deinit(s.gpa);
++        s.layers.deinit(s.gpa);
++        s.* = undefined;
++    }
++};
++
++/// Layer `layer`'s shard of node `node` of `nodes` in `dir`, checked against its table (rows, row widths) and the
++/// node's range, and whole (its last record readable); its descriptors go into `fds`.
++pub fn openOne(gpa: std.mem.Allocator, fds: *std.ArrayList(std.c.fd_t), dir: []const u8, layer: u32, rows: u64, row_w: usize, row_s: usize, node: u32, nodes: u32) !engram_io.Packed {
++    var nb: [64]u8 = undefined;
++    const path = try std.fs.path.joinZ(gpa, &.{ dir, try name(&nb, layer, node, nodes) });
++    defer gpa.free(path);
++    const fd = std.c.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
++    if (fd < 0) return error.FileNotFound;
++    fds.append(gpa, fd) catch |err| {
++        _ = std.c.close(fd);
++        return err;
++    };
++    var hb: [header_bytes]u8 = undefined;
++    try engram_io.preadAll(fd, &hb, 0);
++    const h = try decode(&hb);
++    const want = range(rows, node, nodes);
++    if (h.layer != layer or h.rows != rows or h.lo != want[0] or h.hi != want[1] or h.row_w != row_w or h.row_s != row_s) {
++        std.log.err("dsv41: {s} holds layer {d} rows [{d}, {d}) of {d}; node {d} of {d} reads [{d}, {d}) of {d}", .{ path, h.layer, h.lo, h.hi, h.rows, node, nodes, want[0], want[1], rows });
++        return error.PackedShardMismatch;
++    }
++    const rec = row_w + row_s;
++    if (h.hi > h.lo) {
++        var last: [1]u8 = undefined;
++        try engram_io.preadAll(fd, &last, header_bytes + (h.hi - h.lo) * rec - 1);
++    }
++    var pk: engram_io.Packed = .{ .fd = fd, .base = header_bytes, .rec = rec, .rows = rows, .lo = h.lo, .hi = h.hi };
++    var df = dio.File.open(path) catch null;
++    if (df) |*f| {
++        if (f.direct) {
++            fds.append(gpa, f.fd) catch |err| {
++                f.close();
++                return err;
++            };
++            pk.fd_d = f.fd;
++        } else f.close();
++    }
++    return pk;
++}
++
++/// Rows [h.lo, h.hi) of table `t` into `file` as a shard with header `h`: runs of rows, each run's weights and its
++/// scales one sequential read each, interleaved into records.
++pub fn write(gpa: std.mem.Allocator, io: std.Io, t: engram_io.Table, h: Header, file: std.Io.File) !void {
++    if (h.row_w != t.row_w or h.row_s != t.row_s or h.rows != t.rows or h.lo > h.hi or h.hi > t.rows) return error.BadPackedShard;
++    var hb: [header_bytes]u8 = undefined;
++    encode(h, &hb);
++    try file.writePositionalAll(io, &hb, 0);
++    const run: usize = 1 << 18;
++    const rec = t.row_w + t.row_s;
++    const w = try gpa.alloc(u8, run * t.row_w);
++    defer gpa.free(w);
++    const s = try gpa.alloc(u8, run * t.row_s);
++    defer gpa.free(s);
++    const out = try gpa.alloc(u8, run * rec);
++    defer gpa.free(out);
++    var at: u64 = h.lo;
++    var report: u64 = h.lo + (16 << 20);
++    while (at < h.hi) {
++        const n: usize = @intCast(@min(@as(u64, run), h.hi - at));
++        try engram_io.preadAll(t.fd_w, w[0 .. n * t.row_w], t.base_w + at * t.row_w);
++        try engram_io.preadAll(t.fd_s, s[0 .. n * t.row_s], t.base_s + at * t.row_s);
++        for (0..n) |i| {
++            @memcpy(out[i * rec ..][0..t.row_w], w[i * t.row_w ..][0..t.row_w]);
++            @memcpy(out[i * rec + t.row_w ..][0..t.row_s], s[i * t.row_s ..][0..t.row_s]);
++        }
++        try file.writePositionalAll(io, out[0 .. n * rec], header_bytes + (at - h.lo) * rec);
++        at += n;
++        if (at >= report) {
++            std.debug.print("engram layer {d}: {d} of {d} rows\n", .{ h.layer, at - h.lo, h.hi - h.lo });
++            report += 16 << 20;
++        }
++    }
++}
++
++test "a packed shard's records are the table's rows, a read each" {
++    const a = std.testing.allocator;
++    const io = std.testing.io;
++    var tmp = std.testing.tmpDir(.{ .iterate = true });
++    defer tmp.cleanup();
++    // a [300, 100] weight table and its [300, 3] scales for layer 1
++    const rows = 300;
++    var json_buf: [256]u8 = undefined;
++    const json = try std.fmt.bufPrint(&json_buf, "{{\"layers.1.engram.embed.weight\":{{\"dtype\":\"U8\",\"shape\":[{d},100],\"data_offsets\":[0,{d}]}},\"layers.1.engram.embed.scale\":{{\"dtype\":\"U8\",\"shape\":[{d},3],\"data_offsets\":[{d},{d}]}}}}", .{ rows, rows * 100, rows, rows * 100, rows * 103 });
++    var bytes: std.ArrayList(u8) = .empty;
++    defer bytes.deinit(a);
++    var len: [8]u8 = undefined;
++    std.mem.writeInt(u64, &len, json.len, .little);
++    try bytes.appendSlice(a, &len);
++    try bytes.appendSlice(a, json);
++    for (0..rows * 103) |i| try bytes.append(a, @intCast((i * 7 + 3) % 251));
++    try tmp.dir.writeFile(io, .{ .sub_path = "engram.safetensors", .data = bytes.items });
++    const dir = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", &tmp.sub_path });
++    defer a.free(dir);
++    var tables = try engram_io.Tables.open(a, io, dir);
++    defer tables.close();
++    const t = tables.layers.get(1).?;
++    // node 1 of 3: rows [100, 200)
++    const r = range(rows, 1, 3);
++    try std.testing.expectEqual([2]u64{ 100, 200 }, r);
++    var nb: [64]u8 = undefined;
++    var file = try tmp.dir.createFile(io, try name(&nb, 1, 1, 3), .{});
++    try write(a, io, t, .{ .layer = 1, .rows = rows, .lo = r[0], .hi = r[1], .row_w = 100, .row_s = 3 }, file);
++    file.close(io);
++    var shards = try Shards.open(a, dir, &tables, 1, 3);
++    defer shards.close();
++    const pk = shards.layers.get(1).?;
++    const pool = try engram_io.Pool.init(a, io, 2);
++    defer pool.deinit(a);
++    const ids = [_]i64{ 100, 199, 150, 101, 150 };
++    var want_w: [ids.len * 100]u8 = undefined;
++    var want_s: [ids.len * 3]u8 = undefined;
++    try pool.gather(t, &ids, &want_w, &want_s);
++    var got: [ids.len * 103]u8 = undefined;
++    var dsts: [ids.len][*]u8 = undefined;
++    for (&dsts, 0..) |*x, i| x.* = got[i * 103 ..].ptr;
++    try pool.gatherRecords(pk, &ids, &dsts);
++    for (0..ids.len) |i| {
++        try std.testing.expectEqualSlices(u8, want_w[i * 100 ..][0..100], got[i * 103 ..][0..100]);
++        try std.testing.expectEqualSlices(u8, want_s[i * 3 ..][0..3], got[i * 103 + 100 ..][0..3]);
++    }
++    // a row outside the node's range is refused, and another node's open refuses this file
++    try std.testing.expectError(error.ReadFailed, pool.gatherRecords(pk, &.{99}, dsts[0..1]));
++    try std.testing.expectError(error.FileNotFound, Shards.open(a, dir, &tables, 0, 3));
++}
+diff --git a/zig/src/families/dsv41/engram_pack_main.zig b/zig/src/families/dsv41/engram_pack_main.zig
+new file mode 100644
+index 0000000..43634b3
+--- /dev/null
++++ b/zig/src/families/dsv41/engram_pack_main.zig
+@@ -0,0 +1,71 @@
++//! tf-dsv41-engram-pack TABLES_DIR OUT_DIR NODE NODES: each Engram layer's packed shard for node NODE of NODES
++//! (engram_pack.zig: rows [rows * NODE / NODES, rows * (NODE + 1) / NODES), each row's FP8 values and scales side by
++//! side) from the checkpoint's tables in TABLES_DIR, into OUT_DIR; NODES 1 packs the whole tables. A shard in OUT_DIR
++//! that checks out stays; the others are written as dot files and renamed when whole. No GPU.
++const std = @import("std");
++const dsv41 = @import("dsv41");
++
++const usage = "usage: tf-dsv41-engram-pack TABLES_DIR OUT_DIR NODE NODES\n";
++
++pub fn main(init: std.process.Init) !u8 {
++    const a = init.arena.allocator();
++    const gpa = init.gpa;
++    const io = init.io;
++    const args = try init.minimal.args.toSlice(a);
++    if (args.len != 5) {
++        std.debug.print("{s}", .{usage});
++        return 2;
++    }
++    const node = std.fmt.parseInt(u32, args[3], 10) catch {
++        std.debug.print("{s}", .{usage});
++        return 2;
++    };
++    const nodes = std.fmt.parseInt(u32, args[4], 10) catch {
++        std.debug.print("{s}", .{usage});
++        return 2;
++    };
++    if (nodes == 0 or node >= nodes) {
++        std.debug.print("NODE is below NODES\n{s}", .{usage});
++        return 2;
++    }
++    var tables = try dsv41.engram_io.Tables.open(gpa, io, args[1]);
++    defer tables.close();
++    if (tables.layers.count() == 0) {
++        std.debug.print("{s} holds no Engram tables\n", .{args[1]});
++        return 1;
++    }
++    var dir = try std.Io.Dir.cwd().createDirPathOpen(io, args[2], .{});
++    defer dir.close(io);
++    var out_buf: [4096]u8 = undefined;
++    var out = std.Io.File.stdout().writer(io, &out_buf);
++    var it = tables.layers.iterator();
++    while (it.next()) |kv| {
++        const layer = kv.key_ptr.*;
++        const t = kv.value_ptr.*;
++        const r = dsv41.engram_pack.range(t.rows, node, nodes);
++        const bytes = dsv41.engram_pack.header_bytes + (r[1] - r[0]) * (t.row_w + t.row_s);
++        var nb: [64]u8 = undefined;
++        const final = try dsv41.engram_pack.name(&nb, layer, node, nodes);
++        // a whole shard from an earlier run stays
++        var kept: dsv41.engram_pack.Shards = .{ .gpa = gpa };
++        defer kept.close();
++        if (dsv41.engram_pack.openOne(gpa, &kept.fds, args[2], layer, t.rows, t.row_w, t.row_s, node, nodes)) |_| {
++            try out.interface.print("{{\"file\": \"{s}\", \"layer\": {d}, \"lo\": {d}, \"hi\": {d}, \"bytes\": {d}, \"kept\": true}}\n", .{ final, layer, r[0], r[1], bytes });
++            continue;
++        } else |_| {}
++        const partial = try std.fmt.allocPrint(a, ".{s}.partial", .{final});
++        var file = try dir.createFile(io, partial, .{});
++        var file_open = true;
++        defer if (file_open) file.close(io);
++        errdefer dir.deleteFile(io, partial) catch {};
++        try dsv41.engram_pack.write(gpa, io, t, .{ .layer = layer, .rows = t.rows, .lo = r[0], .hi = r[1], .row_w = @intCast(t.row_w), .row_s = @intCast(t.row_s) }, file);
++        try file.sync(io);
++        file.close(io);
++        file_open = false;
++        try dir.rename(partial, dir, final, io);
++        try out.interface.print("{{\"file\": \"{s}\", \"layer\": {d}, \"lo\": {d}, \"hi\": {d}, \"bytes\": {d}, \"kept\": false}}\n", .{ final, layer, r[0], r[1], bytes });
++        try out.interface.flush();
++    }
++    try out.interface.flush();
++    return 0;
++}
+diff --git a/zig/src/families/dsv41/engram_rows.zig b/zig/src/families/dsv41/engram_rows.zig
+new file mode 100644
+index 0000000..69b20fa
+--- /dev/null
++++ b/zig/src/families/dsv41/engram_rows.zig
+@@ -0,0 +1,379 @@
++//! Engram's rows from packed shards (TF_DS_ENGRAM_PACKED, engram_pack.zig) instead of the tables' separate weight and
++//! scale rows: each slot's record staged on the host (a cache hit copied, a miss read in one go, a row another node
++//! owns zeroed), uploaded as it is, combined over the nodes when each owns a range of the rows (TF_DS_ENGRAM_OWNED: a
++//! byte max, one node holding a slot's bytes and the rest zeros) and decoded to bf16 on the GPU (engram_gpu.zig).
++//! A layer's rows keep the host path's bits; only where they come from changes.
++const std = @import("std");
++const cuda = @import("cuda");
++const engram_io = @import("engram_io.zig");
++const engram_aio = @import("engram_aio.zig");
++const engram_pack = @import("engram_pack.zig");
++const engram_cache = @import("engram_cache.zig");
++const engram_gpu = @import("engram_gpu.zig");
++const comm = @import("comm.zig");
++
++/// Whether environment switch `name` is set to anything but 0.
++pub fn envOn(name: [:0]const u8) bool {
++    const v = std.c.getenv(name) orelse return false;
++    return !std.mem.eql(u8, std.mem.span(v), "0");
++}
++
++/// A staging buffer: rows x slots records, the misses' row ids and where each lands, their AIO batch.
++pub const Stage = struct {
++    j: usize, // the Engram layer slot it serves (its cache)
++    bytes: []u8,
++    ids: []i64,
++    dsts: [][*]u8,
++    misses: usize = 0,
++    batch: u64 = 0, // the misses' AIO batch (0: none)
++    host: ?cuda.HostBuffer = null, // pinned bytes (a round's), else the allocator's
++    rows: ?*Rows = null, // what a stream's host step reads
++    failed: std.atomic.Value(bool) = .init(false),
++
++    fn init(gpa: std.mem.Allocator, d: ?*const cuda.Driver, j: usize, records: usize, rec: usize) !Stage {
++        var st: Stage = .{ .j = j, .bytes = &.{}, .ids = &.{}, .dsts = &.{} };
++        errdefer st.deinit(gpa);
++        if (d) |dr| {
++            st.host = try cuda.HostBuffer.alloc(dr, records * rec);
++            st.bytes = st.host.?.bytes[0 .. records * rec];
++        } else st.bytes = try gpa.alloc(u8, records * rec);
++        st.ids = try gpa.alloc(i64, records);
++        st.dsts = try gpa.alloc([*]u8, records);
++        return st;
++    }
++
++    fn deinit(st: *Stage, gpa: std.mem.Allocator) void {
++        if (st.host) |*h| h.free() else if (st.bytes.len > 0) gpa.free(st.bytes);
++        if (st.ids.len > 0) gpa.free(st.ids);
++        if (st.dsts.len > 0) gpa.free(st.dsts);
++        st.* = undefined;
++    }
++};
++
++pub const Options = struct {
++    dir: []const u8, // the packed shards
++    owned: bool, // node `node` of `nodes` reads its own range of each table's rows (else the whole tables, node 0 of 1)
++    node: u32,
++    nodes: u32,
++    lo: usize, // this node's hash columns [lo, lo + k) of a row's `cols`
++    k: usize,
++    cols: usize,
++    dim: usize, // a row's values (engram_head_dim)
++    layer_ids: []const u16, // the Engram layers in order
++    round_rows: usize, // a round's rows at most
++    chunk_rows: usize, // a prompt chunk's
++    cache_bytes: usize, // the row cache over the layers (0: none)
++    instream: bool, // a round's landing as a host step on the stream (needs the round's AIO ring)
++    round_dev: u64, // device records of a round (round_rows * slots * record bytes)
++    chunk_dev: u64, // of a chunk (chunk_rows * slots * record bytes)
++};
++
++pub const Rows = struct {
++    gpa: std.mem.Allocator,
++    owned: bool,
++    node: u32,
++    nodes: u32,
++    lo: usize,
++    k: usize,
++    cols: usize,
++    dim: usize,
++    rec: usize,
++    layers: usize,
++    shards: engram_pack.Shards,
++    pk: [2]engram_io.Packed,
++    caches: [2]?engram_cache.Cache,
++    kernels: engram_gpu.Kernels,
++    round: [2]Stage, // a round's records by Engram layer slot (pinned)
++    chunk: Stage, // a prompt chunk's, read on the pass's thread
++    ahead: [2]Stage, // a prompt chunk's read ahead, by Engram layer slot
++    wk: [2][2]Stage, // a fill's worker's records, by chunk parity and Engram layer slot (prompt.engramWorker)
++    round_dev: u64,
++    chunk_dev: u64,
++    pool: *engram_io.Pool,
++    aio: ?*engram_aio.Aio, // a round's reads (TF_DS_ENGRAM_AIO), else the pool
++    paio: ?*engram_aio.Aio, // a chunk's
++    instream: bool,
++
++    /// The shards of node o.node of o.nodes (owned) or the whole ones, checked against `tables`; the kernels; the
++    /// staging buffers and the caches. Needs the CUDA context current.
++    pub fn open(gpa: std.mem.Allocator, d: *const cuda.Driver, tables: *const engram_io.Tables, pool: *engram_io.Pool, aio: ?*engram_aio.Aio, paio: ?*engram_aio.Aio, o: Options) !*Rows {
++        if (o.layer_ids.len == 0 or o.layer_ids.len > 2 or o.dim == 0 or o.dim % 32 != 0 or o.lo + o.k > o.cols) return error.EngramShape;
++        if (o.instream and aio == null) return error.EngramInStreamNeedsAio;
++        if (!cuda.kernels.available) return error.NoKernelImages;
++        const rec = o.dim + o.dim / 32;
++        const nodes: u32 = if (o.owned) o.nodes else 1;
++        const node: u32 = if (o.owned) o.node else 0;
++        if (node >= nodes) return error.EngramShape;
++        const sl = if (o.owned) o.cols else o.k;
++        var shards = try engram_pack.Shards.open(gpa, o.dir, tables, node, nodes);
++        errdefer shards.close();
++        var pks: [2]engram_io.Packed = undefined;
++        for (o.layer_ids, 0..) |li, j| {
++            pks[j] = shards.layers.get(li) orelse return error.MissingEngramTable;
++            if (pks[j].rec != rec) return error.EngramShape;
++        }
++        var kernels = try engram_gpu.Kernels.load(d, cuda.kernels.dsv41_engram);
++        errdefer kernels.unload();
++        var round0 = try Stage.init(gpa, d, 0, o.round_rows * sl, rec);
++        errdefer round0.deinit(gpa);
++        var round1 = try Stage.init(gpa, d, 1, o.round_rows * sl, rec);
++        errdefer round1.deinit(gpa);
++        var chunk = try Stage.init(gpa, null, 0, o.chunk_rows * sl, rec);
++        errdefer chunk.deinit(gpa);
++        var ahead0 = try Stage.init(gpa, null, 0, o.chunk_rows * sl, rec);
++        errdefer ahead0.deinit(gpa);
++        var ahead1 = try Stage.init(gpa, null, 1, o.chunk_rows * sl, rec);
++        errdefer ahead1.deinit(gpa);
++        var wk: [2][2]Stage = undefined;
++        var made: usize = 0;
++        errdefer for (0..made) |i| wk[i / 2][i % 2].deinit(gpa);
++        for (0..4) |i| {
++            wk[i / 2][i % 2] = try Stage.init(gpa, null, i % 2, o.chunk_rows * sl, rec);
++            made += 1;
++        }
++        var caches: [2]?engram_cache.Cache = .{ null, null };
++        errdefer for (&caches) |*c| {
++            if (c.*) |*x| x.deinit(gpa);
++        };
++        if (o.cache_bytes > 0) {
++            for (0..o.layer_ids.len) |j| caches[j] = try engram_cache.Cache.init(gpa, o.cache_bytes / o.layer_ids.len, rec, 16);
++        }
++        const r = try gpa.create(Rows);
++        r.* = .{
++            .gpa = gpa,
++            .owned = o.owned,
++            .node = node,
++            .nodes = nodes,
++            .lo = o.lo,
++            .k = o.k,
++            .cols = o.cols,
++            .dim = o.dim,
++            .rec = rec,
++            .layers = o.layer_ids.len,
++            .shards = shards,
++            .pk = pks,
++            .caches = caches,
++            .kernels = kernels,
++            .round = .{ round0, round1 },
++            .chunk = chunk,
++            .ahead = .{ ahead0, ahead1 },
++            .wk = wk,
++            .round_dev = o.round_dev,
++            .chunk_dev = o.chunk_dev,
++            .pool = pool,
++            .aio = aio,
++            .paio = paio,
++            .instream = o.instream,
++        };
++        for (&r.round) |*st| st.rows = r;
++        return r;
++    }
++
++    pub fn close(r: *Rows) void {
++        const gpa = r.gpa;
++        for (&r.round) |*st| st.deinit(gpa);
++        r.chunk.deinit(gpa);
++        for (&r.ahead) |*st| st.deinit(gpa);
++        for (&r.wk) |*row| {
++            for (row) |*st| st.deinit(gpa);
++        }
++        for (&r.caches) |*c| {
++            if (c.*) |*x| x.deinit(gpa);
++        }
++        r.kernels.unload();
++        r.shards.close();
++        gpa.destroy(r);
++    }
++
++    /// A row's slots this node stages: every hash column (owned), else its own k.
++    pub fn slots(r: *const Rows) usize {
++        return if (r.owned) r.cols else r.k;
++    }
++
++    /// `st` for `n` rows of Engram layer slot `j` from `hashes` ([n][layers][cols] row ids): each slot a cache hit's
++    /// record, zeros (a row another node owns), or a miss listed with where it lands.
++    fn plan(r: *Rows, st: *Stage, j: usize, hashes: []const i64, n: usize, layers: usize) !void {
++        const sl = r.slots();
++        if (n * sl * r.rec > st.bytes.len or hashes.len < n * layers * r.cols or j >= r.layers) return error.EngramShape;
++        const first = if (r.owned) 0 else r.lo;
++        const pk = r.pk[j];
++        const cache: ?*engram_cache.Cache = if (r.caches[j]) |*c| c else null;
++        var m: usize = 0;
++        for (0..n) |row| {
++            for (0..sl) |q| {
++                const x = hashes[(row * layers + j) * r.cols + first + q];
++                if (x < 0) return error.BadEngramRow;
++                const id: u64 = @intCast(x);
++                const dst = st.bytes[(row * sl + q) * r.rec ..][0..r.rec];
++                if (r.owned and (id < pk.lo or id >= pk.hi)) {
++                    @memset(dst, 0);
++                    continue;
++                }
++                if (cache) |c| {
++                    if (c.get(id, dst)) continue;
++                }
++                st.ids[m] = x;
++                st.dsts[m] = dst.ptr;
++                m += 1;
++            }
++        }
++        st.j = j;
++        st.misses = m;
++        st.batch = 0;
++    }
++
++    /// The staged misses' records kept in their layer's cache.
++    fn keep(r: *Rows, st: *const Stage) void {
++        const c = if (r.caches[st.j]) |*x| x else return;
++        for (st.ids[0..st.misses], st.dsts[0..st.misses]) |x, dst| c.put(@intCast(x), dst[0..r.rec]);
++    }
++
++    /// The staged misses read now (an AIO ring when given, else the reader pool) and kept.
++    fn readMisses(r: *Rows, st: *Stage, aio: ?*engram_aio.Aio) !void {
++        const m = st.misses;
++        if (m == 0) return;
++        const pk = r.pk[st.j];
++        if (aio) |x| try aioRecords(x, pk, st.ids[0..m], st.dsts[0..m]) else try r.pool.gatherRecords(pk, st.ids[0..m], st.dsts[0..m]);
++        r.keep(st);
++    }
++
++    /// A round's rows of Engram layer slot `j` staged from `hashes` ([rows][layers][cols]), the misses submitted to the
++    /// round's AIO ring when there is one (else they are read when the layer lands).
++    pub fn roundAhead(r: *Rows, j: usize, hashes: []const i64, rows: usize, layers: usize) !void {
++        const st = &r.round[j];
++        st.failed.store(false, .monotonic);
++        try r.plan(st, j, hashes, rows, layers);
++        if (st.misses > 0) {
++            if (r.aio) |x| {
++                if (st.misses <= x.slots) st.batch = try x.startRecords(r.pk[j], st.ids[0..st.misses], st.dsts[0..st.misses]);
++            }
++        }
++    }
++
++    /// Engram layer slot `j`'s rows of the round into `out` (bf16 [rows][k][dim]) in `s`'s order: the misses landed
++    /// (read now when none were submitted) and kept, the records uploaded, combined over the nodes (owned) and
++    /// decoded. In stream mode the landing is a host step on `s`, so the host goes on: roundCheck after the round.
++    pub fn roundLand(r: *Rows, j: usize, rows: usize, c: *const comm.Comm, s: cuda.Stream, out: u64) !void {
++        const st = &r.round[j];
++        const sl = r.slots();
++        const bytes = rows * sl * r.rec;
++        if (st.batch != 0 and r.instream) {
++            try s.hostFunc(stepLand, st);
++        } else if (st.batch != 0) {
++            const id = st.batch;
++            st.batch = 0;
++            try r.aio.?.wait(id);
++            r.keep(st);
++        } else try r.readMisses(st, r.aio);
++        try upload(s, r.round_dev, st.bytes[0..bytes]);
++        if (r.owned and r.nodes > 1) try c.maxBytes(r.round_dev, bytes, s);
++        try r.kernels.decodeRows(s, r.round_dev, out, rows, sl, if (r.owned) r.lo else 0, r.k, r.dim);
++    }
++
++    /// After a round's synchronize: error.ReadFailed when a stream host step's read failed.
++    pub fn roundCheck(r: *Rows) !void {
++        var bad = false;
++        for (&r.round) |*st| bad = st.failed.swap(false, .acq_rel) or bad;
++        if (bad) return error.ReadFailed;
++    }
++
++    /// A prompt chunk's rows of Engram layer slot `j` staged in `st` (the chunk's own, or a read-ahead's) and read.
++    pub fn chunkRead(r: *Rows, st: *Stage, j: usize, hashes: []const i64, n: usize, layers: usize) !void {
++        try r.plan(st, j, hashes, n, layers);
++        try r.readMisses(st, r.paio);
++    }
++
++    /// A staged chunk's records uploaded, combined over the nodes (owned) and decoded into `out` (bf16 [n][k][dim]).
++    pub fn chunkApply(r: *Rows, st: *const Stage, n: usize, c: *const comm.Comm, s: cuda.Stream, out: u64) !void {
++        const sl = r.slots();
++        const bytes = n * sl * r.rec;
++        try upload(s, r.chunk_dev, st.bytes[0..bytes]);
++        if (r.owned and r.nodes > 1) try c.maxBytes(r.chunk_dev, bytes, s);
++        try r.kernels.decodeRows(s, r.chunk_dev, out, n, sl, if (r.owned) r.lo else 0, r.k, r.dim);
++    }
++};
++
++/// A stream's host step for a staged round layer: its AIO batch waited for and its misses kept (no CUDA call).
++fn stepLand(data: ?*anyopaque) callconv(.c) void {
++    const st: *Stage = @ptrCast(@alignCast(data.?));
++    const r = st.rows.?;
++    const id = st.batch;
++    st.batch = 0;
++    r.aio.?.wait(id) catch {
++        st.failed.store(true, .release);
++        return;
++    };
++    r.keep(st);
++}
++
++/// Bytes to the device in `s`'s order (pinned bytes copy when the stream gets there; pageable ones are staged now).
++fn upload(s: cuda.Stream, dst: u64, src: []const u8) !void {
++    if (src.len == 0) return;
++    try s.d.check(s.d.api.cuMemcpyHtoDAsync_v2(dst, src.ptr, src.len, s.handle), "cuMemcpyHtoDAsync");
++}
++
++/// Records of `ids` from `pk` into `dsts` through `aio`: batches of half its ring, all submitted, waited for in order.
++fn aioRecords(aio: *engram_aio.Aio, pk: engram_io.Packed, ids: []const i64, dsts: []const [*]u8) !void {
++    const per = @max(aio.slots / 2, 1);
++    var batch: [64]u64 = undefined;
++    var nb: usize = 0;
++    var at: usize = 0;
++    errdefer for (batch[0..nb]) |id| aio.wait(id) catch {};
++    while (at < ids.len) : (at += per) {
++        const n = @min(per, ids.len - at);
++        if (nb == batch.len) return error.TooManyRows;
++        batch[nb] = try aio.startRecords(pk, ids[at..][0..n], dsts[at..][0..n]);
++        nb += 1;
++    }
++    for (batch[0..nb], 0..) |id, i| {
++        aio.wait(id) catch |err| {
++            for (batch[i + 1 .. nb]) |rest| aio.wait(rest) catch {};
++            nb = 0;
++            return err;
++        };
++    }
++    nb = 0;
++}
++
++test "an owned plan stages hits, zeros another node's rows and lists the misses" {
++    const a = std.testing.allocator;
++    var cache = try engram_cache.Cache.init(a, 64 * 4, 4, 4);
++    defer cache.deinit(a);
++    cache.put(12, &.{ 1, 2, 3, 4 });
++    var st = try Stage.init(a, null, 0, 2 * 3, 4);
++    defer st.deinit(a);
++    var r: Rows = undefined;
++    r.owned = true;
++    r.lo = 1;
++    r.k = 2;
++    r.cols = 3;
++    r.rec = 4;
++    r.layers = 1;
++    r.pk = .{ .{ .fd = -1, .base = 0, .rec = 4, .rows = 40, .lo = 10, .hi = 20 }, undefined };
++    r.caches = .{ cache, null };
++    // two rows, one layer, three columns: 12 cached, 5 and 25 another node's, 11 / 13 / 19 misses
++    const hashes = [_]i64{ 12, 5, 11, 13, 25, 19 };
++    try r.plan(&st, 0, &hashes, 2, 1);
++    try std.testing.expectEqual(@as(usize, 3), st.misses);
++    try std.testing.expectEqualSlices(i64, &.{ 11, 13, 19 }, st.ids[0..3]);
++    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, st.bytes[0..4]);
++    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, st.bytes[4..8]);
++    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, st.bytes[16..20]);
++    try std.testing.expectEqual(@intFromPtr(st.bytes[8..].ptr), @intFromPtr(st.dsts[0]));
++    try std.testing.expectEqual(@intFromPtr(st.bytes[20..].ptr), @intFromPtr(st.dsts[2]));
++    // the misses kept: the next plan of the same rows reads nothing
++    @memset(st.bytes[8..12], 7);
++    @memset(st.bytes[12..16], 8);
++    @memset(st.bytes[20..24], 9);
++    r.keep(&st);
++    try r.plan(&st, 0, &hashes, 2, 1);
++    try std.testing.expectEqual(@as(usize, 0), st.misses);
++    try std.testing.expectEqualSlices(u8, &.{ 9, 9, 9, 9 }, st.bytes[20..24]);
++    // the whole tables (not owned): this node's columns only, every row a miss or a hit
++    r.owned = false;
++    r.caches = .{ null, null };
++    r.pk[0].lo = 0;
++    r.pk[0].hi = 40;
++    try r.plan(&st, 0, &hashes, 2, 1);
++    try std.testing.expectEqualSlices(i64, &.{ 5, 11, 25, 19 }, st.ids[0..st.misses]);
++}
+diff --git a/zig/src/families/dsv41/model.zig b/zig/src/families/dsv41/model.zig
+index 61e776a..8be8e89 100644
+--- a/zig/src/families/dsv41/model.zig
++++ b/zig/src/families/dsv41/model.zig
+@@ -17,6 +17,7 @@ const draft = @import("draft.zig");
+ const engram = @import("engram.zig");
+ const engram_io = @import("engram_io.zig");
+ const engram_aio = @import("engram_aio.zig");
++const engram_rows = @import("engram_rows.zig");
+ const exl3_prefill = @import("exl3_prefill.zig");
+ const exl3_linear = @import("exl3_linear.zig");
+ const exl3_experts = @import("exl3_experts.zig");
+@@ -136,6 +137,7 @@ pub const Model = struct {
+     aio: ?*engram_aio.Aio = null,
+     paio: ?*engram_aio.Aio = null, // the prompt chunks' Engram reads, on a ring of their own
+     eh: ?prompt.EngramHost = null,
++    erows: ?*engram_rows.Rows = null, // TF_DS_ENGRAM_PACKED: Engram's rows from packed shards (engram_rows.zig)
+     host_pos: []i64,
+     ids64: []i64,
+     vocab: usize,
+@@ -214,6 +216,7 @@ pub const Model = struct {
+         m.aio = null;
+         m.paio = null;
+         m.eh = null;
++        m.erows = null;
+         m.rdma_mod = null;
+         m.ring = null;
+         m.graphs = null;
+@@ -398,6 +401,37 @@ pub const Model = struct {
+                 m.paio = try engram_aio.Aio.init(gpa, io, 4096);
+                 m.eh.?.paio = m.paio;
+             }
++            // TF_DS_ENGRAM_PACKED (a folder of tf-dsv41-engram-pack's shards): a row is one read, kept in a row cache
++            // (TF_DS_ENGRAM_CACHE_MIB, default 2048, 0 none) and decoded on the GPU; TF_DS_ENGRAM_OWNED=1: each node
++            // reads only its range of the rows and a byte max over the nodes fills the rest; TF_DS_ENGRAM_INSTREAM=1:
++            // a round's landing as a host step on the stream (with TF_DS_ENGRAM_AIO)
++            if (std.c.getenv("TF_DS_ENGRAM_PACKED")) |pd| {
++                const owned = engram_rows.envOn("TF_DS_ENGRAM_OWNED");
++                const eh = &m.eh.?;
++                const cols = eh.hasher.cols();
++                const k = eh.hi - eh.lo;
++                const sl = if (owned) cols else k;
++                const rec = c.engram_head_dim + c.engram_head_dim / 32;
++                const mib: usize = if (std.c.getenv("TF_DS_ENGRAM_CACHE_MIB")) |v| try std.fmt.parseInt(usize, std.mem.span(v), 10) else 2048;
++                m.erows = try engram_rows.Rows.open(gpa, d, &m.tables.?, m.epool.?, m.aio, m.paio, .{
++                    .dir = std.mem.span(pd),
++                    .owned = owned,
++                    .node = role,
++                    .nodes = o.world,
++                    .lo = eh.lo,
++                    .k = k,
++                    .cols = cols,
++                    .dim = c.engram_head_dim,
++                    .layer_ids = c.engram_layers.slice(),
++                    .round_rows = round.max_rows,
++                    .chunk_rows = chunk_rows,
++                    .cache_bytes = mib << 20,
++                    .instream = engram_rows.envOn("TF_DS_ENGRAM_INSTREAM"),
++                    .round_dev = try m.arena.take(round.max_rows * sl * rec),
++                    .chunk_dev = try m.arena.take(chunk_rows * sl * rec),
++                });
++                eh.pk = m.erows;
++            }
+         } else if (c.engram_layers.slice().len > 0) return error.NoEngramTables;
+ 
+         // a vision checkpoint's image routing bias (without it a prompt with images is refused; text runs as ever)
+@@ -432,6 +466,7 @@ pub const Model = struct {
+         m.rd.dropSide(&m.eng);
+         m.rd.dropPrefetch();
+         m.rd.dropPar();
++        if (m.erows) |r| r.close();
+         if (m.aio) |x| x.deinit();
+         if (m.paio) |x| x.deinit();
+         if (m.epool) |p| p.deinit(m.gpa);
+@@ -736,8 +771,14 @@ pub const Model = struct {
+                 const eh = if (m.eh) |*x| x else return error.NoEngramTables;
+                 const j = std.mem.indexOfScalar(u16, c.engram_layers.slice(), @intCast(li)).?;
+                 if (use_wk and j < 2) {
+-                    eh.use_rows = try prompt.engramWorkerRows(eh, j, start, chunk_rows);
+-                    defer eh.use_rows = null;
++                    // the worker's rows, or its records with packed shards (engram_rows.zig)
++                    if (eh.pk != null) {
++                        eh.use_stage = try prompt.engramWorkerStage(eh, j, start, chunk_rows);
++                    } else eh.use_rows = try prompt.engramWorkerRows(eh, j, start, chunk_rows);
++                    defer {
++                        eh.use_rows = null;
++                        eh.use_stage = null;
++                    }
+                     try prompt.engramApply(e, ch, eh, li, seq);
+                     // the rows are uploaded (a pageable copy is staged before it returns): the slot is the worker's
+                     eh.wk_used[j].store((start - eh.wk_start) / chunk_rows + 1, .release);
+@@ -840,6 +881,7 @@ pub const Model = struct {
+             if (n > 0) try dr.absorbMany(e, &m.ch, &m.dpool.?, items[0..n]);
+         }
+         try m.stream.synchronize();
++        if (m.erows) |r| try r.roundCheck(); // a stream host step's failed read fails the round
+         if (m.prof) m.t_absorb = m.now() - t1;
+     }
+ 
+diff --git a/zig/src/families/dsv41/native.zig b/zig/src/families/dsv41/native.zig
+index 20f6580..aa6672e 100644
+--- a/zig/src/families/dsv41/native.zig
++++ b/zig/src/families/dsv41/native.zig
+@@ -22,6 +22,10 @@
+ //!   TF_DS_HC_SIDE=1                             the mixes' side work on a stream of its own
+ //!   TF_DS_L2_PREFETCH=1                         the paced L2 prefetch of the next kernels' weights
+ //!   TF_DS_ENGRAM_AIO=1                          a round's Engram reads by Linux AIO on O_DIRECT
++//!   TF_DS_ENGRAM_PACKED=DIR                     Engram rows from tf-dsv41-engram-pack's shards in DIR: a record a row,
++//!                                               a row cache (TF_DS_ENGRAM_CACHE_MIB, 2048), decoded on the GPU;
++//!                                               TF_DS_ENGRAM_OWNED=1: each node reads its own range of the rows;
++//!                                               TF_DS_ENGRAM_INSTREAM=1: a round's landing as a stream host step
+ //!   TF_DS_FIX_K=K                               a measurement: every drafted stream verifies K drafts a round
+ //!   TF_DS_SERVED_K=all|solo                     a stream verifies at most the served lane's choice of drafts (its
+ //!                                               round table and draft ms): at any streams, or one stream alone
+diff --git a/zig/src/families/dsv41/prompt.zig b/zig/src/families/dsv41/prompt.zig
+index 8fe6b20..865872e 100644
+--- a/zig/src/families/dsv41/prompt.zig
++++ b/zig/src/families/dsv41/prompt.zig
+@@ -29,6 +29,7 @@ const comm = @import("comm.zig");
+ const engram = @import("engram.zig");
+ const engram_io = @import("engram_io.zig");
+ const engram_aio = @import("engram_aio.zig");
++const engram_rows = @import("engram_rows.zig");
+ const exact = @import("exact.zig");
+ const tri_index = @import("tri_index.zig");
+ const exl3_linear = @import("exl3_linear.zig");
+@@ -1247,6 +1248,7 @@ pub const EngramHost = struct {
+     s: []u8, // their E8M0 scales
+     rows: []u16, // bf16 [cap, (hi - lo) * head_dim]
+     aio: ?*engram_aio.Aio = null, // a round's reads by Linux AIO on the tables' O_DIRECT descriptors (else the pool)
++    pk: ?*engram_rows.Rows = null, // TF_DS_ENGRAM_PACKED: rows staged as packed records and decoded on the GPU
+     paio: ?*engram_aio.Aio = null, // a prompt chunk's reads the same way, on a ring of its own (else the pool)
+     // the rounds' Engram host time (ns, summed; a profile reads it): hashing, the table reads, the decode, the upload
+     io: ?std.Io = null,
+@@ -1290,6 +1292,7 @@ pub const EngramHost = struct {
+     wk_seq: []const i32 = &.{}, // the prompt it reads (its whole ids)
+     wk_start: usize = 0, // its first chunk's start
+     use_rows: ?[]u16 = null, // engramApply's rows when the worker read them
++    use_stage: ?*engram_rows.Stage = null, // its records instead with packed shards (engramWorkerStage)
+ 
+     pub fn init(gpa: std.mem.Allocator, c: *const Config, hasher: engram.Hasher, tables: *const engram_io.Tables, pool: *engram_io.Pool, rank: usize, world: usize, cap: usize) !EngramHost {
+         const cols = hasher.cols();
+@@ -1366,6 +1369,12 @@ fn engramAhead1(eh: *EngramHost, c: *const Config, seq: []const i32, start: usiz
+     const cols = eh.hasher.cols();
+     const k = eh.hi - eh.lo;
+     if (j == 0) eh.hasher.hashes(seq, start, n, eh.hashes[0 .. n * eh.hasher.layers * cols]);
++    if (eh.pk) |pr| {
++        // packed shards: the records staged in this layer's read-ahead buffer (decoded on the GPU when applied)
++        try pr.chunkRead(&pr.ahead[j], j, eh.hashes[0 .. n * eh.hasher.layers * cols], n, eh.hasher.layers);
++        eh.ahead_ready[j] = true;
++        return;
++    }
+     for (0..n) |r| {
+         for (0..k) |q| eh.ahead_flat[j][r * k + q] = eh.hashes[(r * eh.hasher.layers + j) * cols + eh.lo + q];
+     }
+@@ -1393,7 +1402,7 @@ pub fn engramWorker(eh: *EngramHost, c: *const Config, seq: []const i32, start:
+                 std.Thread.yield() catch {};
+             }
+             if (eh.wk_stop.load(.acquire)) return;
+-            workerRows(eh, c, seq, at, n, j, cols, k, eh.wk_rows[ci % 2][j]) catch |err| {
++            workerRows(eh, c, seq, at, n, j, cols, k, eh.wk_rows[ci % 2][j], ci % 2) catch |err| {
+                 eh.wk_err = err;
+                 eh.wk_failed.store(true, .release);
+                 return;
+@@ -1404,10 +1413,12 @@ pub fn engramWorker(eh: *EngramHost, c: *const Config, seq: []const i32, start:
+     }
+ }
+ 
+-fn workerRows(eh: *EngramHost, c: *const Config, seq: []const i32, start: usize, n: usize, j: usize, cols: usize, k: usize, out: []u16) !void {
++fn workerRows(eh: *EngramHost, c: *const Config, seq: []const i32, start: usize, n: usize, j: usize, cols: usize, k: usize, out: []u16, slot: usize) !void {
+     const li = c.engram_layers.slice()[j];
+     const t = eh.tables.layers.get(@intCast(li)) orelse return error.MissingEngramTable;
+     if (j == 0) eh.hasher.hashes(seq, start, n, eh.wk_hashes[0 .. n * eh.hasher.layers * cols]);
++    // packed shards: the chunk's records staged in the worker's slot, decoded on the GPU when applied
++    if (eh.pk) |pr| return pr.chunkRead(&pr.wk[slot][j], j, eh.wk_hashes[0 .. n * eh.hasher.layers * cols], n, eh.hasher.layers);
+     for (0..n) |r| {
+         for (0..k) |q| eh.wk_flat[r * k + q] = eh.wk_hashes[(r * eh.hasher.layers + j) * cols + eh.lo + q];
+     }
+@@ -1448,6 +1459,14 @@ pub fn engramWorkerRows(eh: *EngramHost, j: usize, start: usize, chunk: usize) !
+     return eh.wk_rows[ci % 2][j];
+ }
+ 
++/// With packed shards: the worker's records of Engram layer j for the chunk at `start` (waiting for them), for
++/// engramApply, as engramWorkerRows gives its rows.
++pub fn engramWorkerStage(eh: *EngramHost, j: usize, start: usize, chunk: usize) !*engram_rows.Stage {
++    const pr = eh.pk orelse return error.NoPackedRows;
++    _ = try engramWorkerRows(eh, j, start, chunk);
++    return &pr.wk[((start - eh.wk_start) / chunk) % 2][j];
++}
++
+ /// Layer li's Engram on the chunk (engram_apply, no image span), as _forward_k runs it before the attention mixes: a
+ /// pending MoE post into the streams first (hc_post), then the rows of each position's n-grams (hashed on the host from
+ /// `seq`, the whole sequence's ids so far; read from the tables; decoded to bf16 as Engram._decode does), their
+@@ -1469,25 +1488,41 @@ pub fn engramApply(e: *const Engine, ch: *Chunk, eh: *EngramHost, li: usize, seq
+     const m = n * k;
+     const prof = eh.io != null;
+     var tq = if (prof) pstamp(e, eh) else 0;
+-    // the rows read ahead (fillChunk's thread) when they are this chunk's, else read here
+-    var rows: []u16 = eh.rows;
+-    if (eh.use_rows) |ur| {
+-        rows = ur;
+-    } else if (l < 2 and eh.ahead_ready[l] and eh.ahead_start == ch.start and eh.ahead_n == n) {
+-        rows = eh.ahead_rows[l];
+-        eh.ahead_ready[l] = false;
++    if (m * t.row_w != n * ew.k) return error.EngramShape;
++    if (eh.pk) |pr| {
++        // packed shards: the chunk's records (the fill's worker's, else read ahead when they are this chunk's, else read
++        // here), decoded on the GPU
++        const st = if (eh.use_stage) |us| us else if (l < 2 and eh.ahead_ready[l] and eh.ahead_start == ch.start and eh.ahead_n == n) blk: {
++            eh.ahead_ready[l] = false;
++            break :blk &pr.ahead[l];
++        } else blk: {
++            eh.hasher.hashes(seq, ch.start, n, eh.hashes[0 .. n * eh.hasher.layers * cols]);
++            try pr.chunkRead(&pr.chunk, l, eh.hashes[0 .. n * eh.hasher.layers * cols], n, eh.hasher.layers);
++            break :blk &pr.chunk;
++        };
++        if (prof) eh.p_rows += lap(e, eh, &tq);
++        try pr.chunkApply(st, n, e.comm, e.s, ch.eb);
++        if (prof) eh.p_upload += lap(e, eh, &tq);
+     } else {
+-        eh.hasher.hashes(seq, ch.start, n, eh.hashes[0 .. n * eh.hasher.layers * cols]);
+-        for (0..n) |r| {
+-            for (0..k) |j| eh.flat[r * k + j] = eh.hashes[(r * eh.hasher.layers + l) * cols + eh.lo + j];
++        // the rows read ahead (fillChunk's thread) when they are this chunk's, else read here
++        var rows: []u16 = eh.rows;
++        if (eh.use_rows) |ur| {
++            rows = ur;
++        } else if (l < 2 and eh.ahead_ready[l] and eh.ahead_start == ch.start and eh.ahead_n == n) {
++            rows = eh.ahead_rows[l];
++            eh.ahead_ready[l] = false;
++        } else {
++            eh.hasher.hashes(seq, ch.start, n, eh.hashes[0 .. n * eh.hasher.layers * cols]);
++            for (0..n) |r| {
++                for (0..k) |j| eh.flat[r * k + j] = eh.hashes[(r * eh.hasher.layers + l) * cols + eh.lo + j];
++            }
++            if (eh.paio) |aio| try aioGather(aio, t, eh.flat[0..m], eh.w[0 .. m * t.row_w], eh.s[0 .. m * t.row_s]) else try eh.pool.gather(t, eh.flat[0..m], eh.w[0 .. m * t.row_w], eh.s[0 .. m * t.row_s]);
++            engram.decodeRows(eh.w[0 .. m * t.row_w], eh.s[0 .. m * t.row_s], eh.rows[0 .. m * t.row_w], m, t.row_w, t.row_s, 8); // the rows on 8 threads
+         }
+-        if (eh.paio) |aio| try aioGather(aio, t, eh.flat[0..m], eh.w[0 .. m * t.row_w], eh.s[0 .. m * t.row_s]) else try eh.pool.gather(t, eh.flat[0..m], eh.w[0 .. m * t.row_w], eh.s[0 .. m * t.row_s]);
+-        engram.decodeRows(eh.w[0 .. m * t.row_w], eh.s[0 .. m * t.row_s], eh.rows[0 .. m * t.row_w], m, t.row_w, t.row_s, 8); // the rows on 8 threads
++        if (prof) eh.p_rows += lap(e, eh, &tq);
++        try upload(e, ch.eb, rows.ptr, m * t.row_w * 2);
++        if (prof) eh.p_upload += lap(e, eh, &tq);
+     }
+-    if (m * t.row_w != n * ew.k) return error.EngramShape;
+-    if (prof) eh.p_rows += lap(e, eh, &tq);
+-    try upload(e, ch.eb, rows.ptr, m * t.row_w * 2);
+-    if (prof) eh.p_upload += lap(e, eh, &tq);
+     try mm(e, ch, ew, ch.eb, ew.k, ch.ek, .fp32, ew.n);
+     if (prof) eh.p_mm += lap(e, eh, &tq);
+     // 2D (model.py esum): this node's columns of its rank's projection; the quarters give both ranks' whole ones
+diff --git a/zig/src/families/dsv41/round.zig b/zig/src/families/dsv41/round.zig
+index c6578ec..f5b863b 100644
+--- a/zig/src/families/dsv41/round.zig
++++ b/zig/src/families/dsv41/round.zig
+@@ -1207,6 +1207,12 @@ fn engramAhead(e: *const Engine, eh: *prompt.EngramHost, seq: []const i32, rows:
+         eh.hasher.hashes(w.seq, start, w.n, eh.hashes[w.row * per .. (w.row + w.n) * per]);
+     }
+     ah.* = .{ .aio = eh.aio != null, .R = R };
++    if (eh.pk) |pr| {
++        // packed shards: each layer's records staged now, their misses submitted (engram_rows.zig)
++        for (0..c.engram_layers.slice().len) |j| try pr.roundAhead(j, eh.hashes[0 .. R * eh.hasher.layers * cols], R, eh.hasher.layers);
++        if (eh.io != null) eh.t_hash += stamp(eh) - t0;
++        return;
++    }
+     for (c.engram_layers.slice(), 0..) |li, j| {
+         const tbl = eh.tables.layers.get(li) orelse return error.MissingEngramTable;
+         const f0 = aheadRow(j) * k;
+@@ -1224,6 +1230,16 @@ fn engramAhead(e: *const Engine, eh: *prompt.EngramHost, seq: []const i32, rows:
+ fn engramLand(e: *const Engine, rd: *Round, eh: *prompt.EngramHost, ah: *const Ahead, li: usize) !void {
+     const c = e.c;
+     const j = std.mem.indexOfScalar(u16, c.engram_layers.slice(), @intCast(li)) orelse return error.NotAnEngramLayer;
++    if (eh.pk) |pr| {
++        // packed shards: landed (a host step on the stream in stream mode), uploaded, combined, decoded into rd.e_in
++        const tp = stamp(eh);
++        try pr.roundLand(j, ah.R, e.comm, e.s, rd.e_in);
++        if (eh.io != null) {
++            eh.t_read += stamp(eh) - tp;
++            eh.calls += 1;
++        }
++        return;
++    }
+     const tbl = eh.tables.layers.get(@intCast(li)) orelse return error.MissingEngramTable;
+     const k = eh.hi - eh.lo;
+     const f0 = aheadRow(j) * k;

@@ -1,0 +1,72 @@
+diff --git a/zig/src/cuda/aot.zig b/zig/src/cuda/aot.zig
+index ec4665db..6c7f8631 100644
+--- a/zig/src/cuda/aot.zig
++++ b/zig/src/cuda/aot.zig
+@@ -98,11 +98,19 @@ pub const Set = struct {
+         self.* = undefined;
+     }
+ 
+-    /// The variant of `function` compiled for these constexprs and these arguments' specialization.
++    /// The variant of `function` compiled for these constexprs and these arguments' specialization; with none captured
++    /// for it, a variant compiled with fewer of Triton's argument assumptions (an int or pointer it did not assume
++    /// divisible by 16, an int it did not fold as the value 1) and the same constexprs: such a kernel is correct for
++    /// every value its assumptions allow, these included. The first such variant in the set's order, so a launch's
++    /// shape always takes the same kernel.
+     pub fn find(self: *const Set, function: []const u8, args: []const Arg, consts: []const Const) !*const Variant {
+         for (self.variants) |*v| {
+             if (!std.mem.eql(u8, v.spec.@"fn", function)) continue;
+-            if (matches(v.spec, args, consts)) return v;
++            if (matches(v.spec, args, consts, false)) return v;
++        }
++        for (self.variants) |*v| {
++            if (!std.mem.eql(u8, v.spec.@"fn", function)) continue;
++            if (matches(v.spec, args, consts, true)) return v;
+         }
+         std.log.err("no captured Triton variant of {s} for this launch:", .{function});
+         for (args) |a| switch (a.value) {
+@@ -142,12 +150,19 @@ pub const Set = struct {
+     }
+ };
+ 
++/// A variant's divisibility assumption against an argument's: equal, or (`general`) not assumed where it holds.
++fn assumes(compiled: bool, holds: bool, general: bool) bool {
++    return compiled == holds or (general and !compiled);
++}
++
+ fn lookup(args: []const Arg, name: []const u8) ?Arg {
+     for (args) |a| if (std.mem.eql(u8, a.name, name)) return a;
+     return null;
+ }
+ 
+-fn matches(k: KernelJson, args: []const Arg, consts: []const Const) bool {
++/// Whether variant `k` was compiled for these constexprs and arguments: exactly their specialization, or (`general`)
++/// any subset of it (an argument divisible by 16 or equal to 1 may take a variant that did not assume so).
++fn matches(k: KernelJson, args: []const Arg, consts: []const Const, general: bool) bool {
+     for (consts) |c| {
+         const got = k.consts.map.get(c.name) orelse return false;
+         if (c.int) |x| if (got.int == null or got.int.? != x) return false;
+@@ -168,12 +183,12 @@ fn matches(k: KernelJson, args: []const Arg, consts: []const Const) bool {
+                 }
+                 const p = param.?;
+                 if (!std.mem.eql(u8, p.type, "i32")) return false;
+-                if (!p.nospec and x == 1) return false;
+-                if (p.div16 != (!p.nospec and @mod(x, 16) == 0)) return false;
++                if (!general and !p.nospec and x == 1) return false;
++                if (!assumes(p.div16, !p.nospec and @mod(x, 16) == 0, general)) return false;
+             },
+             .ptr => |x| {
+                 const p = param orelse return false;
+-                if (!std.mem.eql(u8, p.type, x.ty) or p.div16 != (x.addr % 16 == 0)) return false;
++                if (!std.mem.eql(u8, p.type, x.ty) or !assumes(p.div16, x.addr % 16 == 0, general)) return false;
+             },
+             .f32 => {
+                 const p = param orelse return false;
+@@ -181,7 +196,7 @@ fn matches(k: KernelJson, args: []const Arg, consts: []const Const) bool {
+             },
+             .u64 => |x| {
+                 const p = param orelse return false;
+-                if (!std.mem.eql(u8, p.type, "u64") or p.div16 != (x % 16 == 0)) return false;
++                if (!std.mem.eql(u8, p.type, "u64") or !assumes(p.div16, x % 16 == 0, general)) return false;
+             },
+         }
+         runtime += 1;

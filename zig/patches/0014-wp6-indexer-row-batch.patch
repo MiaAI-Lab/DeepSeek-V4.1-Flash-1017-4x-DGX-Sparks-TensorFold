@@ -1,0 +1,262 @@
+diff --git a/zig/build/cuda.zig b/zig/build/cuda.zig
+index e5459ca..1a20015 100644
+--- a/zig/build/cuda.zig
++++ b/zig/build/cuda.zig
+@@ -139,6 +139,12 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
+     ds_hc_replay.addImport("dsv41", ds_check.import_table.get("dsv41").?);
+     ds_hc_replay.addImport("cuda", cuda);
+     b.installArtifact(b.addExecutable(.{ .name = "tf-dsv41-hc-replay", .root_module = ds_hc_replay }));
++    // WP6: _index_score_rows at TF_DS_IDX_RB=1 (today) vs 2 (the kit's own other capture), random fixed-seed data,
++    // keyed and plain, even and odd row counts, bit compared
++    const ds_idx_replay = b.createModule(.{ .root_source_file = b.path("zig/src/families/dsv41/idx_replay_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
++    ds_idx_replay.addImport("dsv41", ds_check.import_table.get("dsv41").?);
++    ds_idx_replay.addImport("cuda", cuda);
++    b.installArtifact(b.addExecutable(.{ .name = "tf-dsv41-idx-replay", .root_module = ds_idx_replay }));
+     // the Engram reader's buffered, O_DIRECT and AIO paths on the real tables, every byte compared
+     const ds_engram = b.createModule(.{ .root_source_file = b.path("zig/src/families/dsv41/engram_check_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
+     ds_engram.addImport("dsv41", ds_check.import_table.get("dsv41").?);
+diff --git a/zig/src/families/dsv41/idx_replay_main.zig b/zig/src/families/dsv41/idx_replay_main.zig
+new file mode 100644
+index 0000000..91c09f6
+--- /dev/null
++++ b/zig/src/families/dsv41/idx_replay_main.zig
+@@ -0,0 +1,172 @@
++//! WP6 (docs/prefill-plan.md): the indexer's prompt-chunk scoring kernel (_index_score_rows) called once with
++//! TF_DS_IDX_RB's kernel-side RB=1 (today's default: the kit dequantizes its 64-key tile once a row) and once
++//! with RB=2 (the kit's own captured alternative: once per 2 rows) on identical input, then compares the score
++//! output (and, in the "keyed" mode, the tile maxima) bit for bit. Real AOT kernel, no checkpoint: this tests
++//! only that RB=2 is the same arithmetic as RB=1, not anything about the model's actual indexer weights.
++//! Two "keys" modes (prompt.zig's two indexScore call sites: ch.keys with tmax, or plain ch.score without) and
++//! two row counts, one a multiple of 2 and one odd (the last RB=2 group then covers a single valid row), since
++//! the real engine's row-block size is not guaranteed even.
++//!   tf-dsv41-idx-replay AOT_DIR
++const std = @import("std");
++const cuda = @import("cuda");
++const dsv41 = @import("dsv41");
++const tri_index = dsv41.tri_index;
++
++const IH: usize = 32;
++const ID: usize = 128;
++const N: usize = 256; // compressed keys visible: 4 tiles of 64
++
++fn fillBf16(buf: cuda.DeviceBuffer, rng: *std.Random.DefaultPrng, a: std.mem.Allocator) !void {
++    const n = buf.len / 2;
++    const host = try a.alloc(u16, n);
++    defer a.free(host);
++    for (host) |*v| {
++        const f: f32 = rng.random().floatNorm(f32) * 0.5;
++        v.* = @truncate(@as(u32, @bitCast(f)) >> 16);
++    }
++    try buf.upload(0, std.mem.sliceAsBytes(host));
++}
++
++/// K's packed FP4 codes (random nibbles: every bit pattern is a valid E2M1 code, no NaN/Inf to worry about) and
++/// E8M0 scales (random bytes in [23, 127]: check_native.py's "fast scaling" range, powers of two in [2^-104, 1]).
++fn fillK(codes: cuda.DeviceBuffer, scales: cuda.DeviceBuffer, rng: *std.Random.DefaultPrng, a: std.mem.Allocator) !void {
++    const cb = try a.alloc(u8, codes.len);
++    defer a.free(cb);
++    for (cb) |*v| v.* = rng.random().int(u8);
++    try codes.upload(0, cb);
++    const sb = try a.alloc(u8, scales.len);
++    defer a.free(sb);
++    for (sb) |*v| v.* = 23 + rng.random().uintLessThan(u8, 127 - 23 + 1);
++    try scales.upload(0, sb);
++}
++
++/// VIS: strictly increasing with row index (causal: row r sees up to roughly its own position), varied so an
++/// RB=2 group's two rows do not always share the same visible count -- the per-row masking must stay per-row
++/// even when the tile dequant is shared.
++fn fillVis(buf: cuda.DeviceBuffer, rows: usize, a: std.mem.Allocator) !void {
++    const host = try a.alloc(i64, rows);
++    defer a.free(host);
++    for (host, 0..) |*v, r| v.* = @intCast(@min(N, 16 + r * 3));
++    try buf.upload(0, std.mem.sliceAsBytes(host));
++}
++
++fn zero(buf: cuda.DeviceBuffer, a: std.mem.Allocator) !void {
++    const z = try a.alloc(u8, buf.len);
++    @memset(z, 0);
++    try buf.upload(0, z);
++}
++
++fn runCase(t: dsv41.tri.Tri, stream: cuda.Stream, a: std.mem.Allocator, q: cuda.DeviceBuffer, kcodes: cuda.DeviceBuffer, kscales: cuda.DeviceBuffer, wt: cuda.DeviceBuffer, vis: cuda.DeviceBuffer, out: cuda.DeviceBuffer, tmax: ?cuda.DeviceBuffer, keyed: bool, rows: usize) !void {
++    try zero(out, a);
++    if (tmax) |tm| try zero(tm, a);
++    const k: tri_index.IndexK = .{ .fp4 = .{ .codes = kcodes.ptr, .scales = kscales.ptr } };
++    try tri_index.indexScore(t, q.ptr, k, wt.ptr, vis.ptr, N, out.ptr, null, keyed, if (tmax) |tm| tm.ptr else null, false, rows, IH, ID);
++    try stream.synchronize();
++}
++
++pub fn main(init: std.process.Init) !u8 {
++    const a = init.arena.allocator();
++    const io = init.io;
++    const args = try init.minimal.args.toSlice(a);
++    if (args.len < 2) {
++        std.debug.print("usage: tf-dsv41-idx-replay AOT_DIR\n", .{});
++        return 2;
++    }
++
++    var driver = try cuda.Driver.open();
++    defer driver.close();
++    var ctx = try cuda.Context.init(&driver, 0);
++    defer ctx.deinit();
++    var stream = try cuda.Stream.init(&driver, true);
++    defer stream.deinit();
++    var set = try cuda.aot.Set.load(init.gpa, io, &driver, ctx.device, args[1]);
++    const t: dsv41.tri.Tri = .{ .set = &set, .stream = stream, .pdl = true };
++    const d = &driver;
++    var rng = std.Random.DefaultPrng.init(0xc0ffee);
++
++    const nt = (N + 63) / 64;
++    var ok = true;
++    for ([_]usize{ 64, 65 }) |rows| {
++        for ([_]bool{ true, false }) |keyed| {
++            var q = try cuda.DeviceBuffer.alloc(d, rows * IH * ID * 2);
++            defer q.free();
++            var kcodes = try cuda.DeviceBuffer.alloc(d, N * (ID / 2));
++            defer kcodes.free();
++            var kscales = try cuda.DeviceBuffer.alloc(d, N * (ID / 32));
++            defer kscales.free();
++            var wt = try cuda.DeviceBuffer.alloc(d, rows * IH * 2);
++            defer wt.free();
++            var vis = try cuda.DeviceBuffer.alloc(d, rows * 8);
++            defer vis.free();
++            const out_elem: usize = if (keyed) 8 else 4;
++            var out1 = try cuda.DeviceBuffer.alloc(d, rows * N * out_elem);
++            defer out1.free();
++            var out2 = try cuda.DeviceBuffer.alloc(d, rows * N * out_elem);
++            defer out2.free();
++            var tmax1: ?cuda.DeviceBuffer = if (keyed) try cuda.DeviceBuffer.alloc(d, rows * nt * 8) else null;
++            defer if (tmax1) |*b| b.free();
++            var tmax2: ?cuda.DeviceBuffer = if (keyed) try cuda.DeviceBuffer.alloc(d, rows * nt * 8) else null;
++            defer if (tmax2) |*b| b.free();
++
++            try fillBf16(q, &rng, a);
++            try fillK(kcodes, kscales, &rng, a);
++            try fillBf16(wt, &rng, a);
++            try fillVis(vis, rows, a);
++
++            tri_index.idx_rb = 1;
++            try runCase(t, stream, a, q, kcodes, kscales, wt, vis, out1, tmax1, keyed, rows);
++            tri_index.idx_rb = 2;
++            try runCase(t, stream, a, q, kcodes, kscales, wt, vis, out2, tmax2, keyed, rows);
++
++            const b1 = try a.alloc(u8, out1.len);
++            try out1.download(0, b1);
++            const b2 = try a.alloc(u8, out2.len);
++            try out2.download(0, b2);
++            const label = if (keyed) "keyed" else "plain";
++            if (std.mem.eql(u8, b1, b2)) {
++                std.debug.print("ok   rows={d} {s}: OUT bit-identical RB=1 vs RB=2\n", .{ rows, label });
++            } else {
++                var nd: usize = 0;
++                var first: ?usize = null;
++                if (keyed) {
++                    const v1 = std.mem.bytesAsSlice(i64, b1);
++                    const v2 = std.mem.bytesAsSlice(i64, b2);
++                    for (v1, v2, 0..) |x, y, i| {
++                        if (x != y) {
++                            nd += 1;
++                            if (first == null) first = i;
++                        }
++                    }
++                } else {
++                    const v1 = std.mem.bytesAsSlice(u32, b1);
++                    const v2 = std.mem.bytesAsSlice(u32, b2);
++                    for (v1, v2, 0..) |x, y, i| {
++                        if (x != y) {
++                            nd += 1;
++                            if (first == null) first = i;
++                        }
++                    }
++                }
++                std.debug.print("FAIL rows={d} {s}: OUT differs, {d}/{d} elements, first at {d}\n", .{ rows, label, nd, b1.len / out_elem, first.? });
++                ok = false;
++            }
++            if (keyed) {
++                const t1 = try a.alloc(u8, tmax1.?.len);
++                try tmax1.?.download(0, t1);
++                const t2 = try a.alloc(u8, tmax2.?.len);
++                try tmax2.?.download(0, t2);
++                if (std.mem.eql(u8, t1, t2)) {
++                    std.debug.print("ok   rows={d} {s}: TMAX bit-identical RB=1 vs RB=2\n", .{ rows, label });
++                } else {
++                    std.debug.print("FAIL rows={d} {s}: TMAX differs\n", .{ rows, label });
++                    ok = false;
++                }
++            }
++        }
++    }
++    if (ok) {
++        std.debug.print("WP6: _index_score_rows RB=2 == RB=1 (OUT and TMAX, keyed and plain, even and odd row counts)\n", .{});
++        return 0;
++    }
++    return 1;
++}
+diff --git a/zig/src/families/dsv41/model.zig b/zig/src/families/dsv41/model.zig
+index 3dbbd8e..c1de397 100644
+--- a/zig/src/families/dsv41/model.zig
++++ b/zig/src/families/dsv41/model.zig
+@@ -30,6 +30,7 @@ const comm_mod = @import("comm.zig");
+ const link = @import("link.zig");
+ const ring2d = @import("ring2d.zig");
+ const rdma = @import("rdma.zig");
++const tri_index = @import("tri_index.zig");
+ 
+ /// The served prompt chunk (TF_DS_PREFILL_CHUNK): a prompt runs in chunks that start at its multiples.
+ pub const chunk_rows = 2048;
+@@ -190,6 +191,10 @@ pub const Model = struct {
+         m.world = o.world;
+         if (o.streams == 0 or o.streams > max_streams) return error.BadStreams;
+         m.streams = o.streams;
++        // WP6 (docs/prefill-plan.md): TF_DS_IDX_RB=2 batches the indexer's prompt-chunk scoring kernel to the
++        // kit's own captured RB=2 variant (dequantizing a 64-key tile once for 2 rows instead of 1); the kit
++        // never captured RB above 2. Off (RB=1, today's behavior) unless set; validate on your own ring first.
++        if (std.c.getenv("TF_DS_IDX_RB")) |v| tri_index.idx_rb = std.fmt.parseInt(usize, std.mem.span(v), 10) catch tri_index.idx_rb;
+         if (std.c.getenv("TF_DS_L2_SKIP")) |v| round.l2_skip = std.fmt.parseInt(u8, std.mem.span(v), 10) catch 0;
+         for ([_][:0]const u8{ "TF_DS_L2_ATTN_MB", "TF_DS_L2_MOE_MB", "TF_DS_L2_NEXT_MB", "TF_DS_L2_STRETCH_END_MB" }, 0..) |name, i| {
+             if (std.c.getenv(name)) |v| round.l2_mb[i] = std.fmt.parseInt(u64, std.mem.span(v), 10) catch round.l2_mb[i];
+diff --git a/zig/src/families/dsv41/tri_index.zig b/zig/src/families/dsv41/tri_index.zig
+index 09c5582..cfa5fa9 100644
+--- a/zig/src/families/dsv41/tri_index.zig
++++ b/zig/src/families/dsv41/tri_index.zig
+@@ -15,7 +15,10 @@ pub const tile = 64;
+ /// kernels.TOPK_FUSED_MAX (TF_DS_TOPK_FUSED_MAX unset): keys a row the fused selection takes at most.
+ pub const topk_fused_max = 4096;
+ /// kernels.IDX_RB with IDX_TREE on (TF_DS_IDX_TREE / TF_DS_IDX_RB unset): prompt chunks' scores one row a program.
+-const idx_rb = 1;
++/// WP6 (docs/prefill-plan.md): the kit's own `_index_score_rows` is already captured at RB=2 (dequantizing a
++/// 64-key tile once for 2 rows instead of 1; TF_DS_IDX_RB=2 set once at startup, model.zig), but not at RB=1's
++/// "TREE" constexpr -- the matching capture simply has no TREE entry, so the call below only asks for it at RB=1.
++pub var idx_rb: usize = 1;
+ /// What topk_select_pruned's `every` holds in each row: a visible count past every tile position.
+ pub const every_vis: i64 = 1 << 40;
+ 
+@@ -83,14 +86,22 @@ pub fn indexScore(t: Tri, q: u64, k: IndexK, w: u64, vis: u64, n: usize, out: u6
+         });
+     }
+     std.debug.assert(base == null);
+-    try t.run("_index_score_rows", .{ tri.cdiv(rows, idx_rb), nt, 1 }, &.{
++    const rb_args = [_]aot.Arg{
+         p("Q", "*bf16", q),    p("K", k.ty(), k.codes()), p("KS", k.ty(), k.scales()), p("Wt", "*bf16", w),
+         p("VIS", "*i64", vis), p("OUT", ot, out),         int("n", n),                 int("rows", rows),
+         tm,                    int("nt", nt),
+-    }, &.{
+-        ci("IH", ih),     ci("ID", id),                          ci("BN", tile),   ci("RB", idx_rb), cb("PACKED", k == .fp4),
+-        cb("KEYS", keys), cb("HAS_TMAX", tmax != null and keys), cb("TREE", true),
+-    });
++    };
++    const rb_base_consts = [_]aot.Const{
++        ci("IH", ih),     ci("ID", id),                          ci("BN", tile),   ci("RB", idx_rb),
++        cb("PACKED", k == .fp4), cb("KEYS", keys), cb("HAS_TMAX", tmax != null and keys),
++    };
++    // RB=1 is the only row count the kit captured with a "TREE" constexpr at all; every RB=2 capture has no
++    // TREE entry, so asking for one there (aot.Set.find requires an exact name match) would always miss.
++    if (idx_rb == 1) {
++        try t.run("_index_score_rows", .{ tri.cdiv(rows, idx_rb), nt, 1 }, &rb_args, &(rb_base_consts ++ [_]aot.Const{cb("TREE", true)}));
++    } else {
++        try t.run("_index_score_rows", .{ tri.cdiv(rows, idx_rb), nt, 1 }, &rb_args, &rb_base_consts);
++    }
+ }
+ 
+ /// index_keys: index_score's int64 keys (decode windows), apply_candidates' mask folded in; pruned_k: topk_select_pruned's k.

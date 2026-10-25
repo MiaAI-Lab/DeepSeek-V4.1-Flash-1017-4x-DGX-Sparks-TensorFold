@@ -1,0 +1,199 @@
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index 015239a2..6c8572e7 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -51,6 +51,9 @@ pub const LaneHost = struct {
+     // and frees its extent (its kept state then resumes in place) instead of waiting out every queued pass, as the
+     // Python lane's fills leave decoding its share
+     finish_until: ?i96 = null,
++    // Track D: a round run between an admitting job's prompt chunks failed (its error): once the prompt's pass has
++    // unwound, every admitted job fails with it, as after any failed round
++    between_failed: ?[]const u8 = null,
+ 
+     const Mark = struct { at: i96, tokens: u64 };
+     const full_retry_ns: i96 = std.time.ns_per_s;
+@@ -197,6 +200,40 @@ pub const LaneHost = struct {
+         job.sink.event(job.sink.ctx, job.id, &event);
+     }
+ 
++    /// Track D: between this admitting job's prompt chunks, the other jobs' cancels taken (this one's stay queued for
++    /// its own pass to see), then a round of the streams already live and their new tokens delivered, as the host's loop
++    /// does after any round. A failed round ends this prompt's pass; admitOne then fails every admitted job.
++    fn between(ctx: *anyopaque) anyerror!void {
++        const job: *Job = @ptrCast(@alignCast(ctx));
++        const h = job.host;
++        h.takeCancelsExcept(job);
++        if (h.core.activeCount() == 0) return;
++        h.core.step() catch |e| {
++            h.between_failed = @errorName(e);
++            return e;
++        };
++        var i: usize = 0;
++        while (i < h.admitted.items.len) {
++            const other = h.admitted.items[i];
++            if (other == job or !other.started) {
++                i += 1;
++                continue;
++            }
++            if (h.deliver(other)) {
++                h.lock();
++                _ = h.admitted.orderedRemove(i);
++                h.unlock();
++            } else i += 1;
++        }
++    }
++
++    /// Whether a round between an admitting job's chunks would run (another stream is live): the backend asks first,
++    /// so a prompt alone keeps its read-ahead.
++    fn betweenReady(ctx: *anyopaque) bool {
++        const job: *Job = @ptrCast(@alignCast(ctx));
++        return job.host.core.activeCount() > 0;
++    }
++
+     /// A job's cancel hook for its prompt pass: its id is in `cancels`, or the host is closing (read under the lock).
+     fn cancelled(ctx: *anyopaque) bool {
+         const job: *Job = @ptrCast(@alignCast(ctx));
+@@ -256,11 +293,43 @@ pub const LaneHost = struct {
+         h.decoded.append(h.gpa, .{ .at = now, .tokens = n }) catch {};
+     }
+ 
++    /// takeCancels for every job but `keep` (an admitting job in its prompt pass): under the one lock that takes the
++    /// other ids, `keep`'s stay named (for its pass's own check and the loop after it), so a cancel of it arriving
++    /// meanwhile can never free it here.
++    fn takeCancelsExcept(h: *LaneHost, keep: *Job) void {
++        h.mutex.lockUncancelable(h.io);
++        var ids: std.ArrayList(Id) = .empty;
++        var i: usize = 0;
++        while (i < h.cancels.items.len) {
++            const id = h.cancels.items[i];
++            if (id == keep.id) {
++                i += 1;
++                continue;
++            }
++            ids.append(h.gpa, id) catch {
++                i += 1;
++                continue;
++            };
++            _ = h.cancels.orderedRemove(i);
++        }
++        h.mutex.unlock(h.io);
++        h.cancelIds(ids.items);
++        ids.deinit(h.gpa);
++    }
++
+     /// Cancels queued and admitted jobs named since the last round.
+     fn takeCancels(h: *LaneHost) void {
+         h.mutex.lockUncancelable(h.io);
+         const ids = h.gpa.dupe(Id, h.cancels.items) catch &.{};
+         h.cancels.clearRetainingCapacity();
++        h.mutex.unlock(h.io);
++        h.cancelIds(ids);
++        h.gpa.free(ids);
++    }
++
++    /// The jobs these ids name, queued or admitted, cancelled (their ids already taken from `cancels`).
++    fn cancelIds(h: *LaneHost, ids: []const Id) void {
++        h.mutex.lockUncancelable(h.io);
+         var dropped: std.ArrayList(*Job) = .empty;
+         for (ids) |id| {
+             for (h.queued.items, 0..) |job, i| if (job.id == id) {
+@@ -281,7 +350,6 @@ pub const LaneHost = struct {
+                 break;
+             };
+         }
+-        h.gpa.free(ids);
+     }
+ 
+     fn lock(h: *LaneHost) void {
+@@ -352,11 +420,19 @@ pub const LaneHost = struct {
+             job.proposer.deinit();
+             return h.drop(job, "out of memory");
+         };
++        job.stream.between = .{ .ptr = job, .run = between, .ready = betweenReady };
+         job.started = true;
+         const began = std.Io.Clock.awake.now(h.io).toNanoseconds();
+         job.began = began;
+         if (h.loneFits(job)) return h.runLone(job, began);
+         h.core.addStream(&job.stream) catch |e| {
++            if (h.between_failed) |msg| {
++                // a round between this prompt's chunks failed: this job and every admitted one end with its error
++                h.between_failed = null;
++                _ = h.drop(job, msg);
++                h.failAll(msg);
++                return true;
++            }
+             if (e == error.Cancelled) return h.cancel(job);
+             if (e == error.ContextFull and h.core.activeCount() > 0) return h.requeue(job);
+             return h.drop(job, h.words(e));
+diff --git a/zig/src/core/lanes/stream.zig b/zig/src/core/lanes/stream.zig
+index 6a1a6687..0d30eca3 100644
+--- a/zig/src/core/lanes/stream.zig
++++ b/zig/src/core/lanes/stream.zig
+@@ -88,6 +88,15 @@ pub const MarkHook = struct {
+     at: *const fn (ptr: *anyopaque, s: *Stream, at: u32) void,
+ };
+ 
++/// Called between prompt chunks after the chunk's mark hook, the GPU's queue holding the chunk (the decode plan's Track
++/// D, resumable prefill): the host's turn to run a round of the streams already decoding, so one prompt's pass stops
++/// nobody's decode for its whole length. An error ends this prompt's pass.
++pub const BetweenHook = struct {
++    ptr: *anyopaque,
++    run: *const fn (ptr: *anyopaque) anyerror!void,
++    ready: *const fn (ptr: *anyopaque) bool, // whether `run` would run a round (another stream is live)
++};
++
+ /// Drafts the backend holds for the stream's next round; a tree keeps its tokens and parents on the host.
+ pub const Held = struct {
+     count: u32,
+@@ -157,6 +166,7 @@ pub const Stream = struct {
+     chunks: []const u32,
+     reuse: Reuse = .{},
+     images: []const Image = &.{},
++    between: ?BetweenHook = null, // the host's round between this stream's prompt chunks (a backend may call it)
+     cached: u32 = 0, // prompt tokens the backend restored from `reuse` (its prompt pass started there)
+     reuse_failed: bool = false, // the backend's restore of `reuse` failed: it prefilled from 0
+     context: std.ArrayList(u32) = .empty,
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index ea00905c..37943059 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -395,6 +395,13 @@ pub const Lanes = struct {
+         return std.mem.eql(u8, std.mem.span(v), "1");
+     }
+ 
++    /// TF_DS_PREFILL_YIELD=1: Track D, a decode round of the live streams between a prompt's chunks. Unset or any other
++    /// value: the whole prompt first, as served.
++    fn yieldOn() bool {
++        const v = std.c.getenv("TF_DS_PREFILL_YIELD") orelse return false;
++        return std.mem.eql(u8, std.mem.span(v), "1");
++    }
++
+     /// TF_DS_PASS_MS="a,b": the batched pass's ms for N drafting streams, a + b N (prepass's price of the pass). Unset:
+     /// 2.6 + 1.1 N, the fit of the lane profiles of 2026-10-25 (4.0 ms at 1 stream, 6.0 at 3.2, 9.0 at 5.8).
+     fn passMs() [2]f64 {
+@@ -598,6 +605,15 @@ pub const Lanes = struct {
+             head = try m.fillChunk(seq.items[0 .. start + n], start, n, replay);
+             start += n;
+             if (s.images.len == 0) if (s.reuse.hook) |k| if (start < len and start <= replay and (start == last_end or markEnds(s.reuse.marks, start))) k.at(k.ptr, s, @intCast(start));
++            // Track D (TF_DS_PREFILL_YIELD=1): a round of the other live streams before the next chunk. The prompt's
++            // chunks and their boundaries are the same (its state between chunks is its extent's rows and its slot's,
++            // which a round of other slots leaves alone); the Engram read-ahead is joined first (as a follower joins it
++            // before any round) and its sequence put back after, so the next chunk reads ahead again
++            if (start < len) if (s.between) |b| if (yieldOn() and b.ready(b.ptr)) {
++                m.joinAhead();
++                try b.run(b.ptr);
++                m.fill_seq = seq.items;
++            };
+         }
+         if (!head) return error.NoPromptLogits;
+         const logits = try m.promptLogitsHost();
+@@ -1001,6 +1017,9 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
+                 const n: usize = try r.int(u32);
+                 const replay: usize = @intCast(try r.int(u64));
+                 if (start + n > seqs[slot].items.len) return error.BadChunk;
++                // a round between this prompt's chunks (Track D) joined the read-ahead and cleared its sequence: rank 0
++                // puts its own back, and so does this rank (the same reads either way; the same bits)
++                if (m.fill_seq.len == 0) m.fill_seq = seqs[slot].items;
+                 _ = m.fillChunk(seqs[slot].items[0 .. start + n], start, n, replay) catch |err| refused(err);
+             },
+             .verify => {

@@ -1,0 +1,280 @@
+diff --git a/zig/build/cuda.zig b/zig/build/cuda.zig
+index 9a5f12c..e5459ca 100644
+--- a/zig/build/cuda.zig
++++ b/zig/build/cuda.zig
+@@ -134,6 +134,11 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
+     ds_rdma.addImport("dsv41", ds_check.import_table.get("dsv41").?);
+     ds_rdma.addImport("cuda", cuda);
+     b.installArtifact(b.addExecutable(.{ .name = "tf-dsv41-rdma-bench", .root_module = ds_rdma }));
++    // WP0 4.3b: hc_pre_pf (_hc_mix_pf, _hc_finish) full-chunk vs four row-quarters, random fixed-seed data, bit compared
++    const ds_hc_replay = b.createModule(.{ .root_source_file = b.path("zig/src/families/dsv41/hc_replay_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
++    ds_hc_replay.addImport("dsv41", ds_check.import_table.get("dsv41").?);
++    ds_hc_replay.addImport("cuda", cuda);
++    b.installArtifact(b.addExecutable(.{ .name = "tf-dsv41-hc-replay", .root_module = ds_hc_replay }));
+     // the Engram reader's buffered, O_DIRECT and AIO paths on the real tables, every byte compared
+     const ds_engram = b.createModule(.{ .root_source_file = b.path("zig/src/families/dsv41/engram_check_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
+     ds_engram.addImport("dsv41", ds_check.import_table.get("dsv41").?);
+diff --git a/zig/src/families/dsv41/hc_replay_main.zig b/zig/src/families/dsv41/hc_replay_main.zig
+new file mode 100644
+index 0000000..c8966ec
+--- /dev/null
++++ b/zig/src/families/dsv41/hc_replay_main.zig
+@@ -0,0 +1,258 @@
++//! WP0 4.3b: hc_pre_pf (tri_hc.hcPrePf: hcMixPf's _hc_mix_pf, then _hc_finish) called once as a 2048-row launch and
++//! once as four 512-row launches on the same per-row input (random, fixed seed), each quarter's gathered plane
++//! repacked into its own [world, 512, D] buffer -- the layout WP4's quarter-HC design actually holds (plan.md:
++//! "it packs both original partial planes into G[2, 512, 5120]"), not a re-sliced view of the full one, since a
++//! [world, rows, D] buffer has rows nested inside world and a row-range isn't a single contiguous slice across it.
++//! Compares the posted stream (h_out), the finish's coefficients (post, comb) and the normed output (x) bit for
++//! bit between the two row counts. Real AOT kernel, no checkpoint: row-independence needs identical per-row
++//! inputs in both launches, not real weights (those are layer-wide constants, not row-indexed, and get a fixed
++//! random fill too since every launch shares the same pointer for them regardless of row count).
++//!   tf-dsv41-hc-replay AOT_DIR
++const std = @import("std");
++const cuda = @import("cuda");
++const dsv41 = @import("dsv41");
++const tri_hc = dsv41.tri_hc;
++
++const D: usize = 5120;
++const HC: usize = 4;
++const WORLD: usize = 2;
++const ROWS: usize = 2048;
++const QROWS: usize = 512;
++const NQ: usize = ROWS / QROWS;
++
++/// Bounded random fp32 values (not raw random bytes: those hit NaN/Inf exponent patterns ~25% of the time, and
++/// NaN/Inf propagation through a reduction tree is order-dependent -- not a real row-independence question, just
++/// an invalid test). Range matches check_native.py's own synthetic-input convention (small multiples of randn).
++fn fillF32(buf: cuda.DeviceBuffer, rng: *std.Random.DefaultPrng, a: std.mem.Allocator) !void {
++    const n = buf.len / 4;
++    const host = try a.alloc(f32, n);
++    defer a.free(host);
++    for (host) |*v| v.* = rng.random().floatNorm(f32) * 0.5;
++    try buf.upload(0, std.mem.sliceAsBytes(host));
++}
++
++/// Zero `n` bytes of `buf` at `off` -- the kernel may mix INTO its outputs (XO reads its own prior content, per
++/// the doc comment's "fuses the previous ... post" language) rather than purely overwriting, so every call needs
++/// a clean zero first, not just the very first one.
++fn zero(buf: cuda.DeviceBuffer, off: usize, n: usize, a: std.mem.Allocator) !void {
++    const z = try a.alloc(u8, n);
++    @memset(z, 0);
++    try buf.upload(off, z);
++}
++
++fn fillBf16(buf: cuda.DeviceBuffer, rng: *std.Random.DefaultPrng, a: std.mem.Allocator) !void {
++    const n = buf.len / 2;
++    const host = try a.alloc(u16, n);
++    defer a.free(host);
++    for (host) |*v| {
++        const f: f32 = rng.random().floatNorm(f32) * 0.5;
++        v.* = @truncate(@as(u32, @bitCast(f)) >> 16);
++    }
++    try buf.upload(0, std.mem.sliceAsBytes(host));
++}
++
++fn eqBytes(d: *const cuda.Driver, a: std.mem.Allocator, buf: cuda.DeviceBuffer, off: usize, len: usize, other: cuda.DeviceBuffer, ooff: usize) !bool {
++    const x = try a.alloc(u8, len);
++    defer a.free(x);
++    const y = try a.alloc(u8, len);
++    defer a.free(y);
++    try buf.download(off, x);
++    try other.download(ooff, y);
++    _ = d;
++    return std.mem.eql(u8, x, y);
++}
++
++pub fn main(init: std.process.Init) !u8 {
++    const a = init.arena.allocator();
++    const io = init.io;
++    const args = try init.minimal.args.toSlice(a);
++    if (args.len < 2) {
++        std.debug.print("usage: tf-dsv41-hc-replay AOT_DIR\n", .{});
++        return 2;
++    }
++
++    var driver = try cuda.Driver.open();
++    defer driver.close();
++    var ctx = try cuda.Context.init(&driver, 0);
++    defer ctx.deinit();
++    var stream = try cuda.Stream.init(&driver, true);
++    defer stream.deinit();
++    var set = try cuda.aot.Set.load(init.gpa, io, &driver, ctx.device, args[1]);
++    const t: dsv41.tri.Tri = .{ .set = &set, .stream = stream, .pdl = true };
++
++    var rng = std.Random.DefaultPrng.init(0xc0ffee);
++    const d = &driver;
++
++    // Row-indexed buffers, full 2048 rows: allocate once, quarters are pointer slices into the same buffer.
++    var h = try cuda.DeviceBuffer.alloc(d, ROWS * HC * D * 2); // bf16 [rows, hc, D]: the input streams
++    defer h.free();
++    var h_out = try cuda.DeviceBuffer.alloc(d, ROWS * HC * D * 2); // bf16 [rows, hc, D]: the posted result (XO)
++    defer h_out.free();
++    var out = try cuda.DeviceBuffer.alloc(d, ROWS * D * 2); // bf16 [rows, D]: x, the finish's normed output
++    defer out.free();
++    var part = try cuda.DeviceBuffer.alloc(d, ROWS * 40 * 32 * 4); // fp32 scratch
++    defer part.free();
++    var pre_in = try cuda.DeviceBuffer.alloc(d, ROWS * HC * 4); // fp32 [rows, hc]
++    defer pre_in.free();
++    var pre_out = try cuda.DeviceBuffer.alloc(d, ROWS * HC * 4);
++    defer pre_out.free();
++    var post = try cuda.DeviceBuffer.alloc(d, ROWS * HC * 4);
++    defer post.free();
++    var comb = try cuda.DeviceBuffer.alloc(d, ROWS * HC * HC * 4);
++    defer comb.free();
++
++    // Layer-wide constants (not row-indexed): one fixed random fill, same pointer for every launch.
++    var fn_w = try cuda.DeviceBuffer.alloc(d, 24 * HC * D * 4); // fp32 [24, hc*D]
++    defer fn_w.free();
++    var scale = try cuda.DeviceBuffer.alloc(d, 3 * 4);
++    defer scale.free();
++    var base = try cuda.DeviceBuffer.alloc(d, 24 * 4);
++    defer base.free();
++    var norm_w = try cuda.DeviceBuffer.alloc(d, D * 2); // bf16 [D]
++    defer norm_w.free();
++
++    // The full gathered plane [world, rows, D] fp32 (world outermost: a row-quarter is not one contiguous slice
++    // of this, hence the repack below).
++    var gathered_full = try cuda.DeviceBuffer.alloc(d, WORLD * ROWS * D * 4);
++    defer gathered_full.free();
++
++    for ([_]cuda.DeviceBuffer{ h, norm_w }) |buf| try fillBf16(buf, &rng, a);
++    for ([_]cuda.DeviceBuffer{ part, pre_in, post, comb, fn_w, scale, base, gathered_full }) |buf| try fillF32(buf, &rng, a);
++    // Zero every output-ish buffer before each call: XO (h_out) reads its own prior content ("fuses the previous
++    // sublayer's post", per hcPre2's doc comment), so a second call on top of the first call's leftovers is not
++    // the same computation -- not a pure-overwrite output despite the earlier naming assumption.
++    try zero(h_out, 0, h_out.len, a);
++    try zero(out, 0, out.len, a);
++    try zero(pre_out, 0, pre_out.len, a);
++    try zero(post, 0, post.len, a);
++    try zero(comb, 0, comb.len, a);
++
++    // The full 2048-row launch.
++    _ = try tri_hc.hcPrePf(t, h.ptr, fn_w.ptr, scale.ptr, base.ptr, pre_in.ptr, norm_w.ptr, 1e-20, 1e-6, 20, out.ptr, pre_out.ptr, post.ptr, comb.ptr, part.ptr, .{ .gathered = gathered_full.ptr, .world = WORLD, .h_out = h_out.ptr }, ROWS, D);
++    try stream.synchronize();
++
++    // Snapshot the full run's outputs before the quarter runs overwrite the same buffers.
++    const full_h_out = try a.alloc(u8, h_out.len);
++    try h_out.download(0, full_h_out);
++    const full_out = try a.alloc(u8, out.len);
++    try out.download(0, full_out);
++    const full_pre_out = try a.alloc(u8, pre_out.len);
++    try pre_out.download(0, full_pre_out);
++    const full_post = try a.alloc(u8, post.len);
++    try post.download(0, full_post);
++    const full_comb = try a.alloc(u8, comb.len);
++    try comb.download(0, full_comb);
++
++    // Control: repeat the SAME full 2048-row launch again, untouched inputs (but freshly zeroed outputs -- see
++    // above), and check it reproduces itself -- isolates whether a mismatch below is from row-slicing or
++    // something more basic (determinism, plumbing).
++    try zero(h_out, 0, h_out.len, a);
++    try zero(out, 0, out.len, a);
++    try zero(pre_out, 0, pre_out.len, a);
++    try zero(post, 0, post.len, a);
++    try zero(comb, 0, comb.len, a);
++    _ = try tri_hc.hcPrePf(t, h.ptr, fn_w.ptr, scale.ptr, base.ptr, pre_in.ptr, norm_w.ptr, 1e-20, 1e-6, 20, out.ptr, pre_out.ptr, post.ptr, comb.ptr, part.ptr, .{ .gathered = gathered_full.ptr, .world = WORLD, .h_out = h_out.ptr }, ROWS, D);
++    try stream.synchronize();
++    {
++        const repeat_out = try a.alloc(u8, out.len);
++        try out.download(0, repeat_out);
++        if (std.mem.eql(u8, repeat_out, full_out)) {
++            std.debug.print("control: repeating the SAME full 2048-row launch reproduces x exactly\n", .{});
++        } else {
++            var nd: usize = 0;
++            for (std.mem.bytesAsSlice(u16, repeat_out), std.mem.bytesAsSlice(u16, full_out)) |qv, rv| {
++                if (qv != rv) nd += 1;
++            }
++            std.debug.print("control FAILED: repeating the SAME full 2048-row launch gives a different x ({d}/{d} elements) -- not a row-slicing issue, something more basic\n", .{ nd, out.len / 2 });
++        }
++    }
++
++    // Four 512-row launches, each on its own row-slice of h/out/part/pre_in/pre_out/post/comb/h_out (all
++    // row-outermost, so a pointer offset is exactly the real engine's own row-slicing) and its own freshly
++    // repacked [world, 512, D] gathered plane (WP4's actual layout, not a re-slice of the full one).
++    var gq = try cuda.DeviceBuffer.alloc(d, WORLD * QROWS * D * 4);
++    defer gq.free();
++    // `part` is pure intermediate scratch, written by hc_mix_pf and read back by finish within the SAME call --
++    // it never carries state between calls, so its layout (documented only as a flat element count, not a
++    // dimension order) never needs to be sliced by row at all: give each quarter its own buffer, sized for
++    // QROWS from scratch, exactly as the real engine would size ch.part for a 512-row chunk.
++    var part_q = try cuda.DeviceBuffer.alloc(d, QROWS * 40 * 32 * 4);
++    defer part_q.free();
++    var ok = true;
++    for (0..NQ) |qi| {
++        const row0 = qi * QROWS;
++        for (0..WORLD) |w| {
++            const src = gathered_full.ptr + @as(u64, @intCast((w * ROWS + row0) * D * 4));
++            const dst = gq.ptr + @as(u64, @intCast(w * QROWS * D * 4));
++            try d.check(d.api.cuMemcpyDtoDAsync_v2(dst, src, QROWS * D * 4, stream.handle), "cuMemcpyDtoDAsync");
++        }
++        try stream.synchronize();
++        const hq = h.ptr + @as(u64, @intCast(row0 * HC * D * 2));
++        const hoq = h_out.ptr + @as(u64, @intCast(row0 * HC * D * 2));
++        const outq = out.ptr + @as(u64, @intCast(row0 * D * 2));
++        const preiq = pre_in.ptr + @as(u64, @intCast(row0 * HC * 4));
++        const preoq = pre_out.ptr + @as(u64, @intCast(row0 * HC * 4));
++        const postq = post.ptr + @as(u64, @intCast(row0 * HC * 4));
++        const combq = comb.ptr + @as(u64, @intCast(row0 * HC * HC * 4));
++        try zero(h_out, row0 * HC * D * 2, QROWS * HC * D * 2, a);
++        try zero(out, row0 * D * 2, QROWS * D * 2, a);
++        try zero(pre_out, row0 * HC * 4, QROWS * HC * 4, a);
++        try zero(post, row0 * HC * 4, QROWS * HC * 4, a);
++        try zero(comb, row0 * HC * HC * 4, QROWS * HC * HC * 4, a);
++        _ = try tri_hc.hcPrePf(t, hq, fn_w.ptr, scale.ptr, base.ptr, preiq, norm_w.ptr, 1e-20, 1e-6, 20, outq, preoq, postq, combq, part_q.ptr, .{ .gathered = gq.ptr, .world = WORLD, .h_out = hoq }, QROWS, D);
++        try stream.synchronize();
++
++        const qbytes_hc = QROWS * HC * D * 2;
++        const qbytes_d = QROWS * D * 2;
++        const qbytes_hc4 = QROWS * HC * 4;
++        const qbytes_hc2_4 = QROWS * HC * HC * 4;
++        var buf = try a.alloc(u8, qbytes_hc);
++        try h_out.download(row0 * HC * D * 2, buf);
++        const ref_hc = full_h_out[row0 * HC * D * 2 ..][0..qbytes_hc];
++        if (!std.mem.eql(u8, buf, ref_hc)) {
++            const qu16 = std.mem.bytesAsSlice(u16, buf);
++            const ru16 = std.mem.bytesAsSlice(u16, ref_hc);
++            var n_diff: usize = 0;
++            var n_signed_zero: usize = 0;
++            var first: ?usize = null;
++            for (qu16, ru16, 0..) |qv, rv, idx| {
++                if (qv == rv) continue;
++                n_diff += 1;
++                if (first == null) first = idx;
++                const both_zero = (qv & 0x7fff) == 0 and (rv & 0x7fff) == 0;
++                if (both_zero) n_signed_zero += 1;
++            }
++            std.debug.print("DIFFERS: h_out (posted stream) quarter {d}: {d}/{d} bf16 elements differ ({d} are +-0 sign-only); first at element {d}: quarter=0x{x:0>4} full=0x{x:0>4}\n", .{ qi, n_diff, qu16.len, n_signed_zero, first.?, qu16[first.?], ru16[first.?] });
++            ok = false;
++        }
++        buf = try a.alloc(u8, qbytes_d);
++        try out.download(row0 * D * 2, buf);
++        if (!std.mem.eql(u8, buf, full_out[row0 * D * 2 ..][0..qbytes_d])) {
++            std.debug.print("DIFFERS: x (normed output) quarter {d}\n", .{qi});
++            ok = false;
++        }
++        buf = try a.alloc(u8, qbytes_hc4);
++        try pre_out.download(row0 * HC * 4, buf);
++        if (!std.mem.eql(u8, buf, full_pre_out[row0 * HC * 4 ..][0..qbytes_hc4])) {
++            std.debug.print("DIFFERS: pre_out quarter {d}\n", .{qi});
++            ok = false;
++        }
++        buf = try a.alloc(u8, qbytes_hc4);
++        try post.download(row0 * HC * 4, buf);
++        if (!std.mem.eql(u8, buf, full_post[row0 * HC * 4 ..][0..qbytes_hc4])) {
++            std.debug.print("DIFFERS: post (coefficients) quarter {d}\n", .{qi});
++            ok = false;
++        }
++        buf = try a.alloc(u8, qbytes_hc2_4);
++        try comb.download(row0 * HC * HC * 4, buf);
++        if (!std.mem.eql(u8, buf, full_comb[row0 * HC * HC * 4 ..][0..qbytes_hc2_4])) {
++            std.debug.print("DIFFERS: comb (coefficients) quarter {d}\n", .{qi});
++            ok = false;
++        }
++    }
++    if (ok) {
++        std.debug.print("WP0 4.3b: hc_pre_pf (full chunk) == hc_pre_pf (four quarters): h_out, x, pre_out, post, comb all bit-identical\n", .{});
++        return 0;
++    }
++    return 1;
++}

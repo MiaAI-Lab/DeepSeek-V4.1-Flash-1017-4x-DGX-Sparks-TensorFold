@@ -1,0 +1,38 @@
+diff --git a/zig/src/families/dsv41/prompt.zig b/zig/src/families/dsv41/prompt.zig
+index 865872e4..95944155 100644
+--- a/zig/src/families/dsv41/prompt.zig
++++ b/zig/src/families/dsv41/prompt.zig
+@@ -183,6 +183,7 @@ pub const Chunk = struct {
+     ids: u64, // int64 [cap]
+     pos: u64, // int64 [n]: start .. start + n (after a replay cut a view into pos0, pos[first:])
+     pos0: u64, // int64 [cap]: the chunk's positions as begin() wrote them
++    pos1: u64 = 0, // int64 [cap]: a replay cut's positions moved to a 16-byte boundary (replayCut)
+     h: u64, // bf16 [cap, hc, D]: the streams
+     h_alt: u64, // their second buffer (hc_pre_pf writes the posted streams there)
+     x: u64, // bf16 [cap, D]: a block's input rows
+@@ -299,6 +300,7 @@ pub const Chunk = struct {
+         ch.pending = false;
+         ch.ids = try a.take(cap * 8);
+         ch.pos0 = try a.take(cap * 8);
++        ch.pos1 = try a.take(cap * 8);
+         ch.pos = ch.pos0;
+         ch.h = try a.take(cap * hc * d * 2);
+         ch.h_alt = try a.take(cap * hc * d * 2);
+@@ -1611,9 +1613,15 @@ pub fn replayCut(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
+     std.mem.swap(u64, &ch.pre, &ch.pre_f);
+     ch.start += first;
+     ch.n = n;
+-    // pos[first:]: a view, first * 8 bytes in (its alignment is the one the served kernels were specialized for)
++    // pos[first:]: a view, first * 8 bytes in (its alignment is the one the served kernels were specialized for). An odd
++    // `first` leaves it off a 16-byte boundary, and the kit has no variant for some launches with such a view (a short
++    // chunk's split attention: _sparse_attn_part with SPLITS > 1 and no row bases); the same positions copied, in the
++    // stream's order, to a 16-byte boundary then: the kernels read the same values from an address they were captured for.
+     _ = host_pos;
+-    ch.pos += first * 8;
++    if ((first * 8) % 16 != 0) {
++        try e.d.check(e.d.api.cuMemcpyDtoDAsync_v2(ch.pos1, ch.pos + first * 8, n * 8, e.s.handle), "cuMemcpyDtoDAsync");
++        ch.pos = ch.pos1;
++    } else ch.pos += first * 8;
+     return true;
+ }
+ 

@@ -1,0 +1,79 @@
+diff --git a/zig/src/families/dsv41/model.zig b/zig/src/families/dsv41/model.zig
+index 51dc3f6..3dbbd8e 100644
+--- a/zig/src/families/dsv41/model.zig
++++ b/zig/src/families/dsv41/model.zig
+@@ -244,7 +244,16 @@ pub const Model = struct {
+         if (std.c.getenv("TF_DS_DUMP")) |dd| {
+             prompt.dump_dir = std.mem.span(dd);
+             prompt.dump_node = role;
+-            if (std.c.getenv("TF_DS_DUMP_LAYER")) |dl| prompt.dump_layer = std.fmt.parseInt(usize, std.mem.span(dl), 10) catch 0;
++            // WP1's exit gate wants several layers' tensors in one dump (x, pa, pm, h at layers 0, 8, 19): accept a
++            // comma list, not just one layer, so one instrumented restart covers all of them.
++            if (std.c.getenv("TF_DS_DUMP_LAYER")) |dl| {
++                var it = std.mem.splitScalar(u8, std.mem.span(dl), ',');
++                var i: usize = 0;
++                while (it.next()) |tok| : (i += 1) {
++                    if (i >= prompt.dump_layers.len) break;
++                    prompt.dump_layers[i] = std.fmt.parseInt(i64, tok, 10) catch -1;
++                }
++            }
+         }
+         if (std.c.getenv("TF_DS_DRAFT_PROF")) |v| draft.dprof = v[0] == '1';
+         if (std.c.getenv("TF_DS_DRAFT_LINK")) |v| draft.pair_link = v[0] != '0';
+@@ -816,14 +825,19 @@ pub const Model = struct {
+             if (pt) |t| try t.mark(m.stream, .moe);
+             try prompt.gather(e, ch, ch.pm, ch.gm);
+             if (pt) |t| try t.mark(m.stream, .gather_m);
+-            if (li == prompt.dump_layer and prompt.dump_dir != null and !prompt.dump_done) {
++            // WP1's exit gate: the gathers' own output (what TF_DS_PAIR_SUM changes), both sublayers, at every
++            // requested layer of the first chunk of at least 64 rows (prompt.dump_layers; dump_done stops it after
++            // that chunk, below). The >= 64 guard matters: TF_DS_PAIR_SUM only engages at 64+ rows (prompt.gather),
++            // so a smoke test or validate.py's short prompts would otherwise spend the one-shot dump on a chunk
++            // where pair-sum never ran at all, comparing the untouched quarters path with itself.
++            if (prompt.dump_dir != null and !prompt.dump_done and ch.n >= 64) {
++                prompt.dump(e, li, "ga", ch.ga, 2 * ch.n * c.hidden * 4);
+                 prompt.dump(e, li, "gm", ch.gm, 2 * ch.n * c.hidden * 4);
+-                if (prompt.dump_layer != 0) prompt.dump_done = true;
+             }
+             prompt.endLayer(ch);
+         }
+         try prompt.head(e, ch);
+-        prompt.dump_done = prompt.dump_dir != null;
++        if (ch.n >= 64) prompt.dump_done = prompt.dump_dir != null;
+         if (pt) |t| try t.mark(m.stream, .head);
+         if (m.dr) |*dr| {
+             // its taps (the tap layers side by side) into the slot's drafter rings
+diff --git a/zig/src/families/dsv41/prompt.zig b/zig/src/families/dsv41/prompt.zig
+index 941b04f..7d1fe19 100644
+--- a/zig/src/families/dsv41/prompt.zig
++++ b/zig/src/families/dsv41/prompt.zig
+@@ -817,16 +817,25 @@ pub fn attnMixes(e: *const Engine, ch: *Chunk, li: usize) !void {
+     }
+ }
+ 
+-/// TF_DS_DUMP=DIR (a debugging aid, off in service): layer TF_DS_DUMP_LAYER's (default 0) intermediates of the first
+-/// prompt chunk, each written as DIR/n<node>-<name>.bin (raw device bytes) after the stream drains.
++/// TF_DS_DUMP=DIR (a debugging aid, off in service): TF_DS_DUMP_LAYER's layers' (a comma list, default just "0")
++/// intermediates of the first prompt chunk, each written as DIR/n<node>-<name>.bin (raw device bytes) after the
++/// stream drains. WP1's exit gate (a tensor dump at layers 0, 8 and 19) is TF_DS_DUMP_LAYER=0,8,19.
+ pub var dump_dir: ?[:0]const u8 = null;
+-pub var dump_layer: usize = 0;
++pub var dump_layers: [8]i64 = .{ 0, -1, -1, -1, -1, -1, -1, -1 };
+ pub var dump_done: bool = false;
+ pub var dump_node: u32 = 0;
+ 
++fn wantLayer(li: usize) bool {
++    const l: i64 = @intCast(li);
++    for (dump_layers) |d| {
++        if (d == l) return true;
++    }
++    return false;
++}
++
+ pub fn dump(e: *const Engine, li: usize, name: []const u8, ptr: u64, bytes: usize) void {
+     const dir = dump_dir orelse return;
+-    if (li != dump_layer or dump_done or bytes == 0) return;
++    if (!wantLayer(li) or dump_done or bytes == 0) return;
+     e.s.synchronize() catch return;
+     const host = std.heap.page_allocator.alloc(u8, bytes) catch return;
+     defer std.heap.page_allocator.free(host);

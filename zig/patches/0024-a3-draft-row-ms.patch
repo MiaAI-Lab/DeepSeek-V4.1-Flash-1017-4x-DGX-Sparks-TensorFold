@@ -1,0 +1,212 @@
+diff --git a/zig/src/core/lanes/allocate.zig b/zig/src/core/lanes/allocate.zig
+index ae4fe80c..a55d0f0a 100644
+--- a/zig/src/core/lanes/allocate.zig
++++ b/zig/src/core/lanes/allocate.zig
+@@ -7,6 +7,14 @@ pub const Cost = struct { width: u32, ms: f64 };
+ 
+ /// Draft prefixes per stream with the most expected tokens a ms; fixed rows always run. Caller frees.
+ pub fn allocate(gpa: Allocator, fixed: []const u32, probs: []const []const f64, costs: *const Table, overhead_ms: f64, max_rows: u64) ![]u32 {
++    return allocateRows(gpa, fixed, probs, costs, overhead_ms, max_rows, 0.0, 0);
++}
++
++/// allocate with draft rows priced apart (the decode plan's A3, draft_row_ms > 0): a round's forward as `costs` at its
++/// `streams` (their pending rows: rows of different streams) plus draft_row_ms for every other row it runs (drafts,
++/// forced rows: one stream's further rows share its experts and cost less), the same split Rule.observeOverhead
++/// subtracts; 0: `costs` at the round's total rows, as before.
++pub fn allocateRows(gpa: Allocator, fixed: []const u32, probs: []const []const f64, costs: *const Table, overhead_ms: f64, max_rows: u64, draft_row_ms: f64, streams: u64) ![]u32 {
+     const counts = try gpa.alloc(u32, probs.len);
+     defer gpa.free(counts);
+     const best_counts = try gpa.alloc(u32, probs.len);
+@@ -16,7 +24,8 @@ pub fn allocate(gpa: Allocator, fixed: []const u32, probs: []const []const f64,
+     for (fixed) |f| rows += f;
+     var expected: f64 = @floatFromInt(rows);
+     const timed = !costs.empty();
+-    var best = rate(costs, timed, rows, expected, overhead_ms);
++    const base = if (streams > 0) @min(streams, rows) else rows;
++    var best = rateRows(costs, timed, base, rows, expected, overhead_ms, draft_row_ms);
+     while (rows < max_rows) {
+         // the likeliest next node, ties to the lowest stream (Python's heapq of (-p, stream))
+         var pick: ?usize = null;
+@@ -33,7 +42,7 @@ pub fn allocate(gpa: Allocator, fixed: []const u32, probs: []const []const f64,
+         counts[s] += 1;
+         rows += 1;
+         expected += pick_p;
+-        const now = rate(costs, timed, rows, expected, overhead_ms);
++        const now = rateRows(costs, timed, base, rows, expected, overhead_ms, draft_row_ms);
+         if (now > best) {
+             best = now;
+             @memcpy(best_counts, counts);
+@@ -42,6 +51,13 @@ pub fn allocate(gpa: Allocator, fixed: []const u32, probs: []const []const f64,
+     return best_counts;
+ }
+ 
++fn rateRows(costs: *const Table, timed: bool, base: u64, total: u64, expected: f64, overhead_ms: f64, draft_row_ms: f64) f64 {
++    if (draft_row_ms <= 0.0) return rate(costs, timed, total, expected, overhead_ms);
++    var cost: f64 = 1.0;
++    if (timed) cost = (costs.get(@intCast(base)) orelse return -1.0) + draft_row_ms * @as(f64, @floatFromInt(total - base));
++    return expected / (cost + overhead_ms);
++}
++
+ fn rate(costs: *const Table, timed: bool, total: u64, expected: f64, overhead_ms: f64) f64 {
+     var cost: f64 = 1.0;
+     if (timed) cost = costs.get(@intCast(total)) orelse return -1.0;
+diff --git a/zig/src/core/lanes/config.zig b/zig/src/core/lanes/config.zig
+index 1c79149e..5161f586 100644
+--- a/zig/src/core/lanes/config.zig
++++ b/zig/src/core/lanes/config.zig
+@@ -22,6 +22,7 @@ pub const Model = struct {
+     plain_guard: bool = false, // plain rounds compete with drafted depths
+     prepass: bool = false, // streams join the next head pass only where it pays (depth.Rule.prepassSelect)
+     pass_ms: [2]f64 = .{ 0, 0 }, // prepass: a batched head pass's ms, a + b x streams
++    draft_row_ms: f64 = 0.0, // A3: a draft row's ms apart from the streams' rows (0: shared_costs by total rows)
+     drafts: u32 = 1, // head drafts a round at most
+     window_costs: []const Cost = &.{}, // forward ms by exact window width (timed at load)
+     mtp_step_ms: f64 = 0.0, // one chained head step (timed at load)
+@@ -47,6 +48,7 @@ pub const Config = struct {
+     plain_guard: bool,
+     prepass: bool = false,
+     pass_ms: [2]f64 = .{ 0, 0 },
++    draft_row_ms: f64 = 0.0,
+     most_drafts: u32,
+     family_streams: bool,
+     batch_rows: u32,
+@@ -110,6 +112,7 @@ pub const Config = struct {
+             .plain_guard = m.plain_guard,
+             .prepass = m.prepass,
+             .pass_ms = m.pass_ms,
++            .draft_row_ms = m.draft_row_ms,
+             .most_drafts = @min(m.drafts, @min(width - 1, max_draft)),
+             .family_streams = streams,
+             .batch_rows = batch_rows,
+diff --git a/zig/src/core/lanes/depth.zig b/zig/src/core/lanes/depth.zig
+index 89e25760..f6ce8902 100644
+--- a/zig/src/core/lanes/depth.zig
++++ b/zig/src/core/lanes/depth.zig
+@@ -61,6 +61,7 @@ pub const Rule = struct {
+     prepass: bool = false,
+     pass_ms: [2]f64 = .{ 0, 0 }, // prepass: a batched head pass's ms, a + b x streams (measured; TF_DS_PASS_MS)
+     round_streams: usize = 0, // prepass: the shared round's streams, drafting or not (roundStreams sets it)
++    draft_row_ms: f64 = 0.0, // A3 (TF_DS_DRAFT_ROW_MS): a draft row's ms apart from the streams' rows (0: the table alone)
+     node_probabilities: bool,
+     batch_rows: u32,
+     round_ms: Table = .{}, // a round's wall time by drafts, shared by every stream
+@@ -272,7 +273,11 @@ pub const Rule = struct {
+     fn passRate(r: *const Rule, rows: f64, tokens: f64, members: usize) f64 {
+         const total: i64 = @intFromFloat(@ceil(rows));
+         const last: i64 = @as(i64, @intCast(r.shared_costs.slots.len)) - 1;
+-        const fwd = r.shared_costs.get(@min(total, last)) orelse return 0.0;
++        const streams: i64 = @intCast(r.round_streams);
++        const fwd = if (r.draft_row_ms > 0.0 and streams > 0 and total >= streams)
++            (r.shared_costs.get(@min(streams, last)) orelse return 0.0) + r.draft_row_ms * @as(f64, @floatFromInt(total - streams))
++        else
++            r.shared_costs.get(@min(total, last)) orelse return 0.0;
+         const pass = if (members == 0) 0.0 else r.pass_ms[0] + r.pass_ms[1] * @as(f64, @floatFromInt(members));
+         return tokens / (fwd + pass);
+     }
+@@ -352,7 +357,10 @@ pub const Rule = struct {
+     }
+ 
+     pub fn observeOverhead(r: *Rule, streams: u32, rows: u64, ms: f64) !void {
+-        const forward = r.shared_costs.get(@intCast(rows)) orelse return;
++        const forward = if (r.draft_row_ms > 0.0 and rows >= streams)
++            (r.shared_costs.get(@intCast(streams)) orelse return) + r.draft_row_ms * @as(f64, @floatFromInt(rows - streams))
++        else
++            r.shared_costs.get(@intCast(rows)) orelse return;
+         const extra = if (ms - forward > 0.0) ms - forward else 0.0;
+         for (r.overhead.items) |*o| {
+             if (o.streams == streams) {
+diff --git a/zig/src/core/lanes/engine.zig b/zig/src/core/lanes/engine.zig
+index 98d36747..d0894395 100644
+--- a/zig/src/core/lanes/engine.zig
++++ b/zig/src/core/lanes/engine.zig
+@@ -57,6 +57,7 @@ pub const Engine = struct {
+                 .plain_guard = cfg.plain_guard,
+                 .prepass = cfg.prepass,
+                 .pass_ms = cfg.pass_ms,
++                .draft_row_ms = cfg.draft_row_ms,
+                 .node_probabilities = cfg.node_probabilities,
+                 .batch_rows = cfg.batch_rows,
+             },
+diff --git a/zig/src/core/lanes/windows.zig b/zig/src/core/lanes/windows.zig
+index 005b4f87..23ee7e64 100644
+--- a/zig/src/core/lanes/windows.zig
++++ b/zig/src/core/lanes/windows.zig
+@@ -173,7 +173,7 @@ pub fn allocate(e: *Engine, plans: []Plan) !void {
+             pr.* = try nodeChances(e, p.stream, n);
+         }
+     }
+-    const counts = try alloc.allocate(a, fixed, probs, &e.cfg.shared_costs, e.rule.overheadMs(plans.len), @max(plans.len, e.cfg.batch_rows));
++    const counts = try alloc.allocateRows(a, fixed, probs, &e.cfg.shared_costs, e.rule.overheadMs(plans.len), @max(plans.len, e.cfg.batch_rows), e.rule.draft_row_ms, plans.len);
+     for (plans, probs, counts) |*p, chances, c| {
+         if (p.kind == .head) {
+             p.stream.granted = c;
+diff --git a/zig/src/families/dsv41/draft.zig b/zig/src/families/dsv41/draft.zig
+index bfcbe3aa..cad18ad1 100644
+--- a/zig/src/families/dsv41/draft.zig
++++ b/zig/src/families/dsv41/draft.zig
+@@ -1060,12 +1060,13 @@ pub fn landing(c: f32) f64 {
+ /// sum, survival the sigmoid of each confidence, over the round's table cost with the other streams at their table
+ /// depth), in Python's float64 arithmetic (libm's exp, as Python's math.exp calls it); the first best wins.
+ pub fn chooseK(conf: []const f32, kmax: usize, live: usize, drafts: usize, round_rows: usize) usize {
+-    return chooseKWith(conf, kmax, live, drafts, round_rows, &round_ms, draft_ms);
++    return chooseKWith(conf, kmax, live, drafts, round_rows, &round_ms, draft_ms, 0.0);
+ }
+ 
+ /// chooseK over a round table by rows (`table`, the lane's TF_DS_ROUND_MS) and a round's ms past its forward `dms`,
+-/// each draft's survival its landing chance (conf_cal).
+-pub fn chooseKWith(conf: []const f32, kmax: usize, live: usize, drafts: usize, round_rows: usize, table: []const f64, dms: f64) usize {
++/// each draft's survival its landing chance (conf_cal). draft_row_ms > 0 (A3, TF_DS_DRAFT_ROW_MS): the forward is the
++/// table at the live streams plus draft_row_ms for every row past them, as the lane core's allocation prices it.
++pub fn chooseKWith(conf: []const f32, kmax: usize, live: usize, drafts: usize, round_rows: usize, table: []const f64, dms: f64, draft_row_ms: f64) usize {
+     const others = (live - 1) * (depth(live, drafts, round_rows) + 1);
+     var best: usize = 0;
+     var best_v: f64 = -1.0;
+@@ -1077,7 +1078,11 @@ pub fn chooseKWith(conf: []const f32, kmax: usize, live: usize, drafts: usize, r
+             exp_tokens += surv;
+         }
+         const rows = @min(table.len, others + kk + 1);
+-        const v = exp_tokens * @as(f64, @floatFromInt(live)) / (table[rows - 1] + dms);
++        const fwd = if (draft_row_ms > 0.0)
++            table[@min(table.len, live) - 1] + draft_row_ms * @as(f64, @floatFromInt(others + kk + 1 - @min(others + kk + 1, live)))
++        else
++            table[rows - 1];
++        const v = exp_tokens * @as(f64, @floatFromInt(live)) / (fwd + dms);
+         if (v > best_v) {
+             best = kk;
+             best_v = v;
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index 37943059..fb93cf0c 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -386,6 +386,7 @@ pub const Lanes = struct {
+             .draft_streams = drafting,
+             .prepass = drafting and prepassOn(),
+             .pass_ms = passMs(),
++            .draft_row_ms = draftRowMs(),
+         };
+     }
+ 
+@@ -402,6 +403,14 @@ pub const Lanes = struct {
+         return std.mem.eql(u8, std.mem.span(v), "1");
+     }
+ 
++    /// TF_DS_DRAFT_ROW_MS=d: A3, the shared rounds' draft rows priced at d ms each apart from the streams' rows (the
++    /// round table at the streams' count): the lane profiles of 2026-10-25 measured ~2.6-3.1 ms a draft row against
++    /// ~4.4 ms a stream's row at c1-c2. Unset or 0: the table at the round's total rows, as served.
++    fn draftRowMs() f64 {
++        const v = std.c.getenv("TF_DS_DRAFT_ROW_MS") orelse return 0.0;
++        return std.fmt.parseFloat(f64, std.mem.span(v)) catch 0.0;
++    }
++
+     /// TF_DS_PASS_MS="a,b": the batched pass's ms for N drafting streams, a + b N (prepass's price of the pass). Unset:
+     /// 2.6 + 1.1 N, the fit of the lane profiles of 2026-10-25 (4.0 ms at 1 stream, 6.0 at 3.2, 9.0 at 5.8).
+     fn passMs() [2]f64 {
+@@ -820,7 +829,7 @@ pub const Lanes = struct {
+         if (self.served_k == .all or (self.served_k == .solo and live == 1)) {
+             const drafts: usize = if (self.m.dr) |dr| dr.n else 1;
+             const kmax = @min(out.len, draft.depth(live, drafts, self.m.eng.round_rows));
+-            const k = draft.chooseKWith(l.confs[0..out.len], kmax, live, drafts, self.m.eng.round_rows, self.m.round_ms, draft.cost_ms);
++            const k = draft.chooseKWith(l.confs[0..out.len], kmax, live, drafts, self.m.eng.round_rows, self.m.round_ms, draft.cost_ms, draftRowMs());
+             for (out[k..]) |*o| o.* = 0.0;
+         }
+         return true;

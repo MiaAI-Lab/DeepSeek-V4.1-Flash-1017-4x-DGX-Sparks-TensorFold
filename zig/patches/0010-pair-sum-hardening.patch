@@ -1,0 +1,159 @@
+diff --git a/zig/src/families/dsv41/model.zig b/zig/src/families/dsv41/model.zig
+index 22fbbb6..51dc3f6 100644
+--- a/zig/src/families/dsv41/model.zig
++++ b/zig/src/families/dsv41/model.zig
+@@ -335,7 +335,7 @@ pub const Model = struct {
+         if (sp.pair != null) {
+             m.two = try prompt2d.Two.init(c, &m.w, &m.arena, sp, chunk_rows);
+             m.two.?.nccl = prompt2d.ncclOf(ord);
+-            try m.two.?.agreePairSum(d, &m.comm, m.stream);
++            try m.two.?.agreePairSum(d, &m.comm, m.stream, o.rdma_devices != null);
+             if (o.rdma_devices) |devs| {
+                 const image: []const u8 = if (o.rdma_kernels) |path|
+                     try std.Io.Dir.cwd().readFileAllocOptions(io, path, a, .limited(1 << 26), .@"16", null)
+@@ -526,11 +526,15 @@ pub const Model = struct {
+         try comm.initLinks(ids, .{ pz, nz });
+         // NCCL connects a communicator at its first collective (~0.1 s on the ring's links): warm both links here, in
+         // initLinks' order (each link's two ranks reach it together), so no prompt's first exchange over a link (the
+-        // first Engram layer's row-partner sum) pays it
++        // first Engram layer's row-partner sum) pays it. WP1 hardening (Codex's open item 4): an all-reduce is its own
++        // first collective on a link (distinct from the all-gather above), so TF_DS_PAIR_SUM's first pairSum call
++        // would otherwise pay that connection cost on the live prompt; warm one fp32 all-reduce here too.
+         const order: [2]usize = if (comm.rank % 2 == 0) .{ 1, 0 } else .{ 0, 1 };
+         for (order) |which| if (comm.links[which]) |l| {
+             try comm.linkGather(l, dev.ptr, dev.ptr + per, per, .u8, stream);
+             try stream.synchronize();
++            try comm.linkSum(l, dev.ptr, 1, stream);
++            try stream.synchronize();
+         };
+     }
+ 
+diff --git a/zig/src/families/dsv41/prompt.zig b/zig/src/families/dsv41/prompt.zig
+index 9516e86..941b04f 100644
+--- a/zig/src/families/dsv41/prompt.zig
++++ b/zig/src/families/dsv41/prompt.zig
+@@ -42,6 +42,14 @@ const round = @import("round.zig");
+ /// steps marked inside their phases (a_in, a_q, a_idx, a_core, a_woa; m_rt, m_gu, m_x), the rest of each in its own.
+ pub var ptimer: ?*round.PhaseTimer = null;
+ 
++/// The monotonic clock (ns), for the engramWorker thread and TF_DS_LOG_TIMING's diagnostic prints (WP0 4.5): no
++/// std.Io handle reaches that thread, so this calls libc directly rather than going through Model.now's std.Io path.
++fn nowNs() i128 {
++    var ts: std.c.timespec = undefined;
++    _ = std.c.clock_gettime(.MONOTONIC, &ts);
++    return @as(i128, ts.sec) * 1_000_000_000 + ts.nsec;
++}
++
+ fn pmark(e: *const Engine, p: round.PhaseTimer.Phase) void {
+     if (ptimer) |t| t.mark(e.s, p) catch {};
+ }
+@@ -1420,7 +1428,7 @@ pub fn engramWorker(eh: *EngramHost, c: *const Config, seq: []const i32, start:
+                 eh.wk_failed.store(true, .release);
+                 return;
+             };
+-            eh.wk_done_ns[j].store(std.time.nanoTimestamp(), .release);
++            eh.wk_done_ns[j].store(nowNs(), .release);
+             eh.wk_done[j].store(ci + 1, .release);
+         }
+         at += n;
+@@ -1469,13 +1477,13 @@ pub fn engramWorkerRows(eh: *EngramHost, j: usize, start: usize, chunk: usize) !
+     // WP0 4.5 (TF_DS_LOG_TIMING=1): the wait this loop spends blocked on the worker, chunk 0 against chunk 1, is the
+     // "Engram worker wait" existing counters miss (it precedes engramApply). Diagnostic print only; no other effect.
+     const log_timing = std.c.getenv("TF_DS_LOG_TIMING") != null;
+-    const t_entry: i128 = if (log_timing) std.time.nanoTimestamp() else 0;
++    const t_entry: i128 = if (log_timing) nowNs() else 0;
+     while (eh.wk_done[j].load(.acquire) <= ci) {
+         if (eh.wk_failed.load(.acquire)) return eh.wk_err orelse error.EngramWorkerFailed;
+         std.Thread.yield() catch {};
+     }
+     if (log_timing) {
+-        const t_now = std.time.nanoTimestamp();
++        const t_now = nowNs();
+         const wait_us = @divTrunc(t_now - t_entry, 1000);
+         const done_ns = eh.wk_done_ns[j].load(.acquire);
+         const done_before_us = if (done_ns != 0) @divTrunc(t_entry - done_ns, 1000) else 0;
+diff --git a/zig/src/families/dsv41/prompt2d.zig b/zig/src/families/dsv41/prompt2d.zig
+index 5a98260..3d9e48e 100644
+--- a/zig/src/families/dsv41/prompt2d.zig
++++ b/zig/src/families/dsv41/prompt2d.zig
+@@ -323,30 +323,50 @@ pub const Two = struct {
+         }
+     }
+ 
+-    /// TF_DS_PAIR_SUM, resolved once for the whole world: every rank sends its setting and whether both its partners
+-    /// (the TP2 partner, node ^ 1, and the other pair's same TP2 rank, node ^ 2) are ring neighbours with a link. Ranks
+-    /// that disagree on the setting refuse to start (a rank alone on the other path would leave the rest in collectives
+-    /// it never joins); with the setting on everywhere, pair_sum is on only when every rank has both links, so all
++    /// TF_DS_PAIR_SUM, resolved once for the whole world: every rank sends its setting, its node order (TF_DS_2D_ORDER,
++    /// as `nccl`), its gather widths (`ow`), whether both its partners (the TP2 partner, node ^ 1, and the other
++    /// pair's same TP2 rank, node ^ 2) are ring neighbours with a link, and whether its RDMA rings are enabled. Every
++    /// rank then checks every other rank's node order and widths against its own: a rank alone on a different
++    /// permutation (WP1 hardening; Codex's counterexample: three ranks on `0,1,3,2` and one on `0,2,3,1` would each
++    /// pass a same-setting-only check, since every chosen partner is still a ring neighbour on paper, yet the ranks
++    /// would address different partners under the same role numbers) now fails this exchange outright, with or
++    /// without TF_DS_PAIR_SUM: these hazards (`openLinks` and the RDMA rings also depend on each rank's own
++    /// environment) predate pair-sum and affect the plain four-quarter gather too. Ranks that disagree on the
++    /// *setting* still refuse to start, as before (a rank alone on the other path would leave the rest in collectives
++    /// it never joins); with the setting on everywhere, pair_sum engages only when every rank has both links, so all
+     /// ranks take the same path for every chunk. Before any prompt; the world all-gather is its barrier.
+-    pub fn agreePairSum(t: *Two, d: *const cuda.Driver, comm: *const Comm, stream: cuda.Stream) !void {
++    pub fn agreePairSum(t: *Two, d: *const cuda.Driver, comm: *const Comm, stream: cuda.Stream, rdma_on: bool) !void {
+         const want = if (std.c.getenv("TF_DS_PAIR_SUM")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
+         const me: u32 = @intCast(t.r + 2 * t.p);
+         const links = comm.linkTo(t.nccl[me ^ 1]) != null and comm.linkTo(t.nccl[me ^ 2]) != null;
+         const w = comm.world;
+-        var dev = try cuda.DeviceBuffer.alloc(d, (1 + w) * 4);
++        const Cfg = extern struct { nccl: [4]u32, ow: [2]u32, flags: u32, pad: u32 = 0 };
++        const mine: Cfg = .{
++            .nccl = t.nccl,
++            .ow = .{ @intCast(t.ow[0]), @intCast(t.ow[1]) },
++            .flags = @as(u32, @intFromBool(want)) | (@as(u32, @intFromBool(links)) << 1) | (@as(u32, @intFromBool(rdma_on)) << 2),
++        };
++        var dev = try cuda.DeviceBuffer.alloc(d, (1 + w) * @sizeOf(Cfg));
+         defer dev.free();
+-        const mine: u32 = @as(u32, @intFromBool(want)) | (@as(u32, @intFromBool(links)) << 1);
+         try dev.upload(0, std.mem.asBytes(&mine));
+-        try comm.allGather(dev.ptr, dev.ptr + 4, 1, .u32, stream);
++        try comm.allGather(dev.ptr, dev.ptr + @sizeOf(Cfg), @sizeOf(Cfg) / 4, .u32, stream);
+         try stream.synchronize();
+-        var all: [8]u32 = undefined;
++        var all: [8]Cfg = undefined;
+         if (w > all.len) return error.WorldTooLarge;
+-        try dev.download(4, std.mem.sliceAsBytes(all[0..w]));
++        try dev.download(@sizeOf(Cfg), std.mem.sliceAsBytes(all[0..w]));
+         var on: usize = 0;
+         var linked: usize = 0;
+-        for (all[0..w]) |x| {
+-            on += x & 1;
+-            linked += (x >> 1) & 1;
++        for (all[0..w], 0..) |x, i| {
++            if (!std.mem.eql(u32, &x.nccl, &mine.nccl)) {
++                std.log.err("TF_DS_PAIR_SUM: rank {d}'s node order {any} differs from this rank's {any} (TF_DS_2D_ORDER mismatch): refusing to start", .{ i, x.nccl, mine.nccl });
++                return error.TopologyMismatch;
++            }
++            if (x.ow[0] != mine.ow[0] or x.ow[1] != mine.ow[1]) {
++                std.log.err("TF_DS_PAIR_SUM: rank {d}'s gather widths {any} differ from this rank's {any}: refusing to start", .{ i, x.ow, mine.ow });
++                return error.TopologyMismatch;
++            }
++            on += x.flags & 1;
++            linked += (x.flags >> 1) & 1;
+         }
+         if (on != 0 and on != w) {
+             std.log.err("TF_DS_PAIR_SUM: set on {d} of {d} ranks (this one: {s}); start every rank with the same value", .{ on, w, if (want) "1" else "unset" });
+@@ -377,7 +397,15 @@ pub const Two = struct {
+             const slot: usize = if (pg == t.p) pair_link.me else 1 - pair_link.me;
+             try e.ops.copyRows(e.s, t.parts + slot * n * wmax * 4, w[pg] * 4, dst + pg * w[0] * 4, row_bytes, w[pg] * 4, n);
+         }
+-        try prompt.fill(e, dst + n * row_bytes, 0, n * row_bytes);
++        // WP1 (Hector's reviewer, item 2): plane 1 is the identity element for the reader's add (dst[0] + dst[1]).
++        // Positive zero is the identity for every case except x = -0, where round-to-nearest gives x + (+0) = +0 but
++        // x + (-0) = x = -0: TF_DS_PAIR_SUM_NEGZERO=1 fills plane 1 with negative zero instead, so the add is the
++        // identity for every non-NaN x, signed zeros included (it does not address NaN or flush-to-zero; the
++        // tensor-level comparison, not this fill, is what decides exactness -- see WP1's exit gate).
++        if (std.c.getenv("TF_DS_PAIR_SUM_NEGZERO") != null)
++            try prompt.fill32(e, dst + n * row_bytes, 0x80000000, n * (w[0] + w[1]))
++        else
++            try prompt.fill(e, dst + n * row_bytes, 0, n * row_bytes);
+     }
+ 
+     /// cat_rank (Comm2D.cat_rank): `src` [n, w[p]] -> `dst` [n, w0 + w1]: this node's TP2 rank's whole width, pair 0's

@@ -1,0 +1,508 @@
+diff --git a/tools/dsv41-zig/native/cand_host.cu b/tools/dsv41-zig/native/cand_host.cu
+new file mode 100644
+index 00000000..2ab28422
+--- /dev/null
++++ b/tools/dsv41-zig/native/cand_host.cu
+@@ -0,0 +1,10 @@
++// Host launcher of zig/kernels/cuda/dsv41_ops.cu's tf_ds_top_cand_rows_kernel for check_cand.py (ctypes, torch
++// pointers, stream 0). Not part of the engine.
++#include "../../../zig/kernels/cuda/dsv41_ops.cu"
++extern "C" int dsn_top_cand(const float* logits, unsigned long long ld, int n, int rows, int count, float* vals,
++                            long long* ids, int* flags) {
++    tf_ds_top_cand_rows_kernel<<<rows, 1024>>>(logits, ld, n, count, vals, ids, flags);
++    cudaError_t e = cudaGetLastError();
++    if (e != cudaSuccess) return int(e);
++    return int(cudaDeviceSynchronize());
++}
+diff --git a/tools/dsv41-zig/native/check_cand.py b/tools/dsv41-zig/native/check_cand.py
+new file mode 100644
+index 00000000..fd7c2797
+--- /dev/null
++++ b/tools/dsv41-zig/native/check_cand.py
+@@ -0,0 +1,143 @@
++"""Track B's GPU candidates (zig/kernels/cuda/dsv41_ops.cu tf_ds_top_cand_rows_kernel) against sampling.topCandidates'
++order written here in plain Python: a row's first `count` (value, id), the larger value first, of equal values the lower
++id, +0 and -0 equal, the row's own values kept. A NaN row must be flagged 1, a row with more ties at the cut than the
++tie buffer (2,048) holds flagged 2 (the host then reads the row whole). Runs in nvcr.io/nvidia/pytorch:26.07-py3 on a GB10:
++
++    python check_cand.py
++
++Exit status 0 when every check holds."""
++import ctypes
++import math
++import os
++import random
++import subprocess
++import sys
++
++import torch
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++dev = torch.device("cuda")
++failures = []
++
++
++def check(name, ok, detail=""):
++    print(f"{'ok  ' if ok else 'FAIL'} {name}{': ' + detail if detail else ''}", flush=True)
++    if not ok:
++        failures.append(name)
++
++
++def build():
++    so = os.path.join("/tmp", "dsn_cand_host.so")
++    subprocess.check_call(["nvcc", "-arch=sm_121", "-O3", "--fmad=false", "--ftz=false", "-std=c++17", "-shared",
++                           "-Xcompiler", "-fPIC", "-o", so, os.path.join(HERE, "cand_host.cu")])
++    lib = ctypes.CDLL(so)
++    P, I, U = ctypes.c_void_p, ctypes.c_int, ctypes.c_ulonglong
++    lib.dsn_top_cand.argtypes = [P, U, I, I, I, P, P, P]
++    return lib
++
++
++def ref(row, count):
++    """sampling.topCandidates: insertion keeping the first `count` by (value desc, id asc); -0 == +0."""
++    vals = row.tolist()
++    order = sorted(range(len(vals)), key=lambda i: (-(vals[i] if vals[i] != 0 else 0.0), i))
++    k = min(count, len(vals))
++    return [vals[i] for i in order[:k]], order[:k]
++
++
++def run(lib, rows, count):
++    rows = rows.contiguous().float().to(dev)
++    r, n = rows.shape
++    vals = torch.full((r, count), float("nan"), device=dev)
++    ids = torch.full((r, count), -1, dtype=torch.int64, device=dev)
++    flags = torch.full((r,), -1, dtype=torch.int32, device=dev)
++    rc = lib.dsn_top_cand(ctypes.c_void_p(rows.data_ptr()), n, n, r, count, ctypes.c_void_p(vals.data_ptr()),
++                          ctypes.c_void_p(ids.data_ptr()), ctypes.c_void_p(flags.data_ptr()))
++    assert rc == 0, rc
++    return vals.cpu(), ids.cpu(), flags.cpu()
++
++
++def same_bits(a, b):
++    return all(math.copysign(1, x) == math.copysign(1, y) and (x == y or (x != x and y != y)) for x, y in zip(a, b))
++
++
++def main():
++    lib = build()
++    V = 129280
++    g = torch.Generator().manual_seed(7)
++    rows = []
++    rows.append(torch.randn(V, generator=g) * 4)                         # ordinary logits
++    t = torch.randn(V, generator=g); top = t.topk(40).values
++    t[torch.randint(0, V, (50,), generator=g)] = top[27].item()          # ties at the 28th place
++    rows.append(t)
++    t = torch.randn(V, generator=g) - 10; t[torch.randint(0, V, (30,), generator=g)] = 0.0
++    t[torch.randint(0, V, (30,), generator=g)] = -0.0                   # +0 / -0 ties at the top
++    rows.append(t)
++    t = torch.randn(V, generator=g); t[5] = float("inf"); t[9] = float("inf"); t[100:200] = float("-inf")
++    rows.append(t)
++    t = torch.randn(V, generator=g); t[:] = t.round(decimals=1)          # many ties everywhere
++    rows.append(t)
++    rows.append(torch.randn(V, generator=g).half().float())              # coarse values: ties
++    batch = torch.stack(rows)
++    for count in (1, 8, 28, 64):
++        vals, ids, flags = run(lib, batch, count)
++        for i in range(batch.shape[0]):
++            rv, ri = ref(batch[i], count)
++            got_v, got_i = vals[i, :len(rv)].tolist(), ids[i, :len(ri)].tolist()
++            check(f"row {i} count {count}: the candidates and their order", flags[i].item() == 0 and got_i == ri and same_bits(got_v, rv),
++                  f"flag {flags[i].item()}" if flags[i].item() else "")
++    # one finite value and the rest -inf: count 1 finds it; any count past it cuts in 129,279 ties (flag 2: the host
++    # reads the row whole); a short row of 1,990 -inf ties (within the tie buffer) is exact
++    t = torch.full((1, V), float("-inf")); t[0, 3] = 1.0
++    vals, ids, flags = run(lib, t, 1)
++    check("one finite value, count 1: it alone", flags.tolist() == [0] and ids[0, 0].item() == 3 and vals[0, 0].item() == 1.0)
++    for count in (8, 28, 64):
++        _, _, flags = run(lib, t, count)
++        check(f"one finite value, count {count}: the -inf ties past the buffer are flagged 2", flags.tolist() == [2])
++    t = torch.full((1, 2000), float("-inf")); t[0, :10] = torch.randn(10, generator=g)
++    vals, ids, flags = run(lib, t, 28)
++    rv, ri = ref(t[0], 28)
++    check("10 finite values and 1,990 -inf ties, count 28", flags.tolist() == [0] and ids[0].tolist() == ri and same_bits(vals[0].tolist(), rv))
++    # a row shorter than the count
++    short = torch.randn(3, 10, generator=g)
++    vals, ids, flags = run(lib, short, 28)
++    for i in range(3):
++        rv, ri = ref(short[i], 28)
++        check(f"short row {i}: all 10 in order", flags[i].item() == 0 and ids[i, :10].tolist() == ri and same_bits(vals[i, :10].tolist(), rv))
++    # flags
++    t = torch.randn(2, V, generator=g); t[0, 77] = float("nan")
++    _, _, flags = run(lib, t, 28)
++    check("a NaN row is flagged 1, its neighbour not", flags.tolist() == [1, 0])
++    t = torch.zeros(1, V)
++    _, _, flags = run(lib, t, 28)
++    check("a row of ties past the tie buffer is flagged 2", flags.tolist() == [2])
++    # many random rows, sampled-row counts
++    for trial in range(20):
++        b = torch.randn(48, V, generator=g) * random.Random(trial).uniform(0.5, 8)
++        vals, ids, flags = run(lib, b, 28)
++        ok = flags.eq(0).all().item()
++        for i in range(0, 48, 7):
++            rv, ri = ref(b[i], 28)
++            ok = ok and ids[i].tolist() == ri and same_bits(vals[i].tolist(), rv)
++        check(f"48 random rows, trial {trial}", ok)
++    # the kernel's time (ms) a round of R rows at the served vocabulary, and the copy it replaces (R x V fp32 to pageable
++    # host memory), for the record; not a check
++    for R in (1, 3, 14, 48):
++        b = (torch.randn(R, V, generator=g) * 4).to(dev)
++        vals = torch.empty(R, 28, device=dev); ids = torch.empty(R, 28, dtype=torch.int64, device=dev)
++        flags = torch.empty(R, dtype=torch.int32, device=dev)
++        call = lambda: lib.dsn_top_cand(ctypes.c_void_p(b.data_ptr()), V, V, R, 28, ctypes.c_void_p(vals.data_ptr()),
++                                        ctypes.c_void_p(ids.data_ptr()), ctypes.c_void_p(flags.data_ptr()))
++        for _ in range(3):
++            call()
++        t0 = torch.cuda.Event(enable_timing=True); t1 = torch.cuda.Event(enable_timing=True)
++        t0.record(); [call() for _ in range(20)]; t1.record(); torch.cuda.synchronize()
++        host = torch.empty(R, V)
++        c0 = torch.cuda.Event(enable_timing=True); c1 = torch.cuda.Event(enable_timing=True)
++        c0.record(); [host.copy_(b) for _ in range(20)]; c1.record(); torch.cuda.synchronize()
++        print(f"time R={R}: kernel {t0.elapsed_time(t1) / 20:.3f} ms (with its sync), the full copy {c0.elapsed_time(c1) / 20:.3f} ms")
++    print(f"{len(failures)} failed" if failures else "all checks passed")
++    sys.exit(1 if failures else 0)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/zig/kernels/cuda/dsv41_ops.cu b/zig/kernels/cuda/dsv41_ops.cu
+index df44dcbc..95c91d9c 100644
+--- a/zig/kernels/cuda/dsv41_ops.cu
++++ b/zig/kernels/cuda/dsv41_ops.cu
+@@ -406,6 +406,139 @@ extern "C" __global__ void __launch_bounds__(1024) tf_ds_argmax_rows_kernel(cons
+     if (lane == 0) out[blockIdx.x] = row[0] != row[0] ? 0u : (unsigned)bi;
+ }
+ 
++// The decode plan's Track B (docs/UNIFIED-DECODE-IMPROVEMENTS.md, TF_DS_SAMPLE_CAND=1): a row's first `count` (value,
++// id) in sampling.topCandidates' order (the larger value first, of equal values the lower id; +0 and -0 equal), on the
++// GPU, so the host's draws read count candidates instead of the whole row. logits [rows, n] fp32 (row stride ld); out
++// vals [rows, count] (the row's own values, signed zeros kept), ids [rows, count], flags [rows]: 1 when the row holds a
++// NaN (no total order: the host takes the full-row path) or more ties at the cut than the tie buffer holds (2: the same).
++// A row a block of 1024 threads: an exact radix select of the count-th largest key in four 8-bit passes, then the rows
++// above it and the lowest ids of its ties, sorted in that order. count <= 64.
++__device__ __forceinline__ unsigned cand_key(float v) {
++    const unsigned u = __float_as_uint(v == 0.f ? 0.f : v);  // +0 and -0 one key
++    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
++}
++__device__ __forceinline__ bool cand_before(float va, long long ia, float vb, long long ib) {
++    return va > vb || (va == vb && ia < ib);
++}
++extern "C" __global__ void __launch_bounds__(1024) tf_ds_top_cand_rows_kernel(const float* logits, unsigned long long ld,
++                                                                              int n, int count, float* vals,
++                                                                              long long* ids, int* flags) {
++    // (each pass's histogram is kept a warp: 32 x 256 counters; a warp's lanes that share a bin add once, by their
++    // leader: the top bits of logits fall in a handful of bins, where one shared counter would serialize the row)
++    constexpr int kTies = 2048, kWarps = 32;
++    __shared__ unsigned whist[kWarps][256];
++    __shared__ unsigned hist[256];
++    __shared__ unsigned s_prefix, s_mask, s_left, s_above, s_ties;
++    __shared__ float c_val[64];
++    __shared__ int c_id[64];
++    __shared__ int t_id[kTies];
++    const float* row = logits + (unsigned long long)blockIdx.x * ld;
++    const int k = count < n ? count : n;
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    if (threadIdx.x == 0) {
++        s_prefix = 0u;
++        s_mask = 0u;
++        s_left = (unsigned)k;
++        s_above = 0u;
++        s_ties = 0u;
++    }
++    // the k-th largest key, its bits from the top: a histogram of the next 8 bits among the keys matching the prefix
++    // so far (the first pass also finds a NaN: the row then has no total order)
++    for (int shift = 24; shift >= 0; shift -= 8) {
++        for (int b = threadIdx.x; b < kWarps * 256; b += blockDim.x) (&whist[0][0])[b] = 0u;
++        __syncthreads();
++        const unsigned prefix = s_prefix, mask = s_mask;
++        bool nan = false;
++        // every lane of a warp runs the same trip count (__match_any_sync needs the whole warp)
++        const int trips = (n + (int)blockDim.x - 1) / (int)blockDim.x;
++        for (int t = 0; t < trips; t++) {
++            const int i = t * (int)blockDim.x + (int)threadIdx.x;
++            unsigned bin = 256u;  // none
++            if (i < n) {
++                const float v = row[i];
++                if (shift == 24) nan |= v != v;
++                const unsigned key = cand_key(v);
++                if ((key & mask) == prefix) bin = (key >> shift) & 255u;
++            }
++            const unsigned peers = __match_any_sync(0xffffffffu, bin);
++            if (bin != 256u && lane == __ffs(peers) - 1) atomicAdd(&whist[warp][bin], (unsigned)__popc(peers));
++        }
++        if (shift == 24 && __syncthreads_or(nan)) {
++            if (threadIdx.x == 0) flags[blockIdx.x] = 1;
++            return;
++        }
++        __syncthreads();
++        for (int b = threadIdx.x; b < 256; b += blockDim.x) {
++            unsigned sum = 0u;
++            for (int w = 0; w < kWarps; w++) sum += whist[w][b];
++            hist[b] = sum;
++        }
++        __syncthreads();
++        if (threadIdx.x == 0) {
++            unsigned left = s_left, above = 0u;
++            int b = 255;
++            for (; b > 0; b--) {
++                if (above + hist[b] >= left) break;
++                above += hist[b];
++            }
++            s_left = left - above;
++            s_prefix = prefix | ((unsigned)b << shift);
++            s_mask = mask | (255u << shift);
++        }
++        __syncthreads();
++    }
++    const unsigned cut = s_prefix;  // the k-th largest key; s_left of its ties are in the top k
++    for (int i = threadIdx.x; i < n; i += blockDim.x) {
++        const unsigned key = cand_key(row[i]);
++        if (key > cut) {
++            const unsigned at = atomicAdd(&s_above, 1u);
++            if (at < 64u) {
++                c_val[at] = row[i];
++                c_id[at] = i;
++            }
++        } else if (key == cut) {
++            const unsigned at = atomicAdd(&s_ties, 1u);
++            if (at < (unsigned)kTies) t_id[at] = i;
++        }
++    }
++    __syncthreads();
++    if (threadIdx.x != 0) return;
++    const unsigned above = s_above, ties = s_ties, left = s_left;
++    if (ties > (unsigned)kTies || above + left != (unsigned)k) {
++        flags[blockIdx.x] = 2;
++        return;
++    }
++    // the lowest `left` ids of the ties (selection: ties are few)
++    for (unsigned j = 0; j < left; j++) {
++        unsigned best = j;
++        for (unsigned q = j + 1; q < ties; q++)
++            if (t_id[q] < t_id[best]) best = q;
++        const int tmp = t_id[j];
++        t_id[j] = t_id[best];
++        t_id[best] = tmp;
++        c_val[above + j] = row[t_id[j]];
++        c_id[above + j] = t_id[j];
++    }
++    // the k candidates in topCandidates' order (insertion: k <= 64)
++    for (int a = 1; a < k; a++) {
++        const float v = c_val[a];
++        const int id = c_id[a];
++        int b = a;
++        while (b > 0 && cand_before(v, id, c_val[b - 1], c_id[b - 1])) {
++            c_val[b] = c_val[b - 1];
++            c_id[b] = c_id[b - 1];
++            b--;
++        }
++        c_val[b] = v;
++        c_id[b] = id;
++    }
++    for (int a = 0; a < k; a++) {
++        vals[(size_t)blockIdx.x * count + a] = c_val[a];
++        ids[(size_t)blockIdx.x * count + a] = c_id[a];
++    }
++    flags[blockIdx.x] = 0;
++}
++
+ // ---- the vision tower (vit.zig): DeepSeek's ViT and aligner as the served lane runs them on torch, each torch op its
+ // own rounding point (this file builds with --fmad=false, so a product and a sum stay two roundings).
+ 
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index 14d5b5b1..ea00905c 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -213,6 +213,29 @@ pub fn place(used: []const [2]usize, size: usize, cap: usize) ?usize {
+ 
+ /// The token a row's logits draw at absolute position `position`: greedy without sampling (or at temperature 0),
+ /// else the served sampler with the stream's key.
++/// draw from a row's first candidates (Track B): a greedy row's token is its first candidate (sampling.argmax's: the
++/// first index of the largest value; the GPU's flags send a row with a NaN down draw's path instead); a sampled row's
++/// is sampleRow's choice on its own candidateCount of them.
++pub fn drawCandidates(vals: []const f32, ids: []const i64, n: usize, position: u64, s: ?lanes.Sampling) !u32 {
++    const sm = s orelse return @intCast(ids[0]);
++    if (sm.temperature <= 0) return @intCast(ids[0]);
++    const smp: sampling.Sampling = .{ .seed = sm.seed, .temperature = sm.temperature, .top_k = sm.top_k, .top_p = sm.top_p, .min_p = sm.min_p };
++    const c = sampling.candidateCount(n, smp);
++    if (c > vals.len) return error.TooManyCandidates;
++    return @intCast(try sampling.sampleCandidates(vals[0..c], ids[0..c], position, smp));
++}
++
++/// TF_DS_SAMPLE_CAND=1: Track B's candidates path for sampled rounds. Unset or any other value: the whole logits.
++fn candOn() bool {
++    const S = struct {
++        var v: ?bool = null;
++    };
++    if (S.v) |x| return x;
++    const x = if (std.c.getenv("TF_DS_SAMPLE_CAND")) |e| std.mem.eql(u8, std.mem.span(e), "1") else false;
++    S.v = x;
++    return x;
++}
++
+ pub fn draw(row: []const f32, position: u64, s: ?lanes.Sampling) !u32 {
+     const sm = s orelse return @intCast(sampling.argmax(row));
+     if (sm.temperature <= 0) return @intCast(sampling.argmax(row));
+@@ -652,7 +675,25 @@ pub const Lanes = struct {
+             };
+         }
+         const tokens: []const u32 = if (greedy) try m.roundArgmax(rows.ids.len) else &.{};
+-        const logits: []const f32 = if (greedy) &.{} else try m.roundLogits(rows.ids.len);
++        // Track B (TF_DS_SAMPLE_CAND=1): a sampled round's rows as their first candidates from the GPU (the host's
++        // draws read only those; sampling.sampleCandidates), the whole logits only when a row needs them
++        var cand_count: usize = 0;
++        if (!greedy and candOn()) {
++            cand_count = 1;
++            for (windows) |w| if (w.stream.sampling) |sm| if (sm.temperature > 0) {
++                if (sm.top_k == 0 or sampling.candidateCount(m.vocab, .{ .seed = sm.seed, .temperature = sm.temperature, .top_k = sm.top_k, .top_p = sm.top_p, .min_p = sm.min_p }) > sampling.max_candidates) {
++                    cand_count = 0;
++                    break;
++                }
++                cand_count = @max(cand_count, sampling.candidateCount(m.vocab, .{ .seed = sm.seed, .temperature = sm.temperature, .top_k = sm.top_k, .top_p = sm.top_p, .min_p = sm.min_p }));
++            };
++        }
++        const cand = if (cand_count > 0) try m.roundCandidates(rows.ids.len, cand_count) else null;
++        var whole = cand == null;
++        if (cand) |cd| for (cd.flags) |fl| {
++            whole = whole or fl != 0;
++        };
++        const logits: []const f32 = if (greedy or !whole) &.{} else try m.roundLogits(rows.ids.len);
+         const t3 = m.now();
+         defer if (self.prof) |*p| {
+             p.send += t1 - t0;
+@@ -667,7 +708,12 @@ pub const Lanes = struct {
+         const V = m.vocab;
+         for (windows, out, 0..) |w, *o, k| {
+             const row0 = self.built.wins[k].row;
+-            for (0..w.rows()) |r| o.sampled[r] = if (greedy) tokens[row0 + r] else try draw(logits[(row0 + r) * V ..][0..V], w.positions[r], w.stream.sampling);
++            for (0..w.rows()) |r| o.sampled[r] = if (greedy)
++                tokens[row0 + r]
++            else if (!whole)
++                try drawCandidates(cand.?.vals[(row0 + r) * cand_count ..][0..cand_count], cand.?.ids[(row0 + r) * cand_count ..][0..cand_count], V, w.positions[r], w.stream.sampling)
++            else
++                try draw(logits[(row0 + r) * V ..][0..V], w.positions[r], w.stream.sampling);
+             const l = self.streams.getPtr(w.stream).?;
+             @memcpy(o.drafts[0..w.held], l.held[0..w.held]);
+             @memcpy(o.drafts[w.held..][0..w.tokens.len], w.tokens);
+diff --git a/zig/src/families/dsv41/model.zig b/zig/src/families/dsv41/model.zig
+index 6dd36825..0eb9fca4 100644
+--- a/zig/src/families/dsv41/model.zig
++++ b/zig/src/families/dsv41/model.zig
+@@ -13,6 +13,7 @@ const weights = @import("weights.zig");
+ const prompt = @import("prompt.zig");
+ const prompt2d = @import("prompt2d.zig");
+ const round = @import("round.zig");
++const sampling = @import("sampling.zig");
+ const draft = @import("draft.zig");
+ const engram = @import("engram.zig");
+ const engram_io = @import("engram_io.zig");
+@@ -145,6 +146,12 @@ pub const Model = struct {
+     logits: []f32, // round.max_rows rows of logits on the host
+     amax: u64, // u32 [round.max_rows]: a round's greedy tokens on the device (roundArgmax)
+     amax_host: [round.max_rows]u32 = undefined,
++    // Track B (TF_DS_SAMPLE_CAND=1): a round's candidates on the device (vals f32, ids i64, flags i32; max_rows rows of
++    // sampling.max_candidates) and on the host
++    cand: u64 = 0,
++    cand_vals: [round.max_rows * sampling.max_candidates]f32 = undefined,
++    cand_ids: [round.max_rows * sampling.max_candidates]i64 = undefined,
++    cand_flags: [round.max_rows]i32 = undefined,
+     // the stream a fill is running: its slot and its view of the caches (its extent from base)
+     fill_slot: usize = 0,
+     // the prompt a fill's chunks come from (the caller's, set for the fill) and the thread reading the next chunk's
+@@ -382,6 +389,7 @@ pub const Model = struct {
+         }
+         m.rd = try round.Round.init(&m.eng, &m.arena, a, m.ctx_cap); // a round's deepest bucket: a stream's context
+         m.amax = try m.arena.take(round.max_rows * 4);
++        m.cand = try m.arena.take(round.max_rows * (sampling.max_candidates * 12 + 4));
+         m.eng.agree_flag = try m.arena.take(64); // G0.3: the graph captures' agreement byte
+         if (o.graphs) m.graphs = round.Graphs.init(gpa);
+         if (o.side) try m.rd.useSide(&m.eng);
+@@ -981,6 +989,22 @@ pub const Model = struct {
+         return m.amax_host[0..R];
+     }
+ 
++    /// Track B: the round's first `count` candidates a row (sampling.topCandidates' set and order) on the host, from the
++    /// device's logits: vals and ids [R, count], flags [R] (non-zero: that row must be read whole, roundLogits).
++    pub fn roundCandidates(m: *Model, R: usize, count: usize) !struct { vals: []const f32, ids: []const i64, flags: []const i32 } {
++        const d = m.ctx.d;
++        const mc = sampling.max_candidates;
++        const vals = m.cand;
++        const ids = m.cand + round.max_rows * mc * 4;
++        const flags = ids + round.max_rows * mc * 8;
++        try m.ops.topCandRows(m.stream, m.rd.logits, m.vocab, m.vocab, R, count, vals, ids, flags);
++        try m.stream.synchronize();
++        try d.check(d.api.cuMemcpyDtoH_v2(&m.cand_vals, vals, R * count * 4), "cuMemcpyDtoH");
++        try d.check(d.api.cuMemcpyDtoH_v2(&m.cand_ids, ids, R * count * 8), "cuMemcpyDtoH");
++        try d.check(d.api.cuMemcpyDtoH_v2(&m.cand_flags, flags, R * 4), "cuMemcpyDtoH");
++        return .{ .vals = m.cand_vals[0 .. R * count], .ids = m.cand_ids[0 .. R * count], .flags = m.cand_flags[0..R] };
++    }
++
+     pub fn roundLogits(m: *Model, R: usize) ![]const f32 {
+         const d = m.ctx.d;
+         try m.stream.synchronize();
+diff --git a/zig/src/families/dsv41/ops.zig b/zig/src/families/dsv41/ops.zig
+index aa039342..9fa4af8a 100644
+--- a/zig/src/families/dsv41/ops.zig
++++ b/zig/src/families/dsv41/ops.zig
+@@ -40,6 +40,7 @@ pub const Ops = struct {
+     gather: cuda.Function,
+     copy16: cuda.Function,
+     argmax_rows: cuda.Function,
++    top_cand_rows: cuda.Function,
+     gpu_clock: cuda.Function,
+     rest_group: cuda.Function,
+     remap_picks: cuda.Function,
+@@ -74,6 +75,7 @@ pub const Ops = struct {
+             .gather = try mv.function("tf_gather_rows_kernel"),
+             .copy16 = try fm.function("tf_ds_copy_rows16_kernel"),
+             .argmax_rows = try fm.function("tf_ds_argmax_rows_kernel"),
++            .top_cand_rows = try fm.function("tf_ds_top_cand_rows_kernel"),
+             .gpu_clock = try fm.function("tf_ds_clock_kernel"),
+             .rest_group = try fm.function("tf_ds_rest_group_kernel"),
+             .remap_picks = try fm.function("tf_ds_remap_picks_kernel"),
+@@ -302,6 +304,22 @@ pub const Ops = struct {
+         try go(o.argmax_rows, s, rows, 1024, &a);
+     }
+ 
++    /// Track B: each row's first `count` (value, id) in sampling.topCandidates' order into vals [rows, count] fp32 and ids
++    /// [rows, count] i64; flags [rows] i32 (0, or a row the host must read whole: 1 a NaN, 2 too many ties at the cut).
++    pub fn topCandRows(o: *const Ops, s: cuda.Stream, logits: u64, ld: usize, n: usize, rows: usize, count: usize, vals: u64, ids: u64, flags: u64) !void {
++        if (rows == 0 or n == 0) return;
++        if (count == 0 or count > 64) return error.TooManyCandidates;
++        var a: cuda.Args = .{};
++        a.add(logits);
++        a.add(@as(u64, ld));
++        a.add(@as(c_int, @intCast(n)));
++        a.add(@as(c_int, @intCast(count)));
++        a.add(vals);
++        a.add(ids);
++        a.add(flags);
++        try go(o.top_cand_rows, s, rows, 1024, &a);
++    }
++
+     /// A parity split's rest grouping (experts2d _rest_group_kernel): the places of (uids, count, members [maxu, maxm])
+     /// whose expert's rest this pair computes, in order, into (ruids, rcount, rmembers).
+     pub fn restGroup(o: *const Ops, s: cuda.Stream, uids: u64, count: u64, members: u64, owner: u64, mine: u32, ruids: u64, rcount: u64, rmembers: u64, maxu: usize, maxm: usize) !void {
+diff --git a/zig/src/families/dsv41/sampling.zig b/zig/src/families/dsv41/sampling.zig
+index 3a8c450f..7691a494 100644
+--- a/zig/src/families/dsv41/sampling.zig
++++ b/zig/src/families/dsv41/sampling.zig
+@@ -106,6 +106,20 @@ pub fn sampleRow(row: []const f32, position: u64, s: Sampling) !i64 {
+     var values: [max_candidates]f32 = undefined;
+     var ids: [max_candidates]i64 = undefined;
+     const width = topCandidates(row, count, &values, &ids);
++    return sampleCandidates(values[0..width], ids[0..width], position, s);
++}
++
++/// The candidates a sampled row reads: min(row length, top_k + margin) (sampleRow's `count`).
++pub fn candidateCount(n: usize, s: Sampling) usize {
++    return @min(n, s.top_k + margin);
++}
++
++/// choose_rows on a row's first candidates in topCandidates' order (values, ids: its `width` = candidateCount of the
++/// row, or the row's length when shorter): sampleRow past its scan (Track B hands it the GPU's candidates).
++pub fn sampleCandidates(values: []const f32, ids: []const i64, position: u64, s: Sampling) !i64 {
++    if (s.top_k == 0) return error.NotPortedYet;
++    const width = values.len;
++    if (width == 0 or ids.len != width or width > max_candidates) return error.TooManyCandidates;
+     // choose_rows on the candidates (already in lexsort's order)
+     const k = @max(1, @min(s.top_k, width));
+     const t = @max(s.temperature, 1e-6);

@@ -1,0 +1,39 @@
+diff --git a/zig/kernels/cuda/dsv41/native.cu b/zig/kernels/cuda/dsv41/native.cu
+index 37eccfc..4fc5da9 100644
+--- a/zig/kernels/cuda/dsv41/native.cu
++++ b/zig/kernels/cuda/dsv41/native.cu
+@@ -1361,7 +1361,11 @@ __device__ __forceinline__ void tiles_of(const int* off, const int* act, const i
+ #define PF_GEMM 128, 128, 2, 4, 1, 0, 2, 3
+ #endif
+ #ifndef PF_GEMM_FOLD
+-#define PF_GEMM_FOLD 64, 128, 2, 4, 1, 0, 2, 4
++// WP2 (docs/prefill-plan.md): Hector's measured tuning for the K-split projections (wq_a / wkv / wq_b and every
++// other dense FP8 GEMM that splits, since they share this kernel) -- 4 K-blocks a stage, 3 stages instead of 2
++// and 4. Bit-identical to the previous config on real weights (tools/dsv41-zig/native/check_native.py,
++// attn.wq_a/wq_b/wkv/wo_b and ffn.shared_experts.w1/w2); docs/prefill-plan-progress.md has the per-op timings.
++#define PF_GEMM_FOLD 64, 128, 2, 4, 1, 0, 4, 3
+ #endif
+ #ifndef PF_GU4
+ #define PF_GU4 64, 128, 2, 4, 2, 1, 4, 3
+@@ -1692,7 +1696,7 @@ extern "C" __global__ void __launch_bounds__(256, 1) tf_dsn_pf_bf16_kernel(BfArg
+ 
+ // the prefill kernels' dynamic shared memory (mx.zig pf_*_smem)
+ #ifndef PF_SWEEP
+-static_assert(pf::kGemmSmem == 52224 && pf::kGuSmem == 79872 && pf::kDnSmem == 53760 && pf::kBfSmem == 81920, "prefill shared memory");
++static_assert(pf::kGemmSmem == 76800 && pf::kGuSmem == 79872 && pf::kDnSmem == 53760 && pf::kBfSmem == 81920, "prefill shared memory");
+ #endif
+ 
+ // Decode tensor-core kernels ("dec"): a decode round's few rows on the MMA with the operands swapped (the m16 side 16
+diff --git a/zig/src/families/dsv41/mx.zig b/zig/src/families/dsv41/mx.zig
+index 6624f57..404fea2 100644
+--- a/zig/src/families/dsv41/mx.zig
++++ b/zig/src/families/dsv41/mx.zig
+@@ -305,7 +305,7 @@ fn launch(f: cuda.Function, s: cuda.Stream, grid: [3]usize, block: usize, args:
+ }
+ 
+ /// The prefill tile kernels' dynamic shared memory (native.cu asserts the same: pf::kGemmSmem, kGuSmem, kDnSmem).
+-pub const pf_gemm_smem: u32 = 52224;
++pub const pf_gemm_smem: u32 = 76800;
+ pub const pf_gu_smem: u32 = 79872;
+ pub const pf_dn_smem: u32 = 53760;
+ pub const pf_bf16_smem: u32 = 81920;

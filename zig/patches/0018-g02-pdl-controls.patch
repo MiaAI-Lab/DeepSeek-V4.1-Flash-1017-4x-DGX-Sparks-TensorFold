@@ -1,0 +1,163 @@
+diff --git a/zig/src/cuda/launch.zig b/zig/src/cuda/launch.zig
+index 6d8ad382..f3191b4d 100644
+--- a/zig/src/cuda/launch.zig
++++ b/zig/src/cuda/launch.zig
+@@ -77,7 +77,22 @@ pub const Config = struct {
+ /// Kernel launches so far in this process (a profile's count by phase).
+ pub var count: u64 = 0;
+ 
+-pub fn launch(f: Function, cfg: Config, stream: Stream, args: *Args) Error!void {
++/// TF_DS_PDL=0: every launch without the programmatic-dependent-launch attribute, whatever its caller asks (a fully
++/// serialized stream; the decode plan's G0.2 control (d), docs/UNIFIED-DECODE-IMPROVEMENTS.md). The kernels are the same:
++/// griddepcontrol.wait is a no-op for an ordinary launch. Read at the first launch; unset or any other value: as asked.
++pub fn pdlAllowed() bool {
++    const S = struct {
++        var v: ?bool = null;
++    };
++    if (S.v) |v| return v;
++    const v = if (std.c.getenv("TF_DS_PDL")) |e| !std.mem.eql(u8, std.mem.span(e), "0") else true;
++    S.v = v;
++    return v;
++}
++
++pub fn launch(f: Function, cfg_in: Config, stream: Stream, args: *Args) Error!void {
++    var cfg = cfg_in;
++    if (cfg.pdl and !pdlAllowed()) cfg.pdl = false;
+     try cfg.validate();
+     count += 1;
+     const d = f.d;
+diff --git a/zig/src/cuda/triton.zig b/zig/src/cuda/triton.zig
+index 9b17d121..8580baf0 100644
+--- a/zig/src/cuda/triton.zig
++++ b/zig/src/cuda/triton.zig
+@@ -55,6 +55,20 @@ pub const Kernel = struct {
+         self.* = undefined;
+     }
+ 
++    /// TF_DS_TRITON_PDL_ATTR=0: the captured kernels' launches without the PDL attribute (the decode plan's G0.2 control
++    /// (c), "consumer launch attribute off"): the same PDL=1 cubins, which still execute griddepcontrol (an ordinary
++    /// producer's launch_dependents still releases a consumer that keeps the attribute). Unset or any other value: as
++    /// the kit recorded.
++    pub fn pdlAttribute() bool {
++        const S = struct {
++            var v: ?bool = null;
++        };
++        if (S.v) |v| return v;
++        const v = if (std.c.getenv("TF_DS_TRITON_PDL_ATTR")) |e| !std.mem.eql(u8, std.mem.span(e), "0") else true;
++        S.v = v;
++        return v;
++    }
++
+     /// The launch geometry Triton uses for a grid: x times num_ctas, 32 * num_warps threads, metadata shared bytes.
+     pub fn config(self: Kernel, grid: launch.Dim3) launch.Config {
+         const m = self.meta;
+@@ -64,7 +78,7 @@ pub const Kernel = struct {
+             .shared = m.shared,
+             .cluster = if (m.num_ctas != 1) .{ .x = m.num_ctas } else null,
+             .cluster_spread = m.num_ctas != 1,
+-            .pdl = m.launch_pdl,
++            .pdl = m.launch_pdl and pdlAttribute(),
+             .cooperative = m.launch_cooperative_grid,
+         };
+     }
+diff --git a/zig/src/families/dsv41/model.zig b/zig/src/families/dsv41/model.zig
+index 04721e81..cf6cf009 100644
+--- a/zig/src/families/dsv41/model.zig
++++ b/zig/src/families/dsv41/model.zig
+@@ -360,10 +360,11 @@ pub const Model = struct {
+                 var devices: std.ArrayList([]const u8) = .empty;
+                 var dit = std.mem.splitScalar(u8, devs, ',');
+                 while (dit.next()) |x| try devices.append(a, x);
+-                m.rdma_rings = try ring2d.Rings.open(gpa, d, try rdma.Kernels.load(m.rdma_mod.?), devices.items, role, ord, .{ .max_bytes = ring_bytes, .gid_index = rdmaGid() }, &m.comm, m.stream);
++                m.rdma_rings = try ring2d.Rings.open(gpa, d, try rdma.Kernels.load(m.rdma_mod.?), devices.items, role, ord, .{ .max_bytes = ring_bytes, .gid_index = rdmaGid(), .pdl = rdmaPdl() }, &m.comm, m.stream);
+                 m.two.?.rings = &m.rdma_rings.?;
+             }
+         }
++        logPdlControls(m.comm.rank);
+         m.eng = .{ .d = d, .s = m.stream, .t = .{ .set = &m.set, .stream = m.stream }, .blas = undefined, .comm = &m.comm, .pf = &m.pf, .lin = &m.lg, .ex = &m.exk, .ops = &m.ops, .exact = &m.ex, .c = c, .w = &m.w, .world = sp.world, .plain = rope, .compressed = rope_c, .ring = m.ring, .two = if (m.two) |*t| t else null };
+         m.eng.round_rows = o.round_rows;
+         if (m.par) |*x| m.eng.par = x;
+@@ -554,6 +555,34 @@ pub const Model = struct {
+         };
+     }
+ 
++    /// The decode plan's G0.2 controls (TF_DS_DEC_PDL, TF_DS_RDMA_PDL, TF_DS_TRITON_PDL_ATTR, TF_DS_PDL), one line on each
++    /// rank when any is off, so a run can show that every rank has the same ones.
++    fn logPdlControls(rank: usize) void {
++        const off = struct {
++            fn f(name: [*:0]const u8) bool {
++                return if (std.c.getenv(name)) |v| std.mem.eql(u8, std.mem.span(v), "0") else false;
++            }
++        }.f;
++        const native = off("TF_DS_DEC_PDL");
++        const ring = !rdmaPdl();
++        const tri_attr = off("TF_DS_TRITON_PDL_ATTR");
++        const all = off("TF_DS_PDL");
++        if (!(native or ring or tri_attr or all)) return;
++        const w = struct {
++            fn f(o: bool) []const u8 {
++                return if (o) "off" else "on";
++            }
++        }.f;
++        std.log.info("decode PDL controls on rank {d}: native decode kernels {s}, RDMA kernels {s}, Triton consumer launch attribute {s}, every launch attribute {s}", .{ rank, w(native or all), w(ring or all), w(tri_attr or all), w(all) });
++    }
++
++    /// TF_DS_RDMA_PDL=0 (or the Python build's TF_RDMA_PDL=0): the RDMA rings' kernels as ordinary launches with their
++    /// pdl argument 0 (no griddepcontrol in them): the decode plan's G0.2 control (b). Unset or any other value: as served.
++    pub fn rdmaPdl() bool {
++        for ([_][*:0]const u8{ "TF_DS_RDMA_PDL", "TF_RDMA_PDL" }) |name| if (std.c.getenv(name)) |v| return !std.mem.eql(u8, std.mem.span(v), "0");
++        return true;
++    }
++
+     /// TF_DS_RDMA_GID: the RDMA rings' GID index on every device; unset, each device's first RoCE v2 IPv4 GID.
+     pub fn rdmaGid() ?u8 {
+         const v = std.c.getenv("TF_DS_RDMA_GID") orelse return null;
+diff --git a/zig/src/families/dsv41/mx.zig b/zig/src/families/dsv41/mx.zig
+index 7e850218..8d24b095 100644
+--- a/zig/src/families/dsv41/mx.zig
++++ b/zig/src/families/dsv41/mx.zig
+@@ -220,6 +220,9 @@ pub const Kernels = struct {
+     dec_quant: cuda.Function, // act_quant for decode launches (a programmatic dependent launch)
+     dec_l2pf: cuda.Function, // the active experts' down weights into L2 (beside the 2D exchange)
+     dec_on: bool, // TF_DS_DECODE_DEC=0: the GEMV kernels instead (the reference path, measured slower)
++    // TF_DS_DEC_PDL=0: the decode tensor-core kernels (dense, gate / up, down) as ordinary launches, the same kernels (the
++    // decode plan's G0.2 control (a)); unset or any other value: programmatic dependent launches as served
++    dec_pdl: bool,
+     counters: cuda.DeviceBuffer,
+     combine: cuda.Function,
+     bf16: cuda.Function,
+@@ -254,6 +257,7 @@ pub const Kernels = struct {
+             .dec_quant = try m.function("tf_dsn_dec_quant_kernel"),
+             .dec_l2pf = try m.function("tf_dsn_dec_l2pf_kernel"),
+             .dec_on = if (std.c.getenv("TF_DS_DECODE_DEC")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true,
++            .dec_pdl = if (std.c.getenv("TF_DS_DEC_PDL")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true,
+             .counters = counters,
+             .module = m,
+             .act_quant = try m.function("tf_dsn_act_quant_kernel"),
+@@ -472,7 +476,7 @@ fn decDenseLaunch(k: *const Kernels, s: cuda.Stream, kind: u2, as: []const DecAr
+     const rg = decRg(m);
+     var args: cuda.Args = .{};
+     args.add(mm);
+-    try cuda.launch.launch(k.dec[kind][rg], .{ .grid = .{ .x = @intCast(ctas), .y = 1, .z = @intCast(cs_all) }, .block = .{ .x = 32 * dec_warps }, .shared = decShared(dec_dense_cfg, @as(usize, 1) << @intCast(rg)), .pdl = pdl }, s, &args);
++    try cuda.launch.launch(k.dec[kind][rg], .{ .grid = .{ .x = @intCast(ctas), .y = 1, .z = @intCast(cs_all) }, .block = .{ .x = 32 * dec_warps }, .shared = decShared(dec_dense_cfg, @as(usize, 1) << @intCast(rg)), .pdl = pdl and k.dec_pdl }, s, &args);
+ }
+ 
+ fn decDense(k: *const Kernels, s: cuda.Stream, kind: u2, a: DecArgs, z: ?Z) !void {
+@@ -1087,7 +1091,7 @@ pub fn gateUp(k: *const Kernels, s: cuda.Stream, d: *const cuda.Driver, ex: weig
+             ga.add(b);
+             const tpc = dec_warps / (2 * dec_gu_ks);
+             const rg = decRg(r);
+-            return cuda.launch.launch(k.dec[3][rg], .{ .grid = .{ .x = @intCast(cdiv(nx.tiles * 2, tpc)), .y = @intCast(ny), .z = 1 }, .block = .{ .x = 32 * dec_warps }, .shared = decShared(dec_gu_cfg, @as(usize, 1) << @intCast(rg)), .pdl = true }, s, &ga);
++            return cuda.launch.launch(k.dec[3][rg], .{ .grid = .{ .x = @intCast(cdiv(nx.tiles * 2, tpc)), .y = @intCast(ny), .z = 1 }, .block = .{ .x = 32 * dec_warps }, .shared = decShared(dec_gu_cfg, @as(usize, 1) << @intCast(rg)), .pdl = k.dec_pdl }, s, &ga);
+         }
+         ga.add(a);
+         if (k.sab) return launch(k.gu_sab, s, .{ cdiv(nx.tiles * 32, 16), ny, 1 }, 256, &ga);
+@@ -1167,7 +1171,7 @@ pub fn down(k: *const Kernels, s: cuda.Stream, ex: weights.Experts, sc: ExpertSc
+         da.add(b);
+         const tpc = dec_warps / dec_dn_ks;
+         const rg = decRg(r);
+-        try cuda.launch.launch(k.dec[4][rg], .{ .grid = .{ .x = @intCast(cdiv(n / 16, tpc)), .y = @intCast(ny), .z = 1 }, .block = .{ .x = 32 * dec_warps }, .shared = decShared(dec_experts_cfg, @as(usize, 1) << @intCast(rg)), .pdl = true }, s, &da);
++        try cuda.launch.launch(k.dec[4][rg], .{ .grid = .{ .x = @intCast(cdiv(n / 16, tpc)), .y = @intCast(ny), .z = 1 }, .block = .{ .x = 32 * dec_warps }, .shared = decShared(dec_experts_cfg, @as(usize, 1) << @intCast(rg)), .pdl = k.dec_pdl }, s, &da);
+     } else if (split) {
+         if (k.sab) try launch(k.dn_sab, s, .{ cdiv(n, 16), ny, 1 }, 256, &args) else try launch(k.dn_gemv, s, .{ cdiv(n, 8), ny, 1 }, 256, &args);
+     } else if (pfExperts(k, sc, i, n, 0)) {

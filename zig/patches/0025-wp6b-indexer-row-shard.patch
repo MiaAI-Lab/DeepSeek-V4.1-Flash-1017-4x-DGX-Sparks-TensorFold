@@ -1,0 +1,333 @@
+diff -ruN a/zig/build/cuda.zig b/zig/build/cuda.zig
+--- a/zig/build/cuda.zig	2026-10-25 12:41:29.547364033 +0200
++++ b/zig/build/cuda.zig	2026-10-25 12:41:29.548637556 +0200
+@@ -151,6 +151,12 @@
+     ds_idx_replay.addImport("dsv41", ds_check.import_table.get("dsv41").?);
+     ds_idx_replay.addImport("cuda", cuda);
+     b.installArtifact(b.addExecutable(.{ .name = "tf-dsv41-idx-replay", .root_module = ds_idx_replay }));
++    // WP6(b): _index_score_rows as one full-chunk call vs four quarter-sized calls at row offsets 0/512/1024/
++    // 1536 into the same buffers (the row-sharded indexer's own pattern), bit compared
++    const ds_wp6b_replay = b.createModule(.{ .root_source_file = b.path("zig/src/families/dsv41/wp6b_idx_shard_replay_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
++    ds_wp6b_replay.addImport("dsv41", ds_check.import_table.get("dsv41").?);
++    ds_wp6b_replay.addImport("cuda", cuda);
++    b.installArtifact(b.addExecutable(.{ .name = "tf-dsv41-wp6b-idx-shard-replay", .root_module = ds_wp6b_replay }));
+     // the Engram reader's buffered, O_DIRECT and AIO paths on the real tables, every byte compared
+     const ds_engram = b.createModule(.{ .root_source_file = b.path("zig/src/families/dsv41/engram_check_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
+     ds_engram.addImport("dsv41", ds_check.import_table.get("dsv41").?);
+diff -ruN a/zig/src/families/dsv41/model.zig b/zig/src/families/dsv41/model.zig
+--- a/zig/src/families/dsv41/model.zig	2026-10-25 12:41:29.545117756 +0200
++++ b/zig/src/families/dsv41/model.zig	2026-10-25 12:41:29.546044574 +0200
+@@ -359,6 +359,7 @@
+             try m.two.?.agreePairSum(d, &m.comm, m.stream, o.rdma_devices != null);
+             try m.two.?.agreeQuarterHc(d, &m.comm, m.stream, c.hidden, chunk_rows);
+             try m.two.?.agreeOwnerGather(d, &m.comm, m.stream);
++            try m.two.?.agreeIdxShard(d, &m.comm, m.stream);
+             if (o.rdma_devices) |devs| {
+                 const image: []const u8 = if (o.rdma_kernels) |path|
+                     try std.Io.Dir.cwd().readFileAllocOptions(io, path, a, .limited(1 << 26), .@"16", null)
+diff -ruN a/zig/src/families/dsv41/prompt2d.zig b/zig/src/families/dsv41/prompt2d.zig
+--- a/zig/src/families/dsv41/prompt2d.zig	2026-10-25 12:41:29.542774230 +0200
++++ b/zig/src/families/dsv41/prompt2d.zig	2026-10-25 12:41:29.543968953 +0200
+@@ -176,6 +176,9 @@
+     // pair widths. Shrinks pairSum's column exchange to each rank's own owned quarter for a row-sharded layer's
+     // gather, instead of every row.
+     owner_gather: bool = false,
++    // WP6(b) (docs/prefill-plan.md, indexer row-sharding): agreed at startup (agreeIdxShard), independent of qhc
++    // and owner_gather -- the indexer's own scoring kernels, not the HC-mix/gather path those two touch.
++    idx_shard: bool = false,
+ 
+     /// The widths from the split (both pairs'), and the buffers for chunks of up to `cap` rows (and rounds) from `a`.
+     pub fn init(c: *const Config, w: *const weights.Weights, a: *prompt.Arena, s: plan.Split, cap: usize) !Two {
+@@ -525,6 +528,32 @@
+         if (t.owner_gather) std.log.info("TF_DS_OWNER_GATHER=1: a row-sharded layer's gather moves only each rank's owned quarter over the column link, not every row", .{});
+     }
+ 
++    /// WP6(b) (docs/prefill-plan.md, indexer row-sharding): agreed at startup like pair_sum, qhc and
++    /// owner_gather, but independent of them -- it only needs a 2D engine with every rank's cap evenly
++    /// divisible into 16-row-aligned quarters (idxShardRange's own check; refused per-rank there, not here, so
++    /// a mismatch across ranks still shows as every rank agreeing on the flag but only some actually sharding).
++    pub fn agreeIdxShard(t: *Two, d: *const cuda.Driver, comm: *const Comm, stream: cuda.Stream) !void {
++        const want = if (std.c.getenv("TF_DS_IDX_SHARD")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
++        const w = comm.world;
++        var dev = try cuda.DeviceBuffer.alloc(d, (1 + w) * 4);
++        defer dev.free();
++        const mine: u32 = @intFromBool(want);
++        try dev.upload(0, std.mem.asBytes(&mine));
++        try comm.allGather(dev.ptr, dev.ptr + 4, 1, .u32, stream);
++        try stream.synchronize();
++        var all: [8]u32 = undefined;
++        if (w > all.len) return error.WorldTooLarge;
++        try dev.download(4, std.mem.sliceAsBytes(all[0..w]));
++        var on: usize = 0;
++        for (all[0..w]) |x| on += x;
++        if (on != 0 and on != w) {
++            std.log.err("TF_DS_IDX_SHARD: set on {d} of {d} ranks (this one: {s}); start every rank with the same value", .{ on, w, if (want) "1" else "unset" });
++            return error.IdxShardMismatch;
++        }
++        t.idx_shard = on == w;
++        if (t.idx_shard) std.log.info("TF_DS_IDX_SHARD=1: the indexer's scoring and top-k, for layers before the candidate source on a full chunk, run only each rank's owned quarter, all-gathering the picks", .{});
++    }
++
+     /// cat_rank (Comm2D.cat_rank): `src` [n, w[p]] -> `dst` [n, w0 + w1]: this node's TP2 rank's whole width, pair 0's
+     /// part then pair 1's (from its column partner, the same rank of the other pair).
+     pub fn catRank(t: *const Two, e: *const prompt.Engine, src: u64, dst: u64, n: usize, w: [2]usize, esize: usize) !void {
+diff -ruN a/zig/src/families/dsv41/prompt.zig b/zig/src/families/dsv41/prompt.zig
+--- a/zig/src/families/dsv41/prompt.zig	2026-10-25 12:41:29.539830272 +0200
++++ b/zig/src/families/dsv41/prompt.zig	2026-10-25 12:41:29.541317267 +0200
+@@ -1209,10 +1209,35 @@
+     try tri_attn.fp4Store(e.t, ch.lat2, hd, cs.comp_codes[li], cs.comp_scales[li], ch.groups, full, hd, 16, true);
+ }
+ 
++/// WP6(b) (docs/prefill-plan.md, indexer row-sharding): this layer's owned row range on this node, when
++/// TF_DS_IDX_SHARD applies -- a full-cap 2D chunk, strictly before the candidate-source layer (li <
++/// c.candidate_source). That bound is not coincidental: it is the indexer's own switch point, after which the
++/// per-row "keyed" scoring this shards stops and a cross-layer pool (ch.pool, written once at li ==
++/// candidate_source over every row, read by every later layer) takes over -- excluded here by construction, so
++/// no boundary resync like WP4's is needed. A short chunk, a resumed chunk under cap rows, a non-2D engine, an
++/// unaligned quarter (the kit's index kernels need every block's rows to start on a 16-row boundary) or the
++/// flag off (agreeIdxShard) all fall through to today's unsharded path (null).
++fn idxShardRange(e: *const Engine, ch: *const Chunk, li: usize) ?QRows {
++    const t = e.two orelse return null;
++    if (!t.idx_shard) return null;
++    if (li >= e.c.candidate_source) return null;
++    if (ch.n != ch.cap) return null;
++    const world = e.comm.world;
++    if (world == 0 or ch.cap % world != 0) return null;
++    const q = ch.cap / world;
++    if (q % 16 != 0) return null;
++    return .{ .start = e.comm.rank * q, .n = q };
++}
++
+ /// The indexer of a layer with index queries (switch "prompt_keys", layers before the candidate source): the
+ /// queries (idx_wq_b of q's latent, RoPE, fp4_qd's bytes), the heads' weights (x.float() @ idx_proj.t() through cuBLAS,
+ /// to bf16, times idx_dim ** -0.5 * idx_heads ** -0.5), each row's int64 keys of the kv source's index keys and the
+ /// top-k selection into cidx.
++/// WP6(b): when idxShardRange applies, the row-block loop below covers only this node's owned quarter (the same
++/// pointer-offset-into-the-full-buffer pattern it already uses for block 2, 3, ... of any multi-block call --
++/// see the loop's own "a row's scores and picks are its own" comment, and the offline proof,
++/// tf-dsv41-wp6b-idx-shard-replay, for a nonzero FIRST block), and ch.cidx is all-gathered back to full width
++/// before this returns, so every caller sees the same fully-populated cidx either way.
+ fn indexer(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usize, wqb: weights.Linear, src: usize, n_comp_end: usize, rope: Rope) !void {
+     const lay = e.w.layers[li];
+     const c = e.c;
+@@ -1263,11 +1288,13 @@
+     const pooled = !keyed and nbk > c.candidate_blocks;
+     if (pooled and (ch.pool == 0 or nbk > ch.pool_ms)) return error.ChunkTooLong;
+     const pk = @min(c.candidate_blocks, nbk);
+-    var r0: usize = 0;
+-    while (r0 < n) : (r0 += rb) {
++    const idxr = idxShardRange(e, ch, li);
++    var r0: usize = if (idxr) |r| r.start else 0;
++    const r_end: usize = if (idxr) |r| r.start + r.n else n;
++    while (r0 < r_end) : (r0 += rb) {
+         // the block's rows: iq[r0:r1], wts[r0:r1] and vis[r0:r1] as views (their offsets the served pointers'), its
+         // selection into cidx[r0:r1]
+-        const m = @min(n, r0 + rb) - r0;
++        const m = @min(r_end, r0 + rb) - r0;
+         const q = ch.iq4 + r0 * ih * id * 2;
+         const wb = ch.iw + r0 * ih * 2;
+         const vr = ch.vis + r0 * 8;
+@@ -1290,6 +1317,11 @@
+         }
+     }
+     if (pooled and li == c.candidate_source) sh.pool = true;
++    // WP6(b): this rank's owned-row slice of cidx, all-gathered to every rank -- a plain world-4 all-gather, in
++    // place (NCCL's documented rule: send == recv + rank * count), the same pattern qhcGatherRows already uses
++    // for ch.x. Bytes, not a typed count: cidx's per-row width (kk int64 keys) is uniform across rows for this
++    // call, so a raw byte gather needs no element-type opinion.
++    if (idxr) |r| try e.comm.allGather(ch.cidx + r.start * kk * 8, ch.cidx, r.n * kk * 8, .u8, e.s);
+     sh.kk = kk;
+ }
+ 
+diff -ruN a/zig/src/families/dsv41/wp6b_idx_shard_replay_main.zig b/zig/src/families/dsv41/wp6b_idx_shard_replay_main.zig
+--- a/zig/src/families/dsv41/wp6b_idx_shard_replay_main.zig	1970-01-01 02:00:00.000000000 +0200
++++ b/zig/src/families/dsv41/wp6b_idx_shard_replay_main.zig	2026-10-25 12:41:29.549486518 +0200
+@@ -0,0 +1,188 @@
++//! WP6(b) offline differential: `_index_score_rows` (tri_index.indexScore) called once as a 2048-row launch (the
++//! reference, row offset 0 into [2048, ...] buffers -- today's unsharded path) and once as four 512-row launches
++//! at row offsets 0/512/1024/1536 into the SAME full buffers (the row-sharded path: each node only computes its
++//! own owned quarter). This is exactly what the real engine's indexer() will do once row-sharded -- not a fresh,
++//! tightly-repacked buffer per quarter (unlike WP4's qhc_g/qhc_part): the indexer's own block-looping already
++//! pointer-offsets into these same full-size q/wt/vis/out/tmax buffers at nonzero row starts for every call with
++//! more than one row-block (prompt.zig's existing comment: "a row's scores and picks are its own, so the block
++//! size changes no bits"), so a nonzero r0 is exercised by any long-context prompt in production today. What
++//! row-sharding adds that is genuinely new is calling r0 = q, 2q, 3q as the FIRST launch of a call, not block 2,
++//! 3, 4 of a single call that started at r0 = 0 -- this test is the direct check that distinction changes nothing.
++//! Two "keys" modes, both idx_rb settings (RB=1 and the shipped default RB=2), and a key count (2048) big enough
++//! to span multiple 64-key tiles, so a tile-boundary accounting bug would have somewhere to show up.
++//!   tf-dsv41-wp6b-idx-shard-replay AOT_DIR [seed]
++const std = @import("std");
++const cuda = @import("cuda");
++const dsv41 = @import("dsv41");
++const tri_index = dsv41.tri_index;
++
++const IH: usize = 32;
++const ID: usize = 128;
++const N: usize = 2048; // compressed keys visible: 32 tiles of 64
++const ROWS: usize = 2048; // the real chunk capacity
++const QROWS: usize = 512; // ROWS / world (world = 4)
++const NQ: usize = ROWS / QROWS;
++
++fn fillBf16(buf: cuda.DeviceBuffer, rng: *std.Random.DefaultPrng, a: std.mem.Allocator) !void {
++    const n = buf.len / 2;
++    const host = try a.alloc(u16, n);
++    defer a.free(host);
++    for (host) |*v| {
++        const f: f32 = rng.random().floatNorm(f32) * 0.5;
++        v.* = @truncate(@as(u32, @bitCast(f)) >> 16);
++    }
++    try buf.upload(0, std.mem.sliceAsBytes(host));
++}
++
++fn fillK(codes: cuda.DeviceBuffer, scales: cuda.DeviceBuffer, rng: *std.Random.DefaultPrng, a: std.mem.Allocator) !void {
++    const cb = try a.alloc(u8, codes.len);
++    defer a.free(cb);
++    for (cb) |*v| v.* = rng.random().int(u8);
++    try codes.upload(0, cb);
++    const sb = try a.alloc(u8, scales.len);
++    defer a.free(sb);
++    for (sb) |*v| v.* = 23 + rng.random().uintLessThan(u8, 127 - 23 + 1);
++    try scales.upload(0, sb);
++}
++
++// strictly increasing with row index, same spirit as idx_replay_main.zig's: no two rows share a visible count,
++// and every row sees comfortably more than one 64-key tile.
++fn fillVis(buf: cuda.DeviceBuffer, rows: usize, a: std.mem.Allocator) !void {
++    const host = try a.alloc(i64, rows);
++    defer a.free(host);
++    for (host, 0..) |*v, r| v.* = @intCast(@min(N, 64 + r));
++    try buf.upload(0, std.mem.sliceAsBytes(host));
++}
++
++fn zero(buf: cuda.DeviceBuffer, a: std.mem.Allocator) !void {
++    const z = try a.alloc(u8, buf.len);
++    @memset(z, 0);
++    try buf.upload(0, z);
++}
++
++pub fn main(init: std.process.Init) !u8 {
++    const a = init.arena.allocator();
++    const io = init.io;
++    const args = try init.minimal.args.toSlice(a);
++    if (args.len < 2) {
++        std.debug.print("usage: tf-dsv41-wp6b-idx-shard-replay AOT_DIR [seed]\n", .{});
++        return 2;
++    }
++    const seed: u64 = if (args.len > 2) try std.fmt.parseInt(u64, args[2], 10) else 0xc0ffee;
++
++    var driver = try cuda.Driver.open();
++    defer driver.close();
++    var ctx = try cuda.Context.init(&driver, 0);
++    defer ctx.deinit();
++    var stream = try cuda.Stream.init(&driver, true);
++    defer stream.deinit();
++    var set = try cuda.aot.Set.load(init.gpa, io, &driver, ctx.device, args[1]);
++    const t: dsv41.tri.Tri = .{ .set = &set, .stream = stream, .pdl = true };
++    const d = &driver;
++    const nt = (N + 63) / 64;
++
++    var ok = true;
++    for ([_]usize{ 1, 2 }) |rb| {
++        for ([_]bool{ true, false }) |keyed| {
++            var rng = std.Random.DefaultPrng.init(seed);
++            var q = try cuda.DeviceBuffer.alloc(d, ROWS * IH * ID * 2);
++            defer q.free();
++            var kcodes = try cuda.DeviceBuffer.alloc(d, N * (ID / 2));
++            defer kcodes.free();
++            var kscales = try cuda.DeviceBuffer.alloc(d, N * (ID / 32));
++            defer kscales.free();
++            var wt = try cuda.DeviceBuffer.alloc(d, ROWS * IH * 2);
++            defer wt.free();
++            var vis = try cuda.DeviceBuffer.alloc(d, ROWS * 8);
++            defer vis.free();
++            const out_elem: usize = if (keyed) 8 else 4;
++            var out_full = try cuda.DeviceBuffer.alloc(d, ROWS * N * out_elem);
++            defer out_full.free();
++            var out_shard = try cuda.DeviceBuffer.alloc(d, ROWS * N * out_elem);
++            defer out_shard.free();
++            var tmax_full: ?cuda.DeviceBuffer = if (keyed) try cuda.DeviceBuffer.alloc(d, ROWS * nt * 8) else null;
++            defer if (tmax_full) |*b| b.free();
++            var tmax_shard: ?cuda.DeviceBuffer = if (keyed) try cuda.DeviceBuffer.alloc(d, ROWS * nt * 8) else null;
++            defer if (tmax_shard) |*b| b.free();
++
++            try fillBf16(q, &rng, a);
++            try fillK(kcodes, kscales, &rng, a);
++            try fillBf16(wt, &rng, a);
++            try fillVis(vis, ROWS, a);
++            const k: tri_index.IndexK = .{ .fp4 = .{ .codes = kcodes.ptr, .scales = kscales.ptr } };
++
++            tri_index.idx_rb = rb;
++
++            // Reference: one call, the full 2048 rows, row offset 0 -- today's unsharded path.
++            try zero(out_full, a);
++            if (tmax_full) |tm| try zero(tm, a);
++            try tri_index.indexScore(t, q.ptr, k, wt.ptr, vis.ptr, N, out_full.ptr, null, keyed, if (tmax_full) |tm| tm.ptr else null, false, ROWS, IH, ID);
++            try stream.synchronize();
++
++            // Row-sharded: four separate 512-row calls at row offsets 0, 512, 1024, 1536 into the SAME buffers --
++            // exactly what indexer()'s block loop will do when bounded to [owned.start, owned.start + owned.n).
++            try zero(out_shard, a);
++            if (tmax_shard) |tm| try zero(tm, a);
++            for (0..NQ) |qi| {
++                const r0 = qi * QROWS;
++                const qoff = q.ptr + @as(u64, @intCast(r0 * IH * ID * 2));
++                const woff = wt.ptr + @as(u64, @intCast(r0 * IH * 2));
++                const voff = vis.ptr + @as(u64, @intCast(r0 * 8));
++                const ooff = out_shard.ptr + @as(u64, @intCast(r0 * N * out_elem));
++                const tmoff = if (tmax_shard) |tm| tm.ptr + @as(u64, @intCast(r0 * nt * 8)) else null;
++                try tri_index.indexScore(t, qoff, k, woff, voff, N, ooff, null, keyed, tmoff, false, QROWS, IH, ID);
++            }
++            try stream.synchronize();
++
++            const bf = try a.alloc(u8, out_full.len);
++            try out_full.download(0, bf);
++            const bs = try a.alloc(u8, out_shard.len);
++            try out_shard.download(0, bs);
++            const label = if (keyed) "keyed" else "plain";
++            if (std.mem.eql(u8, bf, bs)) {
++                std.debug.print("ok   RB={d} {s}: OUT bit-identical, full call vs 4 quarter calls at row offsets 0/512/1024/1536\n", .{ rb, label });
++            } else {
++                var nd: usize = 0;
++                var first: ?usize = null;
++                if (keyed) {
++                    const vf = std.mem.bytesAsSlice(i64, bf);
++                    const vs = std.mem.bytesAsSlice(i64, bs);
++                    for (vf, vs, 0..) |x, y, i| {
++                        if (x != y) {
++                            nd += 1;
++                            if (first == null) first = i;
++                        }
++                    }
++                } else {
++                    const vf = std.mem.bytesAsSlice(u32, bf);
++                    const vs = std.mem.bytesAsSlice(u32, bs);
++                    for (vf, vs, 0..) |x, y, i| {
++                        if (x != y) {
++                            nd += 1;
++                            if (first == null) first = i;
++                        }
++                    }
++                }
++                std.debug.print("FAIL RB={d} {s}: OUT differs, {d}/{d} elements, first at {d}\n", .{ rb, label, nd, bf.len / out_elem, first.? });
++                ok = false;
++            }
++            if (keyed) {
++                const tf = try a.alloc(u8, tmax_full.?.len);
++                try tmax_full.?.download(0, tf);
++                const ts = try a.alloc(u8, tmax_shard.?.len);
++                try tmax_shard.?.download(0, ts);
++                if (std.mem.eql(u8, tf, ts)) {
++                    std.debug.print("ok   RB={d} {s}: TMAX bit-identical, full call vs 4 quarter calls\n", .{ rb, label });
++                } else {
++                    std.debug.print("FAIL RB={d} {s}: TMAX differs\n", .{ rb, label });
++                    ok = false;
++                }
++            }
++        }
++    }
++    if (ok) {
++        std.debug.print("WP6(b): _index_score_rows at a row-sharded quarter's own offset == the full-chunk call (OUT and TMAX, keyed and plain, RB=1 and RB=2)\n", .{});
++        return 0;
++    }
++    return 1;
++}

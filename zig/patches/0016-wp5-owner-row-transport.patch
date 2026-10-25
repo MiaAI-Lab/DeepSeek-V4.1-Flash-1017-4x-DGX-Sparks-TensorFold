@@ -1,0 +1,182 @@
+diff -ruN a/zig/src/families/dsv41/layer_main.zig b/zig/src/families/dsv41/layer_main.zig
+--- a/zig/src/families/dsv41/layer_main.zig	2026-10-24 19:00:31.323548162 +0300
++++ b/zig/src/families/dsv41/layer_main.zig	2026-10-24 19:00:31.323882644 +0300
+@@ -873,14 +873,14 @@
+         if (checked and !try run.check(try std.fmt.bufPrint(&label_buf, "L{d} attention in", .{li}), att, ch.x)) return false;
+         prompt.attention(eng, ch, caches, shared, li, rings[li], floor, kv_done != null and kv_done.? == li) catch |err| return report(w_out, rank, li, "attention", err);
+         if (checked and !try run.check(try std.fmt.bufPrint(&label_buf, "L{d} attention partial", .{li}), fx.find(after, "Model.attention_k", l, "out"), ch.pa)) return false;
+-        try prompt.gather(eng, ch, ch.pa, ch.ga);
++        try prompt.gather(eng, ch, ch.pa, ch.ga, li);
+         if (checked and !try run.check(try std.fmt.bufPrint(&label_buf, "L{d} attention gather", .{li}), fx.find(att.?.call, "Comm.gather", null, "out"), ch.ga)) return false;
+         prompt.ffnMixes(eng, ch, li) catch |err| return report(w_out, rank, li, "ffn mixes", err);
+         const mo: ?*const Point = if (checked) (fx.find(att.?.call, "Model.moe", l, "in2") orelse return report(w_out, rank, li, "moe fixture", error.NoLayerFixture)) else null;
+         if (checked and !try run.check(try std.fmt.bufPrint(&label_buf, "L{d} moe in", .{li}), mo, ch.x)) return false;
+         prompt.moe(eng, ch, li) catch |err| return report(w_out, rank, li, "moe", err);
+         if (checked and !try run.check(try std.fmt.bufPrint(&label_buf, "L{d} moe partial", .{li}), fx.find(att.?.call, "Model.moe", l, "out"), ch.pm)) return false;
+-        try prompt.gather(eng, ch, ch.pm, ch.gm);
++        try prompt.gather(eng, ch, ch.pm, ch.gm, li + 1);
+         if (checked) {
+             const mg = fx.find(mo.?.call, "Comm.gather", null, "out") orelse return report(w_out, rank, li, "moe gather fixture", error.NoLayerFixture);
+             if (!try run.check(try std.fmt.bufPrint(&label_buf, "L{d} moe gather", .{li}), mg, ch.gm)) return false;
+diff -ruN a/zig/src/families/dsv41/model.zig b/zig/src/families/dsv41/model.zig
+--- a/zig/src/families/dsv41/model.zig	2026-10-24 19:00:31.321118965 +0300
++++ b/zig/src/families/dsv41/model.zig	2026-10-24 19:00:31.322172171 +0300
+@@ -351,6 +351,7 @@
+             m.two.?.nccl = prompt2d.ncclOf(ord);
+             try m.two.?.agreePairSum(d, &m.comm, m.stream, o.rdma_devices != null);
+             try m.two.?.agreeQuarterHc(d, &m.comm, m.stream, c.hidden, chunk_rows);
++            try m.two.?.agreeOwnerGather(d, &m.comm, m.stream);
+             if (o.rdma_devices) |devs| {
+                 const image: []const u8 = if (o.rdma_kernels) |path|
+                     try std.Io.Dir.cwd().readFileAllocOptions(io, path, a, .limited(1 << 26), .@"16", null)
+@@ -824,13 +825,13 @@
+             if (pt) |t| try t.mark(m.stream, .mix_attn);
+             try prompt.attention(e, ch, &m.view, &shared, li, m.ring_view[li], floor, kv_done != null and kv_done.? == li);
+             if (pt) |t| try t.mark(m.stream, .attn);
+-            try prompt.gather(e, ch, ch.pa, ch.ga);
++            try prompt.gather(e, ch, ch.pa, ch.ga, li);
+             if (pt) |t| try t.mark(m.stream, .gather_a);
+             try prompt.ffnMixes(e, ch, li);
+             if (pt) |t| try t.mark(m.stream, .mix_ffn);
+             try prompt.moe(e, ch, li);
+             if (pt) |t| try t.mark(m.stream, .moe);
+-            try prompt.gather(e, ch, ch.pm, ch.gm);
++            try prompt.gather(e, ch, ch.pm, ch.gm, li + 1);
+             if (pt) |t| try t.mark(m.stream, .gather_m);
+             // WP1's exit gate: the gathers' own output (what TF_DS_PAIR_SUM changes), both sublayers, at every
+             // requested layer of the first chunk of at least 64 rows (prompt.dump_layers; dump_done stops it after
+diff -ruN a/zig/src/families/dsv41/prompt2d.zig b/zig/src/families/dsv41/prompt2d.zig
+--- a/zig/src/families/dsv41/prompt2d.zig	2026-10-24 19:00:31.316630253 +0300
++++ b/zig/src/families/dsv41/prompt2d.zig	2026-10-24 19:00:31.317626771 +0300
+@@ -172,6 +172,10 @@
+     pair_sum: bool = false,
+     // WP4 (docs/prefill-plan.md): quarter-HC, agreed at startup (agreeQuarterHc) like pair_sum.
+     qhc: bool = false,
++    // WP5 (docs/prefill-plan.md, owner-row transport): agreed at startup (agreeOwnerGather), needs qhc and equal
++    // pair widths. Shrinks pairSum's column exchange to each rank's own owned quarter for a row-sharded layer's
++    // gather, instead of every row.
++    owner_gather: bool = false,
+ 
+     /// The widths from the split (both pairs'), and the buffers for chunks of up to `cap` rows (and rounds) from `a`.
+     pub fn init(c: *const Config, w: *const weights.Weights, a: *prompt.Arena, s: plan.Split, cap: usize) !Two {
+@@ -410,6 +414,45 @@
+             try prompt.fill(e, dst + n * row_bytes, 0, n * row_bytes);
+     }
+ 
++    /// WP5 (docs/prefill-plan.md, owner-row transport): pairSum, but the column link's exchange moves only the
++    /// `owned` rows this node actually keeps (a row-sharded quarter-HC layer reads nothing else -- qhcRepackG
++    /// copies exactly this same range back out of dst). linkSum (the TP partner's all-reduce) stays over every
++    /// row unchanged: every row's sum is needed by SOME rank's owned range, not just this node's own, and it is
++    /// already the cheaper of pairSum's two steps. `owned.start`/`owned.n` are qhcRange's own row range (q = cap
++    /// / world, uniform across ranks -- the NCCL rank IS the owner index), so the column partner's owned range is
++    /// computable here with no extra round trip: `peer_nccl * owned.n`.
++    ///
++    /// The exchange is NOT symmetric in content: this node sends its own pg's slice at the PARTNER's owned rows
++    /// (what the partner needs back, not what this node needs), and receives the partner's pg slice at THIS
++    /// node's owned rows, in the one ncclAllGather pairSum's own link already runs (same comm, same `t.parts`
++    /// scratch, never t.pad -- t.pad holds this node's own tp-summed data at every row and is read from, not
++    /// written to, by this step). This node's own pg at its own owned rows never needs the network at all: it is
++    /// already sitting in t.pad from linkSum, exactly where qhcRepackG's reasoning says a rank's own correctly-
++    /// computed rows need no collective to read back.
++    pub fn pairSumOwned(t: *const Two, e: *const prompt.Engine, src: u64, dst: u64, n: usize, w: [2]usize, owned: prompt.QRows) !void {
++        const me: u32 = @intCast(t.r + 2 * t.p);
++        const tp_link = e.comm.linkTo(t.nccl[me ^ 1]) orelse return error.PairSumNoLink;
++        const peer_role: u32 = me ^ 2;
++        const pair_link = e.comm.linkTo(t.nccl[peer_role]) orelse return error.PairSumNoLink;
++        const wmax = @max(w[0], w[1]);
++        if (n * wmax * 4 > t.part_bytes or owned.n * wmax * 4 > t.part_bytes) return error.PartTooBig;
++        const mine = n * w[t.p];
++        try e.d.check(e.d.api.cuMemcpyDtoDAsync_v2(t.pad, src, mine * 4, e.s.handle), "cuMemcpyDtoDAsync");
++        try e.comm.linkSum(tp_link.comm, t.pad, mine, e.s);
++        const peer_nccl = t.nccl[peer_role];
++        const peer_start = peer_nccl * owned.n;
++        try e.comm.linkGather(pair_link.comm, t.pad + peer_start * w[t.p] * 4, t.parts, owned.n * wmax, .f32, e.s);
++        const row_bytes = (w[0] + w[1]) * 4;
++        try e.ops.copyRows(e.s, t.pad + owned.start * w[t.p] * 4, w[t.p] * 4, dst + owned.start * row_bytes + t.p * w[0] * 4, row_bytes, w[t.p] * 4, owned.n);
++        const op = 1 - t.p;
++        const slot: usize = 1 - pair_link.me;
++        try e.ops.copyRows(e.s, t.parts + slot * owned.n * wmax * 4, w[op] * 4, dst + owned.start * row_bytes + op * w[0] * 4, row_bytes, w[op] * 4, owned.n);
++        if (std.c.getenv("TF_DS_PAIR_SUM_NEGZERO") != null)
++            try prompt.fill32(e, dst + n * row_bytes + owned.start * row_bytes, 0x80000000, owned.n * (w[0] + w[1]))
++        else
++            try prompt.fill(e, dst + n * row_bytes + owned.start * row_bytes, 0, owned.n * row_bytes);
++    }
++
+     /// TF_DS_QUARTER_HC, resolved once for the whole world (WP4, docs/prefill-plan.md): every rank sends its setting;
+     /// any disagreement refuses to start (the same reasoning as agreePairSum's setting check -- a rank alone on the
+     /// unsharded path would leave the rest in a world-4 all-gather it never joins). No link-adjacency check is
+@@ -454,6 +497,34 @@
+         }
+     }
+ 
++    /// WP5 (docs/prefill-plan.md, owner-row transport): agreed at startup like pair_sum and qhc. Needs qhc (no
++    /// row-sharded layer reads the saving otherwise) and equal pair widths (pairSumOwned reads t.pad as a tight
++    /// w[t.p]-wide buffer at a row offset, pairSum's own layout, which only lines up with wmax when the two
++    /// pairs' widths are equal -- refuse here rather than read misaligned bytes live, the exact class of mistake
++    /// WP4's own buffer-stride bugs were).
++    pub fn agreeOwnerGather(t: *Two, d: *const cuda.Driver, comm: *const Comm, stream: cuda.Stream) !void {
++        const want = if (std.c.getenv("TF_DS_OWNER_GATHER")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
++        const w = comm.world;
++        var dev = try cuda.DeviceBuffer.alloc(d, (1 + w) * 4);
++        defer dev.free();
++        const mine: u32 = @intFromBool(want);
++        try dev.upload(0, std.mem.asBytes(&mine));
++        try comm.allGather(dev.ptr, dev.ptr + 4, 1, .u32, stream);
++        try stream.synchronize();
++        var all: [8]u32 = undefined;
++        if (w > all.len) return error.WorldTooLarge;
++        try dev.download(4, std.mem.sliceAsBytes(all[0..w]));
++        var on: usize = 0;
++        for (all[0..w]) |x| on += x;
++        if (on != 0 and on != w) {
++            std.log.err("TF_DS_OWNER_GATHER: set on {d} of {d} ranks (this one: {s}); start every rank with the same value", .{ on, w, if (want) "1" else "unset" });
++            return error.OwnerGatherMismatch;
++        }
++        t.owner_gather = on == w and t.qhc and t.ow[0] == t.ow[1];
++        if (on == w and !t.owner_gather) std.log.info("TF_DS_OWNER_GATHER=1: needs TF_DS_QUARTER_HC=1 and equal pair widths (this run: qhc={}, ow={any}); keeping pairSum's full-row gather", .{ t.qhc, t.ow });
++        if (t.owner_gather) std.log.info("TF_DS_OWNER_GATHER=1: a row-sharded layer's gather moves only each rank's owned quarter over the column link, not every row", .{});
++    }
++
+     /// cat_rank (Comm2D.cat_rank): `src` [n, w[p]] -> `dst` [n, w0 + w1]: this node's TP2 rank's whole width, pair 0's
+     /// part then pair 1's (from its column partner, the same rank of the other pair).
+     pub fn catRank(t: *const Two, e: *const prompt.Engine, src: u64, dst: u64, n: usize, w: [2]usize, esize: usize) !void {
+diff -ruN a/zig/src/families/dsv41/prompt.zig b/zig/src/families/dsv41/prompt.zig
+--- a/zig/src/families/dsv41/prompt.zig	2026-10-24 19:00:31.318783705 +0300
++++ b/zig/src/families/dsv41/prompt.zig	2026-10-24 19:00:31.319846943 +0300
+@@ -821,12 +821,16 @@
+     ch.h = src;
+ }
+ 
++/// A row range: `start`, the count `n`. WP4's qhcRange and WP5's row-sharded gather() both key owned-row
++/// transport off the identical range, so it is named once here rather than as two matching anonymous structs.
++pub const QRows = struct { start: usize, n: usize };
++
+ /// WP4 (quarter-HC, docs/prefill-plan.md): this layer's owned row range on this node, when quarter-HC applies --
+ /// a full-cap 2D chunk, strictly before the replay-cut boundary layer (c.layers / 2, which needs every row's h /
+ /// pre / x globally and is never sharded: replayCut truncates ch.n there for the decoder's own, unchanged path).
+ /// node g of `world` owns rows [g * q, (g + 1) * q), q = cap / world. A short chunk, a resumed chunk under cap
+ /// rows, a non-2D engine or the flag off (agreeQuarterHc) all fall through to today's unsharded path (null).
+-fn qhcRange(e: *const Engine, ch: *const Chunk, li: usize) ?struct { start: usize, n: usize } {
++fn qhcRange(e: *const Engine, ch: *const Chunk, li: usize) ?QRows {
+     const t = e.two orelse return null;
+     if (!t.qhc) return null;
+     if (li >= e.c.layers / 2) return null;
+@@ -1274,8 +1278,17 @@
+ /// Comm.gather: [world, n, D] fp32 of every rank's partial, in rank order.
+ /// TF_DS_PAIR_SUM=1 (prompt2d Two.pairSum, agreed at startup): a chunk's gathers as pair sums over the ring's links.
+ /// Every rank holds the same pair_sum and the same chunk rows, so all take the same path.
+-pub fn gather(e: *const Engine, ch: *const Chunk, src: u64, dst: u64) !void {
++/// WP5 (docs/prefill-plan.md, owner-row transport, agreed as owner_gather): `consumer_li` is the layer index
++/// whose attnMixes/ffnMixes/tap/engramApply call will actually read `dst` back (the SAME li for the attention
++/// gather into ch.ga; li + 1 for the MoE gather into ch.gm, which the next layer reads as its "pending" post --
++/// see qhcResyncBoundary's own comment on why that is never the boundary layer itself). qhcRange(consumer_li)
++/// is exactly the range that reader will later pull back out with qhcRepackG, so handing it to pairSumOwned
++/// keeps the producer and every consumer locked to the identical row range by construction.
++pub fn gather(e: *const Engine, ch: *const Chunk, src: u64, dst: u64, consumer_li: usize) !void {
+     if (e.two) |t| {
++        if (t.owner_gather and t.pair_sum and ch.n >= 64) {
++            if (qhcRange(e, ch, consumer_li)) |r| return t.pairSumOwned(e, src, dst, ch.n, t.ow, r);
++        }
+         if (t.pair_sum and ch.n >= 64) return t.pairSum(e, src, dst, ch.n, t.ow);
+         return t.quarters(e, src, dst, ch.n, t.ow, 4); // 2D: the same [2, n, D] from the four quarters
+     }

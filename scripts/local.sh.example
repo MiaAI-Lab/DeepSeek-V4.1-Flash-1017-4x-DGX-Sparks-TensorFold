@@ -1,0 +1,19 @@
+# Copy to scripts/local.sh (not in git) and fill in this setup's values; scripts/config.sh reads it first.
+# The three other Sparks, key-based ssh (ssh-copy-id), on a ring in its order: this Spark (spark1) - WORKER - WORKER2
+# - WORKER3 - back to this Spark. On a switch any order works.
+WORKER=user@192.0.2.2          # NCCL rank 1 (spark2)
+WORKER2=user@192.0.2.3         # NCCL rank 2 (spark3)
+WORKER3=user@192.0.2.4         # NCCL rank 3 (spark4)
+# FABRIC_PEER=192.0.2.12       # a worker's CX7 address when WORKER is reached over another network (FABRIC_PEER2/3 too)
+# NFS_SERVER3=10.0.41.1        # the head's address a worker mounts the weights from, when the link's is not the one
+# NFS_PATH=/huggingface        # HF_CACHE's path in this Spark's NFS export (an export with fsid=0 at its root)
+# PORT=8888
+# DERISKED=1                  # use Blackfrost-AI/DeepSeek-V4.1-Flash-1017-DERISKED-FP8
+# export TF_DS_PAIR_SUM=1     # pair-sum gathers (zig/patches/0008, 0010): validate on your own ring first
+# export TF_DS_IDX_RB=2       # the indexer's kit kernel, its own RB=2 capture (zig/patches/0014): validate on
+#                             # your own ring first
+# export TF_DS_QUARTER_HC=1  # row-sharded HC-mix, each node its own quarter (zig/patches/0015): validate on
+#                             # your own ring first
+# export TF_DS_OWNER_GATHER=1 # owner-row transport over the column link, needs TF_DS_QUARTER_HC=1 (zig/patches/
+#                             # 0016): validate on your own ring first
+# export TF_DS_IDX_SHARD=1    # the indexer's own row-sharding (zig/patches/0025): validate on your own ring first

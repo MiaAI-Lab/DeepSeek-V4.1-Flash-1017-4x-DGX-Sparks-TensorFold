@@ -1,0 +1,298 @@
+diff --git a/zig/src/core/lanes/config.zig b/zig/src/core/lanes/config.zig
+index a5256382..1c79149e 100644
+--- a/zig/src/core/lanes/config.zig
++++ b/zig/src/core/lanes/config.zig
+@@ -20,6 +20,8 @@ pub const Model = struct {
+     speculate_early: bool = true, // draft every row's first draft behind the verify
+     draft_prior: []const f64 = &.{}, // the head's acceptance by depth until a stream has its own
+     plain_guard: bool = false, // plain rounds compete with drafted depths
++    prepass: bool = false, // streams join the next head pass only where it pays (depth.Rule.prepassSelect)
++    pass_ms: [2]f64 = .{ 0, 0 }, // prepass: a batched head pass's ms, a + b x streams
+     drafts: u32 = 1, // head drafts a round at most
+     window_costs: []const Cost = &.{}, // forward ms by exact window width (timed at load)
+     mtp_step_ms: f64 = 0.0, // one chained head step (timed at load)
+@@ -43,6 +45,8 @@ pub const Config = struct {
+     speculate_early: bool,
+     pipelined: bool,
+     plain_guard: bool,
++    prepass: bool = false,
++    pass_ms: [2]f64 = .{ 0, 0 },
+     most_drafts: u32,
+     family_streams: bool,
+     batch_rows: u32,
+@@ -104,6 +108,8 @@ pub const Config = struct {
+             .speculate_early = m.speculate_early,
+             .pipelined = m.gpu_tokens,
+             .plain_guard = m.plain_guard,
++            .prepass = m.prepass,
++            .pass_ms = m.pass_ms,
+             .most_drafts = @min(m.drafts, @min(width - 1, max_draft)),
+             .family_streams = streams,
+             .batch_rows = batch_rows,
+diff --git a/zig/src/core/lanes/depth.zig b/zig/src/core/lanes/depth.zig
+index 015136a0..89e25760 100644
+--- a/zig/src/core/lanes/depth.zig
++++ b/zig/src/core/lanes/depth.zig
+@@ -10,6 +10,7 @@ pub const Constants = struct {
+     cost_rate: f64 = 0.2, // weight of the newest round in a depth's measured time
+     plain_margin: f64 = 1.05, // a drafted depth must beat plain rounds' tokens a ms by this much
+     plain_wait_most: u64 = 128, // plain rounds between probes at most
++    prepass_probe: u64 = 8, // prepass: shared passes a stream sits out before it joins one again to remeasure its gain
+     draft_slack: i64 = 2, // drafts a stream offers past what its last shared round granted it
+ };
+ 
+@@ -20,6 +21,7 @@ pub const State = struct {
+     plain: ?u64 = null,
+     wait: ?u64 = null,
+     ms: ?Table = null, // plain_guard: the stream's own round times
++    skipped: u64 = 0, // prepass: shared passes sat out in a row
+ 
+     pub fn deinit(st: *State, gpa: Allocator) void {
+         gpa.free(st.p);
+@@ -34,6 +36,8 @@ pub const Who = struct {
+     finished: bool,
+     forced: bool,
+     granted: ?u32 = null,
++    gain: ?f64 = null,
++    gain_at: [9]f64 = @splat(0),
+     stream: ?*anyopaque = null,
+ };
+ 
+@@ -54,6 +58,9 @@ pub const Rule = struct {
+     shared_costs: *const Table,
+     mtp_step_ms: f64,
+     plain_guard: bool,
++    prepass: bool = false,
++    pass_ms: [2]f64 = .{ 0, 0 }, // prepass: a batched head pass's ms, a + b x streams (measured; TF_DS_PASS_MS)
++    round_streams: usize = 0, // prepass: the shared round's streams, drafting or not (roundStreams sets it)
+     node_probabilities: bool,
+     batch_rows: u32,
+     round_ms: Table = .{}, // a round's wall time by drafts, shared by every stream
+@@ -165,6 +172,111 @@ pub const Rule = struct {
+         return best;
+     }
+ 
++    /// The decode plan's A2 (docs/UNIFIED-DECODE-IMPROVEMENTS.md), `prepass` on (TF_DS_PREPASS=1), shared rounds:
++    /// which streams join the next head pass, chosen before it. The pass costs its rows whether or not a draft is
++    /// verified after it, so the streams in it and their drafts are priced together: each stream's expected landed
++    /// drafts `gain` and rows `granted` from its last allocation, a round's ms as the shared table at the round's rows
++    /// plus the pass's measured `pass_ms[0] + pass_ms[1] x streams in it` (counted once). Streams join in order of gain
++    /// a row, the best prefix of that order by expected tokens a ms (each stream's pending row: one token, drafted or not).
++    /// Streams with no gain measured yet, and a stream that sat out `prepass_probe` passes in a row (its gain stale),
++    /// always join. Decided anew every round at the round's stream count. depths[i] = 0 for a stream that sits out:
++    /// its windows plain, its drafter history still absorbed by every verify. Replies are the same tokens either way
++    /// (drafts only decide how many rows a round verifies).
++    pub fn prepassSelect(r: *Rule, whos: []Who, depths: []i64) !void {
++        if (!r.prepass or whos.len == 0 or (r.pass_ms[0] == 0 and r.pass_ms[1] == 0)) return;
++        const n = whos.len;
++        const in = try r.gpa.alloc(bool, n);
++        defer r.gpa.free(in);
++        const order = try r.gpa.alloc(usize, n);
++        defer r.gpa.free(order);
++        var m: usize = 0; // candidates: drafting streams with a measured gain and not due to probe
++        var members: usize = 0;
++        // every stream of the round has its pending row and token, drafting or not
++        const all = @max(n, r.round_streams);
++        var rows: f64 = @floatFromInt(all);
++        var tokens: f64 = @floatFromInt(all);
++        for (whos, depths, in, 0..) |w, d, *x, i| {
++            x.* = false;
++            if (d == 0) continue;
++            const st = if (w.state.*) |*s| s else {
++                x.* = true;
++                members += 1;
++                continue;
++            };
++            if (w.gain == null or w.granted == null or st.skipped >= r.k.prepass_probe) {
++                x.* = true;
++                members += 1;
++                if (w.granted != null) {
++                    const c = cut(w, d);
++                    tokens += w.gain_at[c];
++                    rows += @floatFromInt(c);
++                }
++                continue;
++            }
++            order[m] = i;
++            m += 1;
++        }
++        // the candidates by gain a row (rows at least 1: a pass row's share), highest first, ties by stream order
++        const Ctx = struct {
++            w: []Who,
++            d: []i64,
++            fn density(c: @This(), i: usize) f64 {
++                const k = cut(c.w[i], c.d[i]);
++                return c.w[i].gain_at[k] / @as(f64, @floatFromInt(@max(k, 1)));
++            }
++            fn lt(c: @This(), a: usize, b: usize) bool {
++                const da = c.density(a);
++                const db = c.density(b);
++                return da > db or (da == db and a < b);
++            }
++        };
++        std.sort.insertion(usize, order[0..m], Ctx{ .w = whos, .d = depths }, Ctx.lt);
++        // every prefix of that order, the best kept (as allocate keeps its best prefix: the pass's fixed part can make
++        // one stream lose and several win)
++        var best = r.passRate(rows, tokens, members);
++        var take: usize = 0;
++        for (order[0..m], 1..) |i, j| {
++            const c = cut(whos[i], depths[i]);
++            rows += @floatFromInt(c);
++            tokens += whos[i].gain_at[c];
++            members += 1;
++            const now = r.passRate(rows, tokens, members);
++            if (now > best) {
++                best = now;
++                take = j;
++            }
++        }
++        for (order[0..take]) |i| in[i] = true;
++        for (whos, depths, in) |w, *d, x| {
++            if (d.* == 0) continue;
++            const st = if (w.state.*) |*s| s else continue;
++            if (x) {
++                st.skipped = 0;
++            } else {
++                st.skipped += 1;
++                d.* = 0;
++            }
++        }
++    }
++
++    /// The drafts a stream would verify next round as prepassSelect prices them: its last grant, but no more than the
++    /// depth asked of the pass now (room, a copy ahead) nor than gain_at holds.
++    fn cut(w: Who, d: i64) usize {
++        const g: usize = w.granted orelse 0;
++        const dd: usize = @intCast(@max(d, 0));
++        return @min(@min(g, dd), w.gain_at.len - 1);
++    }
++
++    /// prepassSelect's objective: expected tokens over the round's ms (the shared table at these rows, else the
++    /// nearest timed width, plus the pass for `members` streams when any join it).
++    fn passRate(r: *const Rule, rows: f64, tokens: f64, members: usize) f64 {
++        const total: i64 = @intFromFloat(@ceil(rows));
++        const last: i64 = @as(i64, @intCast(r.shared_costs.slots.len)) - 1;
++        const fwd = r.shared_costs.get(@min(total, last)) orelse return 0.0;
++        const pass = if (members == 0) 0.0 else r.pass_ms[0] + r.pass_ms[1] * @as(f64, @floatFromInt(members));
++        return tokens / (fwd + pass);
++    }
++
+     /// One draft after `wait` plain rounds in a row; each probe doubles the wait until drafting wins again.
+     fn probePlain(r: *Rule, st: *State) bool {
+         st.plain = (st.plain orelse 0) + 1;
+@@ -194,6 +306,7 @@ pub const Rule = struct {
+                 const granted: i64 = if (w.granted) |g| g else r.most_drafts;
+                 o.* = try r.headDepth(w, @min(inner, granted + r.k.draft_slack), probe);
+             }
++            try r.prepassSelect(whos, out);
+             return;
+         }
+         const most = try r.gpa.alloc(i64, whos.len);
+diff --git a/zig/src/core/lanes/engine.zig b/zig/src/core/lanes/engine.zig
+index 1199e77b..98d36747 100644
+--- a/zig/src/core/lanes/engine.zig
++++ b/zig/src/core/lanes/engine.zig
+@@ -55,6 +55,8 @@ pub const Engine = struct {
+                 .shared_costs = &cfg.shared_costs,
+                 .mtp_step_ms = cfg.mtp_step_ms,
+                 .plain_guard = cfg.plain_guard,
++                .prepass = cfg.prepass,
++                .pass_ms = cfg.pass_ms,
+                 .node_probabilities = cfg.node_probabilities,
+                 .batch_rows = cfg.batch_rows,
+             },
+@@ -312,6 +314,7 @@ pub const Engine = struct {
+         const whos = try a.alloc(depth.Who, heads.items.len);
+         for (whos, heads.items) |*w, i| w.* = win.who(plans[i].stream);
+         const budgets = try a.alloc(i64, heads.items.len);
++        e.rule.round_streams = plans.len;
+         try e.rule.budgets(whos, win.probe(e), budgets);
+         const ids = try a.alloc(ev.Value, heads.items.len);
+         for (ids, heads.items) |*id, i| id.* = str(plans[i].stream.id);
+diff --git a/zig/src/core/lanes/stream.zig b/zig/src/core/lanes/stream.zig
+index 1d6ba843..6a1a6687 100644
+--- a/zig/src/core/lanes/stream.zig
++++ b/zig/src/core/lanes/stream.zig
+@@ -189,6 +189,8 @@ pub const Stream = struct {
+     inflight: ?u64 = null,
+     served: ?u64 = null,
+     granted: ?u32 = null,
++    gain: ?f64 = null, // the expected landed drafts of its last grant (allocate; depth.Rule.prepassSelect)
++    gain_at: [9]f64 = @splat(0), // gain_at[j]: those of its first j granted drafts (j <= granted, 8 at most)
+     copy_width: ?u32 = null,
+ 
+     pub fn init(gpa: Allocator, spec: Spec) !Stream {
+@@ -230,6 +232,7 @@ pub const Stream = struct {
+         s.inflight = null;
+         s.served = null;
+         s.granted = null;
++        s.gain = null;
+         s.copy_width = null;
+     }
+ 
+diff --git a/zig/src/core/lanes/windows.zig b/zig/src/core/lanes/windows.zig
+index a76e4ed4..005b4f87 100644
+--- a/zig/src/core/lanes/windows.zig
++++ b/zig/src/core/lanes/windows.zig
+@@ -152,7 +152,7 @@ pub fn probe(e: *Engine) depth.Probe {
+ }
+ 
+ pub fn who(s: *Stream) depth.Who {
+-    return .{ .state = &s.depth, .draft_room = s.draftRoom(), .finished = s.finished, .forced = s.force.items.len > 0, .granted = s.granted, .stream = s };
++    return .{ .state = &s.depth, .draft_room = s.draftRoom(), .finished = s.finished, .forced = s.force.items.len > 0, .granted = s.granted, .gain = s.gain, .gain_at = s.gain_at, .stream = s };
+ }
+ 
+ /// Trim draft prefixes by landing probability to the shared width with the most expected tokens a ms.
+@@ -175,7 +175,16 @@ pub fn allocate(e: *Engine, plans: []Plan) !void {
+     }
+     const counts = try alloc.allocate(a, fixed, probs, &e.cfg.shared_costs, e.rule.overheadMs(plans.len), @max(plans.len, e.cfg.batch_rows));
+     for (plans, probs, counts) |*p, chances, c| {
+-        if (p.kind == .head) p.stream.granted = c;
++        if (p.kind == .head) {
++            p.stream.granted = c;
++            var g: f64 = 0.0;
++            p.stream.gain_at[0] = 0.0;
++            for (chances[0..@min(c, chances.len)], 1..) |x, j| {
++                g += x;
++                if (j < p.stream.gain_at.len) p.stream.gain_at[j] = g;
++            }
++            p.stream.gain = g;
++        }
+         if (chances.len == 0 or c == chances.len) continue;
+         if (c == 0) {
+             p.kind = .none;
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index 5cb778cc..14d5b5b1 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -361,9 +361,30 @@ pub const Lanes = struct {
+             .shared_costs = self.sc[0..self.m.eng.round_rows],
+             .draft_probabilities = drafting,
+             .draft_streams = drafting,
++            .prepass = drafting and prepassOn(),
++            .pass_ms = passMs(),
+         };
+     }
+ 
++    /// TF_DS_PREPASS=1: the decode plan's A2 pre-pass choice (core/lanes/depth.zig Rule.prepassSelect). Unset or any other value: off.
++    fn prepassOn() bool {
++        const v = std.c.getenv("TF_DS_PREPASS") orelse return false;
++        return std.mem.eql(u8, std.mem.span(v), "1");
++    }
++
++    /// TF_DS_PASS_MS="a,b": the batched pass's ms for N drafting streams, a + b N (prepass's price of the pass). Unset:
++    /// 2.6 + 1.1 N, the fit of the lane profiles of 2026-10-25 (4.0 ms at 1 stream, 6.0 at 3.2, 9.0 at 5.8).
++    fn passMs() [2]f64 {
++        var out: [2]f64 = .{ 2.6, 1.1 };
++        const v = std.c.getenv("TF_DS_PASS_MS") orelse return out;
++        var it = std.mem.splitScalar(u8, std.mem.span(v), ',');
++        for (&out) |*o| {
++            const t = it.next() orelse break;
++            o.* = std.fmt.parseFloat(f64, std.mem.trim(u8, t, " ")) catch o.*;
++        }
++        return out;
++    }
++
+     fn of(ptr: *anyopaque) *Lanes {
+         return @ptrCast(@alignCast(ptr));
+     }

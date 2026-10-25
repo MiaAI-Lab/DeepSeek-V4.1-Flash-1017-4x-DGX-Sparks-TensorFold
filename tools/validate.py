@@ -1,0 +1,151 @@
+"""Check a running server end to end: text, thinking, tool calls, an image, a video, a long prompt, and that greedy
+replies sent several at once equal the same replies sent one at a time.
+
+    python3 tools/validate.py [base url, default http://127.0.0.1:8888] [--model NAME] [--save FILE] [--compare FILE]
+
+--save writes every greedy reply to FILE; --compare checks them against a FILE saved earlier (a server started with
+DRAFTS=0, say: drafted replies must equal undrafted ones). Needs only the Python standard library, and PyAV for the
+video clip it makes (skipped without it).
+"""
+import base64
+import concurrent.futures as cf
+import io
+import json
+import struct
+import sys
+import time
+import urllib.request
+import zlib
+
+args = sys.argv[1:]
+URL = args[0].rstrip("/") if args and not args[0].startswith("--") else "http://127.0.0.1:8888"
+MODEL = args[args.index("--model") + 1] if "--model" in args else "DeepSeek-V4.1-Flash-1017"
+SAVE = args[args.index("--save") + 1] if "--save" in args else None
+COMPARE = args[args.index("--compare") + 1] if "--compare" in args else None
+failed = []
+
+
+def post(body, timeout=900):
+    req = urllib.request.Request(URL + "/v1/chat/completions", json.dumps(body).encode(), {"content-type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        return {"error": e.read().decode(errors="replace")}
+
+
+def chat(messages, max_tokens=200, thinking=False, **kw):
+    body = {"model": MODEL, "messages": messages, "max_tokens": max_tokens, "temperature": 0,
+            "chat_template_kwargs": {"enable_thinking": thinking}, **kw}
+    return post(body)
+
+
+def check(name, ok, detail=""):
+    print(f"{'PASS' if ok else 'FAIL'}  {name}{('  ' + detail) if detail else ''}", flush=True)
+    if not ok:
+        failed.append(name)
+
+
+def text(r):
+    return ((r.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+
+
+def png(w, h, pixel):
+    raw = b"".join(b"\0" + b"".join(bytes(pixel(x, y)) for x in range(w)) for y in range(h))
+    chunk = lambda t, d: struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xFFFFFFFF)
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b"")
+
+
+def clip():
+    try:
+        import av
+        import numpy as np
+    except ImportError:
+        return None
+    buf = io.BytesIO()
+    c = av.open(buf, "w", format="mp4")
+    s = c.add_stream("libx264", rate=10)
+    s.width, s.height, s.pix_fmt = 320, 240, "yuv420p"
+    for i in range(40):
+        a = np.zeros((240, 320, 3), np.uint8)
+        a[:] = (220, 30, 30) if i < 20 else (30, 30, 220)
+        a[100:140, 10 + i * 7:50 + i * 7] = 255
+        for p in s.encode(av.VideoFrame.from_ndarray(a, format="rgb24")):
+            c.mux(p)
+    for p in s.encode():
+        c.mux(p)
+    c.close()
+    return buf.getvalue()
+
+
+# ---------------------------------------------------------------- features
+t = time.time()
+r = chat([{"role": "user", "content": "What is the capital of France? One word."}], 20)
+check("text", "paris" in text(r).lower(), repr(text(r)[:60]) + f" {time.time() - t:.1f}s")
+
+r = chat([{"role": "user", "content": "What is 17 * 23? Answer with the number."}], 2000, thinking=True)
+m = (r.get("choices") or [{}])[0].get("message") or {}
+check("thinking", "391" in (m.get("content") or "") and len(m.get("reasoning_content") or "") > 0,
+      f"reasoning {len(m.get('reasoning_content') or '')} chars, answer {(m.get('content') or '')[:40]!r}")
+
+tools = [{"type": "function", "function": {"name": "get_weather", "description": "Current weather of a city",
+          "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}]
+r = chat([{"role": "user", "content": "What's the weather in Tokyo? Use the tool."}], 300, tools=tools)
+calls = ((r.get("choices") or [{}])[0].get("message") or {}).get("tool_calls") or []
+ok = bool(calls) and calls[0]["function"]["name"] == "get_weather" and "tokyo" in json.loads(calls[0]["function"]["arguments"]).get("city", "").lower()
+check("tool call", ok, json.dumps(calls)[:120] if calls else json.dumps(r)[:160])
+if ok:
+    msgs = [{"role": "user", "content": "What's the weather in Tokyo? Use the tool."},
+            {"role": "assistant", "content": "", "tool_calls": calls},
+            {"role": "tool", "tool_call_id": calls[0].get("id", "0"), "content": json.dumps({"temp_c": 21, "sky": "clear"})}]
+    r = chat(msgs, 200, tools=tools)
+    check("tool result", "21" in text(r), repr(text(r)[:80]))
+
+img = png(64, 64, lambda x, y: (240, 200, 0) if (x - 32) ** 2 + (y - 32) ** 2 < 400 else (255, 255, 255))
+r = chat([{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64," + base64.b64encode(img).decode()}},
+                                        {"type": "text", "text": "What shape and color is in this picture? Short answer."}]}], 60)
+check("image", "yellow" in text(r).lower() or "circle" in text(r).lower(), repr(text(r)[:80]))
+
+v = clip()
+if v is None:
+    print("SKIP  video (no PyAV here)")
+else:
+    r = chat([{"role": "user", "content": [{"type": "video_url", "video_url": {"url": "data:video/mp4;base64," + base64.b64encode(v).decode()}},
+                                            {"type": "text", "text": "What color is the background at first and what color later? Short answer."}]}], 80)
+    tx = text(r).lower()
+    check("video", "red" in tx and "blue" in tx, repr(text(r)[:100]))
+
+import os
+debug_file = os.environ.get("TF_DEBUG_PROMPT_FILE")
+if debug_file:
+    with open(debug_file) as _f:
+        long_content = _f.read()
+    t = time.time()
+    r = chat([{"role": "user", "content": long_content}], 32)
+    check("debug prompt (TF_DEBUG_PROMPT_FILE)", True, f"{(r.get('usage') or {}).get('prompt_tokens')} tokens, {text(r)[:80]!r}, {time.time() - t:.1f}s")
+else:
+    long = " ".join(f"Item {i}: fox {i} jumps over dog {i * 7}." for i in range(1500))
+    t = time.time()
+    r = chat([{"role": "user", "content": long + "\nWhat is item 1234's dog number? The number only."}], 20)
+    check("long prompt", "8638" in text(r), f"{(r.get('usage') or {}).get('prompt_tokens')} tokens, {text(r)[:20]!r}, {time.time() - t:.1f}s")
+
+# ---------------------------------------------------------------- one at a time == several at once
+prompts = ["Write a haiku about the sea.", "List the first ten prime numbers.", "Explain TCP in two sentences.",
+           "Write a Python function that reverses a string.", "Name five rivers in Europe.",
+           "What causes the seasons on Earth? Two sentences.", "Translate 'good morning' into French, Spanish and German.",
+           "Give three tips for writing clear documentation."]
+req = lambda p: chat([{"role": "user", "content": p}], 160)
+solo = [text(req(p)) for p in prompts]
+with cf.ThreadPoolExecutor(len(prompts)) as ex:
+    burst = [text(r) for r in ex.map(req, prompts)]
+same = sum(bool(a) and a == b for a, b in zip(solo, burst))
+check("concurrent == solo", same == len(prompts), f"{same} of {len(prompts)} equal")
+if SAVE:
+    json.dump(solo, open(SAVE, "w"))
+if COMPARE:
+    ref = json.load(open(COMPARE))
+    same = sum(a == b for a, b in zip(solo, ref))
+    check("equal to the saved replies", same == len(ref), f"{same} of {len(ref)} equal")
+
+print(f"\n{'all passed' if not failed else 'FAILED: ' + ', '.join(failed)}")
+sys.exit(1 if failed else 0)

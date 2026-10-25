@@ -1,0 +1,326 @@
+diff --git a/zig/src/families/dsv41/draft.zig b/zig/src/families/dsv41/draft.zig
+index 4031738d..bfcbe3aa 100644
+--- a/zig/src/families/dsv41/draft.zig
++++ b/zig/src/families/dsv41/draft.zig
+@@ -275,6 +275,7 @@ const MarkovGather = struct {
+ pub const PassGraphs = struct {
+     gpa: std.mem.Allocator,
+     map: std.AutoHashMapUnmanaged(Key, cuda.graph.Exec) = .empty,
++    captures: u64 = 0, // captures attempted (TF_DS_GRAPH_FAIL_TEST=RANK:N:pass counts them)
+ 
+     pub const Key = struct { streams: u32, steps: u32 };
+ 
+@@ -296,19 +297,62 @@ pub const PassGraphs = struct {
+     fn run(g: *PassGraphs, dr: *Drafter, e: *const Engine, ch: *const Chunk, pool: *const Pool, N: usize, steps: usize) !void {
+         const key: Key = .{ .streams = @intCast(N), .steps = @intCast(steps) };
+         if (g.map.getPtr(key)) |x| return x.launchOn(e.s);
+-        try cuda.graph.beginCapture(e.s, .thread_local);
+-        dr.body(e, ch, pool, N, steps, null) catch |err| {
+-            if (cuda.graph.endCapture(e.s)) |got| {
+-                var x = got;
+-                x.deinit();
+-            } else |_| {}
++        // G0.3, as round.Graphs.run: every rank captures and instantiates (the map's room reserved first), then all
++        // agree before any launch; one failure fails the pass on every rank
++        var failed: ?anyerror = null;
++        var exec_got: ?cuda.graph.Exec = null;
++        // the map's room first, agreed before anyone records: NCCL needs every rank to capture the same collectives
++        // (a rank that skipped the capture would leave the others' recorded exchanges unmatched)
++        const room = g.map.ensureUnusedCapacity(g.gpa, 1);
++        if (!try e.agreeAll(if (room) |_| true else |_| false)) {
++            try room;
++            return error.GraphCaptureFailed;
++        }
++        capture: {
++            cuda.graph.beginCapture(e.s, .thread_local) catch |err| {
++                failed = err;
++                break :capture;
++            };
++            dr.body(e, ch, pool, N, steps, null) catch |err| {
++                if (cuda.graph.endCapture(e.s)) |got| {
++                    var x = got;
++                    x.deinit();
++                } else |_| {}
++                failed = err;
++                break :capture;
++            };
++            var graph = cuda.graph.endCapture(e.s) catch |err| {
++                failed = err;
++                break :capture;
++            };
++            defer graph.deinit();
++            exec_got = graph.instantiate() catch |err| {
++                failed = err;
++                break :capture;
++            };
++        }
++        g.captures += 1;
++        if (failed == null and prompt.injectedCaptureFailure(.pass, e.comm.rank, g.captures)) {
++            if (exec_got) |*x| x.deinit();
++            exec_got = null;
++            failed = error.GraphInjectedFailure;
++        }
++        const all_ok = e.agreeAll(failed == null) catch |err| {
++            if (exec_got) |*x| x.deinit();
+             return err;
+         };
+-        var graph = try cuda.graph.endCapture(e.s);
+-        defer graph.deinit();
+-        var exec = try graph.instantiate();
++        if (!all_ok) {
++            if (exec_got) |*x| x.deinit();
++            if (failed) |err| {
++                std.log.err("drafter pass graph of {d} streams, {d} steps failed on rank {d}: {s}; the pass fails on every rank", .{ N, steps, e.comm.rank, @errorName(err) });
++                return err;
++            }
++            std.log.err("drafter pass graph of {d} streams, {d} steps failed on another rank; the pass fails on every rank", .{ N, steps });
++            return error.GraphCaptureFailed;
++        }
++        var exec = exec_got.?;
+         errdefer exec.deinit();
+-        try g.map.put(g.gpa, key, exec);
++        g.map.putAssumeCapacity(key, exec);
+         try exec.launchOn(e.s);
+     }
+ };
+diff --git a/zig/src/families/dsv41/engram_rows.zig b/zig/src/families/dsv41/engram_rows.zig
+index 69b20faf..63727ab2 100644
+--- a/zig/src/families/dsv41/engram_rows.zig
++++ b/zig/src/families/dsv41/engram_rows.zig
+@@ -270,6 +270,16 @@ pub const Rows = struct {
+         try r.kernels.decodeRows(s, r.round_dev, out, rows, sl, if (r.owned) r.lo else 0, r.k, r.dim);
+     }
+ 
++    /// A round's layer slot `j` that will not land (its round failed, G0.3): its submitted batch waited for and dropped
++    /// (nothing kept), so the slot's staging and batch id are free for the next round. Errors are ignored.
++    pub fn roundDrain(r: *Rows, j: usize) void {
++        const st = &r.round[j];
++        if (st.batch == 0) return;
++        const id = st.batch;
++        st.batch = 0;
++        if (r.aio) |x| x.wait(id) catch {};
++    }
++
+     /// After a round's synchronize: error.ReadFailed when a stream host step's read failed.
+     pub fn roundCheck(r: *Rows) !void {
+         var bad = false;
+diff --git a/zig/src/families/dsv41/layer_main.zig b/zig/src/families/dsv41/layer_main.zig
+index cdd11d71..80e8f85e 100644
+--- a/zig/src/families/dsv41/layer_main.zig
++++ b/zig/src/families/dsv41/layer_main.zig
+@@ -427,6 +427,7 @@ pub fn main(init: std.process.Init) !u8 {
+     }
+     var eng: prompt.Engine = .{ .d = &driver, .s = stream, .t = .{ .set = &set, .stream = stream }, .blas = undefined, .comm = &comm, .pf = &pf, .lin = &lg, .ex = &exk, .ops = &ops, .exact = &ex, .c = &cfg, .w = &w, .world = sp.world, .plain = rope, .compressed = rope_c, .two = if (two) |*t| t else null };
+     if (par) |*x| eng.par = x;
++    eng.agree_flag = try arena.take(64); // G0.3: the graph captures' agreement byte (round.Graphs)
+     // TP2 with --rdma: the decode gathers over the RDMA ring (the served lane's), their bytes checked as NCCL's were
+     var tp2_mod: ?cuda.Module = null;
+     defer if (tp2_mod) |*mm| mm.unload();
+diff --git a/zig/src/families/dsv41/model.zig b/zig/src/families/dsv41/model.zig
+index cf6cf009..6dd36825 100644
+--- a/zig/src/families/dsv41/model.zig
++++ b/zig/src/families/dsv41/model.zig
+@@ -382,6 +382,7 @@ pub const Model = struct {
+         }
+         m.rd = try round.Round.init(&m.eng, &m.arena, a, m.ctx_cap); // a round's deepest bucket: a stream's context
+         m.amax = try m.arena.take(round.max_rows * 4);
++        m.eng.agree_flag = try m.arena.take(64); // G0.3: the graph captures' agreement byte
+         if (o.graphs) m.graphs = round.Graphs.init(gpa);
+         if (o.side) try m.rd.useSide(&m.eng);
+         if (o.prefetch) try m.rd.usePrefetch(&m.eng);
+diff --git a/zig/src/families/dsv41/prompt.zig b/zig/src/families/dsv41/prompt.zig
+index f0841ddc..4bca390b 100644
+--- a/zig/src/families/dsv41/prompt.zig
++++ b/zig/src/families/dsv41/prompt.zig
+@@ -121,6 +121,17 @@ pub const Arena = struct {
+     }
+ };
+ 
++/// TF_DS_GRAPH_FAIL_TEST=RANK:N (round graphs) or RANK:N:pass (the drafter's pass graphs): a test of G0.3, never in
++/// service: rank RANK's Nth capture of that kind reports a failed instantiate (its graph dropped). Unset: never.
++pub fn injectedCaptureFailure(kind: enum { round, pass }, rank: u32, nth: u64) bool {
++    const v = std.mem.span(std.c.getenv("TF_DS_GRAPH_FAIL_TEST") orelse return false);
++    var it = std.mem.splitScalar(u8, v, ':');
++    const r = std.fmt.parseInt(u32, it.next() orelse return false, 10) catch return false;
++    const n = std.fmt.parseInt(u64, it.next() orelse return false, 10) catch return false;
++    const want: @TypeOf(kind) = if (it.next()) |x| (if (std.mem.eql(u8, x, "pass")) .pass else return false) else .round;
++    return r == rank and n == nth and want == kind;
++}
++
+ /// A RoPE kind's tables on the device: cos, sin fp32 [rows, rope_dim / 2] (ops.RopeTables' rows).
+ pub const Rope = struct { cos: u64, sin: u64 };
+ 
+@@ -146,6 +157,23 @@ pub const Engine = struct {
+     ring: ?*rdma.Ring = null, // TP2: the decode-size all-gathers over the RDMA ring (the served lane's), else NCCL
+     par: ?*const exl3_experts2d.ParKernels = null, // the parity split's gate / up in one launch (null: the served two)
+     mx: ?*const mx.Kernels = null, // Format.native: DeepSeek's own FP8 / MXFP4 checkpoint's kernels (mx.zig)
++    agree_flag: u64 = 0, // a device byte for agreeAll (Model.init, layer_main); 0 at world > 1: agreeAll refuses
++
++    /// G0.3 (docs/UNIFIED-DECODE-IMPROVEMENTS.md): whether `ok` holds on every rank, after a graph capture and
++    /// instantiate and before any launch of it: one byte a rank set on the stream, the ranks' largest by NCCL (1: a
++    /// failure), read after a synchronize. Called in the same order on every rank (a new graph key comes up at the same
++    /// round and stretch everywhere). World 1: this rank's own. A failure in the middle of recording on one rank only
++    /// is not covered: the others' recorded collectives stay unmatched (no out-of-band abort exists).
++    pub fn agreeAll(e: *const Engine, ok: bool) !bool {
++        if (e.comm.world <= 1) return ok;
++        if (e.agree_flag == 0) return error.NoAgreeFlag;
++        try e.d.check(e.d.api.cuMemsetD8Async(e.agree_flag, @intFromBool(!ok), 1, e.s.handle), "cuMemsetD8Async");
++        try e.comm.maxBytes(e.agree_flag, 1, e.s);
++        try e.s.synchronize();
++        var v: [1]u8 = undefined;
++        try e.d.check(e.d.api.cuMemcpyDtoH_v2(&v, e.agree_flag, 1), "cuMemcpyDtoH");
++        return v[0] == 0;
++    }
+ 
+     /// A decode-size all-gather of `count` fp32 a rank into `dst`, rank after rank: the RDMA ring when the engine has
+     /// one and the slice fits a slot (whole float4s), else NCCL. The same bytes either way.
+diff --git a/zig/src/families/dsv41/round.zig b/zig/src/families/dsv41/round.zig
+index f5b863b0..deff59a7 100644
+--- a/zig/src/families/dsv41/round.zig
++++ b/zig/src/families/dsv41/round.zig
+@@ -469,6 +469,18 @@ pub const Round = struct {
+         if (rd.timer) |t| try t.mark(e.s, p);
+     }
+ 
++    /// After a capture that did not complete (G0.3): the side and prefetch forks it recorded went with it, so nothing is
++    /// outstanding; a side stream still capturing (its capture sequence not ended with the main stream's) is logged.
++    fn abortCapture(rd: *Round, e: *const Engine) void {
++        rd.side_out = false;
++        rd.pf_out = false;
++        _ = e;
++        for ([_]?cuda.Stream{ rd.side, rd.pf, rd.par }) |os| if (os) |st| {
++            const status = cuda.graph.captureStatus(st) catch continue;
++            if (status != .none) std.log.err("a side stream is still in a stream capture after a failed capture ({s})", .{@tagName(status)});
++        };
++    }
++
+     /// The main stream waits for the side work forked so far.
+     fn joinSide(rd: *Round, e: *const Engine) !void {
+         if (!rd.side_out) return;
+@@ -975,6 +987,7 @@ const Carry = struct {
+ pub const Graphs = struct {
+     gpa: std.mem.Allocator,
+     map: std.AutoHashMapUnmanaged(Key, Entry) = .empty,
++    captures: u64 = 0, // captures attempted (TF_DS_GRAPH_FAIL_TEST counts them)
+ 
+     pub const Key = struct { rows: u32, bucket: u64, stretch: u32 };
+     const Entry = struct { exec: cuda.graph.Exec, start: Carry, end: Carry };
+@@ -1006,19 +1019,68 @@ pub const Graphs = struct {
+             return;
+         }
+         const start = cy.*;
+-        try cuda.graph.beginCapture(e.s, .thread_local);
+-        stretch(e, rd, ch, cs, rings, cy, li, end, null) catch |err| {
+-            if (cuda.graph.endCapture(e.s)) |got| {
+-                var x = got;
+-                x.deinit();
+-            } else |_| {}
++        // G0.3 (docs/UNIFIED-DECODE-IMPROVEMENTS.md): a capture or instantiate that fails on one rank only (Hector saw
++        // cuGraphInstantiateWithFlags fail with 800 after hours) left that rank out of the stretch's exchanges and the
++        // others waiting in them for good. Every rank now captures and instantiates (the map's room for the new key
++        // reserved first, so nothing can fail after the vote), then all agree on the outcome before any launches: one
++        // failure anywhere fails the stretch, and so the round, on every rank.
++        var failed: ?anyerror = null;
++        var exec_got: ?cuda.graph.Exec = null;
++        // the map's room first, agreed before anyone records: NCCL needs every rank to capture the same collectives
++        // (a rank that skipped the capture would leave the others' recorded exchanges unmatched)
++        const room = g.map.ensureUnusedCapacity(g.gpa, 1);
++        if (!try e.agreeAll(if (room) |_| true else |_| false)) {
++            try room;
++            return error.GraphCaptureFailed;
++        }
++        capture: {
++            cuda.graph.beginCapture(e.s, .thread_local) catch |err| {
++                failed = err;
++                break :capture;
++            };
++            stretch(e, rd, ch, cs, rings, cy, li, end, null) catch |err| {
++                if (cuda.graph.endCapture(e.s)) |got| {
++                    var x = got;
++                    x.deinit();
++                } else |_| {}
++                failed = err;
++                break :capture;
++            };
++            var graph = cuda.graph.endCapture(e.s) catch |err| {
++                failed = err;
++                break :capture;
++            };
++            defer graph.deinit();
++            exec_got = graph.instantiate() catch |err| {
++                failed = err;
++                break :capture;
++            };
++        }
++        g.captures += 1;
++        if (failed == null and prompt.injectedCaptureFailure(.round, e.comm.rank, g.captures)) {
++            if (exec_got) |*x| x.deinit();
++            exec_got = null;
++            failed = error.GraphInjectedFailure;
++        }
++        // a capture cut short leaves the side and prefetch streams' forks marked outstanding: their work was discarded
++        // with the capture, so the next stretch must not wait on events recorded in it
++        if (failed != null) rd.abortCapture(e);
++        const all_ok = e.agreeAll(failed == null) catch |err| {
++            if (exec_got) |*x| x.deinit();
+             return err;
+         };
+-        var graph = try cuda.graph.endCapture(e.s);
+-        defer graph.deinit();
+-        var exec = try graph.instantiate();
++        if (!all_ok) {
++            if (exec_got) |*x| x.deinit();
++            if (failed) |err| {
++                std.log.err("graph capture of rows {d} bucket {d} stretch {d} failed on rank {d}: {s}; the round fails on every rank", .{ key.rows, key.bucket, key.stretch, e.comm.rank, @errorName(err) });
++                return err;
++            }
++            std.log.err("graph capture of rows {d} bucket {d} stretch {d} failed on another rank; the round fails on every rank", .{ key.rows, key.bucket, key.stretch });
++            return error.GraphCaptureFailed;
++        }
++        var exec = exec_got.?;
+         errdefer exec.deinit();
+-        try g.map.put(g.gpa, key, .{ .exec = exec, .start = start, .end = cy.* });
++        g.map.putAssumeCapacity(key, .{ .exec = exec, .start = start, .end = cy.* });
+         try exec.launchOn(e.s);
+     }
+ };
+@@ -1048,6 +1110,10 @@ pub fn forward(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches
+     // (its GPU time covers the reads), landed on the host before each Engram layer's stretch
+     var ah: Ahead = .{};
+     var ahead = e.c.engram_layers.slice().len == 0;
++    // a round that fails between submitting its Engram reads and landing them (a failed stretch, G0.3) drains the
++    // reads still in flight, so the next round's reads cannot meet them in the staging buffers or the batch ids
++    var landed: [2]bool = .{ false, false };
++    errdefer if (eh) |x| drainAhead(e, x, &ah, landed); // (slots never submitted: ids 0, batch 0, nothing to wait)
+     // the stretches: cut before each Engram layer (TF_DS_ENGRAM_SPLIT on), its rows read on the host before it
+     var li: usize = 0;
+     var sn: u32 = 0;
+@@ -1060,6 +1126,7 @@ pub fn forward(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches
+             if (!ahead) try engramAhead(e, eh orelse return error.NoEngramTables, seq, rows, &ah);
+             ahead = true;
+             try engramLand(e, rd, eh orelse return error.NoEngramTables, &ah, li);
++            if (std.mem.indexOfScalar(u16, e.c.engram_layers.slice(), @intCast(li))) |j| landed[j] = true;
+         }
+         try rd.clock(e, Round.clock_wait);
+         if (graphs) |g| {
+@@ -1186,6 +1253,20 @@ fn mix(e: *const Engine, rd: *Round, h: u64, spare: *u64, pending: *?u64, params
+ /// go out at the round's start, else each layer's when its stretch comes (the reader pool).
+ const Ahead = struct { ids: [2]u64 = .{ 0, 0 }, aio: bool = false, R: usize = 0 };
+ 
++/// The round's Engram reads not yet landed (slots j with landed[j] false) waited for and dropped (G0.3: a round that
++/// failed after engramAhead). Errors are ignored: the round has failed already.
++fn drainAhead(e: *const Engine, eh: *prompt.EngramHost, ah: *const Ahead, landed: [2]bool) void {
++    const n = @min(e.c.engram_layers.slice().len, 2);
++    for (0..n) |j| {
++        if (landed[j]) continue;
++        if (eh.pk) |pr| {
++            pr.roundDrain(j);
++        } else if (ah.aio) {
++            if (eh.aio) |aio| aio.wait(ah.ids[j]) catch {};
++        }
++    }
++}
++
+ /// Layer slot j's first row in the Engram host's buffers (a round's rows of each Engram layer apart).
+ fn aheadRow(j: usize) usize {
+     return j * max_rows;

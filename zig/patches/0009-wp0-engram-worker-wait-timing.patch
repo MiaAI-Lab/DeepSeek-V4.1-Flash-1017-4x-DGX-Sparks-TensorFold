@@ -1,0 +1,44 @@
+diff --git a/zig/src/families/dsv41/prompt.zig b/zig/src/families/dsv41/prompt.zig
+index ef8e61a..9516e86 100644
+--- a/zig/src/families/dsv41/prompt.zig
++++ b/zig/src/families/dsv41/prompt.zig
+@@ -1294,6 +1294,9 @@ pub const EngramHost = struct {
+     wk_w: []u8 = &.{},
+     wk_s: []u8 = &.{},
+     wk_done: [2]std.atomic.Value(usize) = .{ .init(0), .init(0) },
++    // WP0 4.5 (TF_DS_LOG_TIMING): wall-clock ns when wk_done[j] last advanced, read back by engramWorkerRows to log
++    // the worker's own finish time next to the wait it measures there -- diagnostic only, no effect on any result.
++    wk_done_ns: [2]std.atomic.Value(i128) = .{ .init(0), .init(0) },
+     wk_used: [2]std.atomic.Value(usize) = .{ .init(0), .init(0) },
+     wk_stop: std.atomic.Value(bool) = .init(false),
+     wk_failed: std.atomic.Value(bool) = .init(false),
+@@ -1417,6 +1420,7 @@ pub fn engramWorker(eh: *EngramHost, c: *const Config, seq: []const i32, start:
+                 eh.wk_failed.store(true, .release);
+                 return;
+             };
++            eh.wk_done_ns[j].store(std.time.nanoTimestamp(), .release);
+             eh.wk_done[j].store(ci + 1, .release);
+         }
+         at += n;
+@@ -1462,10 +1466,21 @@ pub fn engramWorkerStop(eh: *EngramHost) void {
+ /// The worker's rows of Engram layer j for the chunk at `start` (waiting for them), for engramApply.
+ pub fn engramWorkerRows(eh: *EngramHost, j: usize, start: usize, chunk: usize) ![]u16 {
+     const ci = (start - eh.wk_start) / chunk;
++    // WP0 4.5 (TF_DS_LOG_TIMING=1): the wait this loop spends blocked on the worker, chunk 0 against chunk 1, is the
++    // "Engram worker wait" existing counters miss (it precedes engramApply). Diagnostic print only; no other effect.
++    const log_timing = std.c.getenv("TF_DS_LOG_TIMING") != null;
++    const t_entry: i128 = if (log_timing) std.time.nanoTimestamp() else 0;
+     while (eh.wk_done[j].load(.acquire) <= ci) {
+         if (eh.wk_failed.load(.acquire)) return eh.wk_err orelse error.EngramWorkerFailed;
+         std.Thread.yield() catch {};
+     }
++    if (log_timing) {
++        const t_now = std.time.nanoTimestamp();
++        const wait_us = @divTrunc(t_now - t_entry, 1000);
++        const done_ns = eh.wk_done_ns[j].load(.acquire);
++        const done_before_us = if (done_ns != 0) @divTrunc(t_entry - done_ns, 1000) else 0;
++        std.debug.print("[tf-timing] engram_worker_wait ci={d} j={d} wait_us={d} entry_was_after_worker_done_by_us={d}\n", .{ ci, j, wait_us, done_before_us });
++    }
+     return eh.wk_rows[ci % 2][j];
+ }
+ 

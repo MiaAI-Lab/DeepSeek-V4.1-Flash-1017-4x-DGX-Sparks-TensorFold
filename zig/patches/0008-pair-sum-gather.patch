@@ -1,0 +1,132 @@
+diff --git a/zig/src/families/dsv41/comm.zig b/zig/src/families/dsv41/comm.zig
+index 4d05605..ee73d8d 100644
+--- a/zig/src/families/dsv41/comm.zig
++++ b/zig/src/families/dsv41/comm.zig
+@@ -83,6 +83,11 @@ pub const Comm = struct {
+         try c.lib.check(c.lib.api.ncclAllGather(send, recv, count, dtype, link, stream.handle), "ncclAllGather (ring link)");
+     }
+ 
++    /// The two-rank link's sum of `count` fp32 elements, in place (NCCL leaves both ranks the same result).
++    pub fn linkSum(c: Comm, link: nccl.Comm, buf: u64, count: usize, stream: cuda.Stream) !void {
++        try c.lib.check(c.lib.api.ncclAllReduce(buf, buf, count, .f32, .sum, link, stream.handle), "ncclAllReduce (ring link, sum)");
++    }
++
+     /// `count` elements of `dtype` from every rank into `recv`, rank after rank.
+     pub fn allGather(c: Comm, send: u64, recv: u64, count: usize, dtype: nccl.DataType, stream: cuda.Stream) !void {
+         try c.lib.check(c.lib.api.ncclAllGather(send, recv, count, dtype, c.comm, stream.handle), "ncclAllGather");
+diff --git a/zig/src/families/dsv41/model.zig b/zig/src/families/dsv41/model.zig
+index 8be8e89..22fbbb6 100644
+--- a/zig/src/families/dsv41/model.zig
++++ b/zig/src/families/dsv41/model.zig
+@@ -335,6 +335,7 @@ pub const Model = struct {
+         if (sp.pair != null) {
+             m.two = try prompt2d.Two.init(c, &m.w, &m.arena, sp, chunk_rows);
+             m.two.?.nccl = prompt2d.ncclOf(ord);
++            try m.two.?.agreePairSum(d, &m.comm, m.stream);
+             if (o.rdma_devices) |devs| {
+                 const image: []const u8 = if (o.rdma_kernels) |path|
+                     try std.Io.Dir.cwd().readFileAllocOptions(io, path, a, .limited(1 << 26), .@"16", null)
+diff --git a/zig/src/families/dsv41/prompt.zig b/zig/src/families/dsv41/prompt.zig
+index b2a0a34..ef8e61a 100644
+--- a/zig/src/families/dsv41/prompt.zig
++++ b/zig/src/families/dsv41/prompt.zig
+@@ -1156,8 +1156,13 @@ pub fn scale(hd: usize) f32 {
+ }
+ 
+ /// Comm.gather: [world, n, D] fp32 of every rank's partial, in rank order.
++/// TF_DS_PAIR_SUM=1 (prompt2d Two.pairSum, agreed at startup): a chunk's gathers as pair sums over the ring's links.
++/// Every rank holds the same pair_sum and the same chunk rows, so all take the same path.
+ pub fn gather(e: *const Engine, ch: *const Chunk, src: u64, dst: u64) !void {
+-    if (e.two) |t| return t.quarters(e, src, dst, ch.n, t.ow, 4); // 2D: the same [2, n, D] from the four quarters
++    if (e.two) |t| {
++        if (t.pair_sum and ch.n >= 64) return t.pairSum(e, src, dst, ch.n, t.ow);
++        return t.quarters(e, src, dst, ch.n, t.ow, 4); // 2D: the same [2, n, D] from the four quarters
++    }
+     try e.comm.allGather(src, dst, ch.n * e.c.hidden, .f32, e.s);
+ }
+ 
+diff --git a/zig/src/families/dsv41/prompt2d.zig b/zig/src/families/dsv41/prompt2d.zig
+index eb97de5..5a98260 100644
+--- a/zig/src/families/dsv41/prompt2d.zig
++++ b/zig/src/families/dsv41/prompt2d.zig
+@@ -168,6 +168,8 @@ pub const Two = struct {
+     // identity on a switch; on a ring of four cabled in NCCL rank order, roles 0, 1, 3, 2 around it put every row and
+     // column partner on a cable of its own
+     nccl: [4]u32 = .{ 0, 1, 2, 3 },
++    // TF_DS_PAIR_SUM=1, agreed by every rank at startup (agreePairSum): a prompt chunk's gathers as pair sums
++    pair_sum: bool = false,
+ 
+     /// The widths from the split (both pairs'), and the buffers for chunks of up to `cap` rows (and rounds) from `a`.
+     pub fn init(c: *const Config, w: *const weights.Weights, a: *prompt.Arena, s: plan.Split, cap: usize) !Two {
+@@ -177,6 +179,7 @@ pub const Two = struct {
+         const x0 = s0.expertParts(c.*);
+         const x1 = s1.expertParts(c.*);
+         var t: Two = undefined;
++        t.pair_sum = false; // agreePairSum sets it on a model start; other callers keep the four-quarter gather
+         t.r = s.rank;
+         t.p = pp;
+         t.heads = s.headSpan(c.*)[1];
+@@ -320,6 +323,63 @@ pub const Two = struct {
+         }
+     }
+ 
++    /// TF_DS_PAIR_SUM, resolved once for the whole world: every rank sends its setting and whether both its partners
++    /// (the TP2 partner, node ^ 1, and the other pair's same TP2 rank, node ^ 2) are ring neighbours with a link. Ranks
++    /// that disagree on the setting refuse to start (a rank alone on the other path would leave the rest in collectives
++    /// it never joins); with the setting on everywhere, pair_sum is on only when every rank has both links, so all
++    /// ranks take the same path for every chunk. Before any prompt; the world all-gather is its barrier.
++    pub fn agreePairSum(t: *Two, d: *const cuda.Driver, comm: *const Comm, stream: cuda.Stream) !void {
++        const want = if (std.c.getenv("TF_DS_PAIR_SUM")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
++        const me: u32 = @intCast(t.r + 2 * t.p);
++        const links = comm.linkTo(t.nccl[me ^ 1]) != null and comm.linkTo(t.nccl[me ^ 2]) != null;
++        const w = comm.world;
++        var dev = try cuda.DeviceBuffer.alloc(d, (1 + w) * 4);
++        defer dev.free();
++        const mine: u32 = @as(u32, @intFromBool(want)) | (@as(u32, @intFromBool(links)) << 1);
++        try dev.upload(0, std.mem.asBytes(&mine));
++        try comm.allGather(dev.ptr, dev.ptr + 4, 1, .u32, stream);
++        try stream.synchronize();
++        var all: [8]u32 = undefined;
++        if (w > all.len) return error.WorldTooLarge;
++        try dev.download(4, std.mem.sliceAsBytes(all[0..w]));
++        var on: usize = 0;
++        var linked: usize = 0;
++        for (all[0..w]) |x| {
++            on += x & 1;
++            linked += (x >> 1) & 1;
++        }
++        if (on != 0 and on != w) {
++            std.log.err("TF_DS_PAIR_SUM: set on {d} of {d} ranks (this one: {s}); start every rank with the same value", .{ on, w, if (want) "1" else "unset" });
++            return error.PairSumMismatch;
++        }
++        t.pair_sum = on == w and linked == w;
++        if (on == w and !t.pair_sum) std.log.info("TF_DS_PAIR_SUM=1: {d} of {d} ranks have both partners as ring neighbours; every rank keeps the four-quarter gather", .{ linked, w });
++        if (t.pair_sum) std.log.info("TF_DS_PAIR_SUM=1: prompt gathers of 64+ rows as pair sums on all {d} ranks", .{w});
++    }
++
++    /// TF_DS_PAIR_SUM=1 (pair_sum, agreed at startup): a prompt chunk's quarters as the readers use them. Every
++    /// column's two TP2 partials are summed with NCCL over the link to this rank's TP2 partner (both ranks get the same
++    /// result), then the sums swapped with the other pair over that link; `dst` [2, n, w0 + w1] holds the sums in its
++    /// first plane and zeros in its second, and a reader adds G[0] + G[1]. Two link transfers of one part each instead
++    /// of the four-rank all-gather's three. Called only when pair_sum is set, so both links exist on every rank.
++    pub fn pairSum(t: *const Two, e: *const prompt.Engine, src: u64, dst: u64, n: usize, w: [2]usize) !void {
++        const me: u32 = @intCast(t.r + 2 * t.p);
++        const tp_link = e.comm.linkTo(t.nccl[me ^ 1]) orelse return error.PairSumNoLink;
++        const pair_link = e.comm.linkTo(t.nccl[me ^ 2]) orelse return error.PairSumNoLink;
++        const wmax = @max(w[0], w[1]);
++        if (n * wmax * 4 > t.part_bytes) return error.PartTooBig;
++        const mine = n * w[t.p];
++        try e.d.check(e.d.api.cuMemcpyDtoDAsync_v2(t.pad, src, mine * 4, e.s.handle), "cuMemcpyDtoDAsync");
++        try e.comm.linkSum(tp_link.comm, t.pad, mine, e.s);
++        try e.comm.linkGather(pair_link.comm, t.pad, t.parts, n * wmax, .f32, e.s);
++        const row_bytes = (w[0] + w[1]) * 4;
++        for (0..2) |pg| {
++            const slot: usize = if (pg == t.p) pair_link.me else 1 - pair_link.me;
++            try e.ops.copyRows(e.s, t.parts + slot * n * wmax * 4, w[pg] * 4, dst + pg * w[0] * 4, row_bytes, w[pg] * 4, n);
++        }
++        try prompt.fill(e, dst + n * row_bytes, 0, n * row_bytes);
++    }
++
+     /// cat_rank (Comm2D.cat_rank): `src` [n, w[p]] -> `dst` [n, w0 + w1]: this node's TP2 rank's whole width, pair 0's
+     /// part then pair 1's (from its column partner, the same rank of the other pair).
+     pub fn catRank(t: *const Two, e: *const prompt.Engine, src: u64, dst: u64, n: usize, w: [2]usize, esize: usize) !void {

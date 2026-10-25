@@ -1,0 +1,51 @@
+DeepSeek-V4.1-Flash-1017 on 4x DGX Spark with TensorFold
+Copyright 2026 MiaAI-Lab
+
+This project's own code, scripts and documentation are licensed under the Apache License, Version 2.0 (see
+LICENSE). If you redistribute this project or a modified version of it, keep this NOTICE file and state what you
+changed (Apache-2.0, section 4).
+
+This project builds on third-party work that keeps its own license:
+
+TensorFold
+  https://github.com/ashhart/TensorFold
+  Copyright 2026 TensorFold contributors. Apache License, Version 2.0. TensorFold's NOTICE reads: "TensorFold /
+  Copyright 2026 TensorFold contributors / https://github.com/ashhart/TensorFold".
+
+The DeepSeek-V4.1-Flash family on TensorFold's native engine (BertholomusAI's fork)
+  https://github.com/bertholomus/TensorFold (branch deepseek-v41-zig-tp4, commit
+  59402086381a42c74d53053443224eec2790b4c5)
+  Written by BertholomusAI (Albert Lee, @bertholomus), on TensorFold. Apache License, Version 2.0.
+  zig/Dockerfile builds that commit; the files in zig/patches modify its source. The changes in zig/patches are this
+  project's work under Apache-2.0; the code they modify, and quote as diff context, stays under its authors' license.
+
+The DeepSeek-V4.1 kernel kit (BertholomusAI's four-node recipe)
+  https://github.com/bertholomus/deepseek-v4.1-tensorfold-tp4-4xgb10 (kit/ at commit
+  6033ea48a27004b2715db82190e2a61f33411d92)
+  Written by BertholomusAI. Apache License, Version 2.0; the parts it carries keep the licenses its
+  kit/KIT-LICENSES.md lists (Triton: MIT; PyTorch's attention kernel: BSD-3-Clause, on NVIDIA CUTLASS: BSD-3-Clause;
+  the EXL3 format of ExLlamaV3 by turboderp: MIT). scripts/prepare.sh fetches it; it is not part of this repository.
+
+DeepSeek-V4.1-Flash-1017
+  https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017
+  Copyright (c) 2023 DeepSeek. MIT License. The weights are downloaded by scripts/prepare.sh, not distributed here.
+  The native FP8 / MXFP4 kernels in zig/patches follow the arithmetic of DeepSeek's reference inference code
+  (inference/model.py, kernel.py, convert.py), written anew; no DeepSeek code is included.
+
+Chat template (model/chat_template.jinja)
+  https://huggingface.co/Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-2.9bpw
+  Written by Mia's AI Lab (Mia-AiLab): a port of the checkpoint's encoding/encoding.py (DeepSeek, MIT) to Jinja.
+
+GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold
+  https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold
+  Copyright 2026 MiaAI-Lab and its contributors. Apache License, Version 2.0. scripts/config.sh, scripts/nodes.sh,
+  start.sh, stop.sh and scripts/banner.sh are adapted from it, including code by webzone, Alexbob0 and john (see
+  CREDITS.md).
+
+PyAV
+  https://github.com/PyAV-Org/PyAV
+  Copyright the PyAV contributors. BSD 3-Clause License. Installed into the image (pip, av==18.1.0) for video input;
+  its wheel bundles FFmpeg libraries, which report themselves as LGPL version 3 or later.
+
+NVIDIA PyTorch container (nvcr.io/nvidia/pytorch:26.07-py3)
+  The image's base, under NVIDIA's container license and its components' own licenses.
