@@ -14,6 +14,9 @@ DGX Sparks. Almost everything that makes it work was built by others. Its own wo
   (`inference/model.py`'s `linear`, `Expert` and `MoE`; `inference/kernel.py`'s `act_quant`, `fp8_gemm` and `fp4_gemm`;
   `inference/convert.py`'s bf16 `wo_a`): the arithmetic rules were read there and written anew in CUDA; no DeepSeek
   code is included.
+- **[Keys abliteration overlay for DeepSeek-V4.1-Flash-1017](https://huggingface.co/drowzeys/keys-DeepSeek-V4.1-Flash-1017-Abliterated)**
+  by drowzeys: the `attn.wo_b` (layers 10-35) weights `ABLIT=1` grafts onto the checkpoint, gated (MIT). Not part of
+  this repository; `scripts/prepare.sh` downloads the sidecar and builds the overlaid checkpoint view when set.
 
 ## Engine
 
