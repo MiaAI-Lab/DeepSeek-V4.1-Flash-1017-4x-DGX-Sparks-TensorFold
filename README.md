@@ -59,6 +59,7 @@ shaped each specific fix along the way.
 - [Performance](#performance)
 - [Requirements](#requirements)
 - [Quick start](#quick-start)
+- [ABLIT (opt-in)](#ablit-opt-in)
 - [Images and video](#images-and-video)
 - [DSpark drafting](#dspark-drafting)
 - [NFS](#nfs)
@@ -191,15 +192,34 @@ To use Blackfrost-AI’s DERISKED FP8 checkpoint, set `DERISKED=1` in `scripts/l
 `DERISKED=1 ./start-switchless.sh restart`. Set `DERISKED=0` to return to the original checkpoint.
 The first switch downloads and prepares separate weights; the API model id stays `DeepSeek-V4.1-Flash-1017`.
 
-`ABLIT=1` grafts [drowzeys’s Keys abliteration overlay](https://huggingface.co/drowzeys/keys-DeepSeek-V4.1-Flash-1017-Abliterated)
-(`attn.wo_b`, layers 10-35 — everything else, including all experts, Engram, MTP and vision, stays stock) onto the
-checkpoint before the rank caches are baked. The repository is gated: accept its terms while logged in on
-Hugging Face, then `export HF_TOKEN=hf_...` or `hf auth login` with that account before `ABLIT=1 ./start-switchless.sh
-restart`. The overlay is published and vendor-validated against SGLang/vLLM, not this engine; this recipe applies it
-by placing the sidecar beside the stock shards in a new checkpoint view, since our engine never reads
-`model.safetensors.index.json` -- it scans every `*.safetensors` file in a directory by its own header (`scripts/
-prepare.sh`). Live-validated on this cluster (`tools/validate.py`, `tools/needle_bench.py`): loads and serves
-coherently, including at long context. Set `ABLIT=0` to return to the stock checkpoint.
+## ABLIT (opt-in)
+
+`ABLIT=1` grafts [drowzeys's Keys abliteration overlay](https://huggingface.co/drowzeys/keys-DeepSeek-V4.1-Flash-1017-Abliterated)
+onto the checkpoint before the rank caches are baked: a refusal-direction ablation of `attn.wo_b`, layers 10-35 only
+(L0-9, L36-39, all MTP, vision, Engram, every expert, embed/head stay stock — see the overlay's own `ABLIT_META.json`
+for the recipe). It is gated and free: accept its terms while logged in on Hugging Face, then `export HF_TOKEN=hf_...`
+or `hf auth login` with that account, before:
+
+```bash
+ABLIT=1 ./start-switchless.sh restart
+```
+
+Set `ABLIT=0` to return to the stock checkpoint. The first switch downloads the overlay's sidecar (~1.1 GB) and
+rebuilds all four weight files from it (the usual "~80 GB, a few minutes" rank-cache build, once).
+
+**Why this needed its own mechanism, not the vendor's script.** The overlay is published and vendor-validated
+against SGLang/vLLM; its own TensorFold-validated recipe needs a different, EXL3-quantized checkpoint, not the
+native FP8/MXFP4 one this recipe serves. The vendor's apply script works by rewriting `model.safetensors.index.json`'s
+`weight_map` -- a convention our engine never reads: `checkpoint.zig`'s `Shards.open` scans every `*.safetensors`
+file in a directory by its own embedded header, keeping the last tensor name it sees in sorted-path order. So
+`scripts/prepare.sh` instead builds a new checkpoint view with every stock file linked plus the overlay's sidecar
+dropped in beside them -- `wo_b_l10_35_1017.safetensors` sorts after every `model-...-of-00048.safetensors` shard,
+so its 26 layers' `attn.wo_b` win the lookup, and that view is what `tf-dsv41-rank-cache` bakes into the rank caches.
+
+**Validated on this cluster**, not just the vendor's: a tensor-level check that the grafted `layers.N.attn.wo_b.weight`
+in the built checkpoint view byte-matches the overlay's sidecar (not stock's); `tools/validate.py` all passed; a
+`tools/needle_bench.py` spot check at 65k and 262k tokens, 25%/75% depth, all passed at the same speed as the stock
+checkpoint's numbers above -- the graft doesn't cost long-context retrieval.
 
 ## Images and video
 
@@ -270,7 +290,7 @@ Settings come from the environment, then `scripts/local.sh`, then `./.env`, then
 | Setting | Default | |
 | --- | --- | --- |
 | `DERISKED` | 0 | set to 1 to load [Blackfrost-AI’s DERISKED FP8 checkpoint](https://huggingface.co/Blackfrost-AI/DeepSeek-V4.1-Flash-1017-DERISKED-FP8); explicit `MODEL_ID` / `MODEL_REVISION` override it |
-| `ABLIT` | 0 | set to 1 to graft [drowzeys’s Keys abliteration overlay](https://huggingface.co/drowzeys/keys-DeepSeek-V4.1-Flash-1017-Abliterated) (`attn.wo_b`, layers 10-35) onto the checkpoint before baking the rank caches; gated, needs `HF_TOKEN` |
+| `ABLIT` | 0 | set to 1 for the Keys abliteration overlay ([above](#ablit-opt-in)); gated, needs `HF_TOKEN` |
 | `CONTEXT` | 1048576 | a request's positions at most (the model's window) |
 | `POOL` | 2097152 | the positions all requests share |
 | `PARALLEL` | 16 | requests at once |
