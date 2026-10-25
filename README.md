@@ -1,4 +1,4 @@
-<h1 align="center">:DeepSeek-V4.1-Flash-1017 / 4x DGX Sparks / TensorFold</h1>
+<h1 align="center">DeepSeek-V4.1-Flash-1017 / 4x DGX Sparks / TensorFold</h1>
 
 <p align="center">
   <sub>by <a href="https://x.com/MiaAI_lab">Mia's AI Lab</a></sub>
