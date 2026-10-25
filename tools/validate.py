@@ -52,11 +52,13 @@ def text(r):
 
 def reply_text(r):
     """The reply's text when r is a completion with non-empty text content, else None (an HTTP error, an error
-    object, no choices, empty or non-text content)."""
+    object, no choices, a non-assistant message, empty or non-text content)."""
     if not isinstance(r, dict) or "error" in r or not isinstance(r.get("choices"), list) or not r["choices"]:
         return None
     m = r["choices"][0].get("message") if isinstance(r["choices"][0], dict) else None
-    c = m.get("content") if isinstance(m, dict) else None
+    if not isinstance(m, dict) or m.get("role", "assistant") != "assistant":
+        return None
+    c = m.get("content")
     return c if isinstance(c, str) and c else None
 
 
@@ -132,9 +134,11 @@ if debug_file:
         long_content = _f.read()
     t = time.time()
     r = chat([{"role": "user", "content": long_content}], 32)
-    check("debug prompt (TF_DEBUG_PROMPT_FILE)", reply_text(r) is not None,
-          f"{(r.get('usage') or {}).get('prompt_tokens')} tokens, {text(r)[:80]!r}, {time.time() - t:.1f}s"
-          + ("" if reply_text(r) is not None else f", no reply text: {json.dumps(r)[:160]}"))
+    reply = reply_text(r)
+    usage = r.get("usage") if isinstance(r, dict) else None
+    check("debug prompt (TF_DEBUG_PROMPT_FILE)", reply is not None,
+          f"{usage.get('prompt_tokens') if isinstance(usage, dict) else None} tokens, {(reply or '')[:80]!r}, {time.time() - t:.1f}s"
+          + ("" if reply is not None else f", no reply text: {json.dumps(r)[:160]}"))
 else:
     long = " ".join(f"Item {i}: fox {i} jumps over dog {i * 7}." for i in range(1500))
     t = time.time()
@@ -147,9 +151,9 @@ prompts = ["Write a haiku about the sea.", "List the first ten prime numbers.", 
            "What causes the seasons on Earth? Two sentences.", "Translate 'good morning' into French, Spanish and German.",
            "Give three tips for writing clear documentation."]
 req = lambda p: chat([{"role": "user", "content": p}], 160)
-solo = [text(req(p)) for p in prompts]
+solo = [reply_text(req(p)) or "" for p in prompts]
 with cf.ThreadPoolExecutor(len(prompts)) as ex:
-    burst = [text(r) for r in ex.map(req, prompts)]
+    burst = [reply_text(r) or "" for r in ex.map(req, prompts)]
 same = sum(bool(a) and a == b for a, b in zip(solo, burst))
 check("concurrent == solo", same == len(prompts), f"{same} of {len(prompts)} equal")
 if SAVE:

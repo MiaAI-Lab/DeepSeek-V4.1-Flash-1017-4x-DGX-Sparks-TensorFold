@@ -70,11 +70,27 @@ def run_tool(name, args, env=None):
     return p.returncode, p.stdout + p.stderr
 
 
+def check_line(out, name):
+    return next((l for l in out.splitlines() if name in l and l[:4] in ("PASS", "FAIL")), "")
+
+
+class ToolTest(unittest.TestCase):
+    def assertPassed(self, code, out, name):
+        self.assertTrue(check_line(out, name).startswith("PASS"), out)
+        self.assertEqual(code, 0, out)
+
+    def assertFailedCleanly(self, code, out, name):
+        """A deliberate FAIL of check <name>: its FAIL line, exit code 1, and no traceback (not a crash)."""
+        self.assertTrue(check_line(out, name).startswith("FAIL"), out)
+        self.assertEqual(code, 1, out)
+        self.assertNotIn("Traceback", out)
+
+
 # ---------------------------------------------------------------- validate.py
 
 def validate_server(overrides=None, debug=None):
-    """A server that answers every validate.py check correctly; overrides maps a test prompt to its reply text,
-    debug is the (status, body) answer to the TF_DEBUG_PROMPT_FILE prompt."""
+    """A server that answers every validate.py check correctly; overrides maps a test prompt to its reply text or a
+    whole (status, body) answer, debug is the (status, body) answer to the TF_DEBUG_PROMPT_FILE prompt."""
     overrides = overrides or {}
 
     def respond(body):
@@ -99,42 +115,43 @@ def validate_server(overrides=None, debug=None):
         if "item 1234" in c:
             return completion("8638")
         if c in PROMPTS:
-            return completion(overrides.get(c, reply_to(c)))
+            o = overrides.get(c, reply_to(c))
+            return o if isinstance(o, tuple) else completion(o)
         return 400, {"error": {"message": "unexpected prompt"}}
 
     return respond
 
 
-class ValidateCompare(unittest.TestCase):
+class ValidateCompare(ToolTest):
+    NAME = "equal to the saved replies"
+
     def run_compare(self, ref, overrides=None, raw=None):
         m = Mock(validate_server(overrides))
         try:
             with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
                 f.write(raw if raw is not None else json.dumps(ref))
-            code, out = run_tool("validate.py", [m.url, "--compare", f.name])
+            return run_tool("validate.py", [m.url, "--compare", f.name])
         finally:
             m.close()
             os.unlink(f.name)
-        line = next((l for l in out.splitlines() if "equal to the saved replies" in l), "")
-        return code, out, line
 
-    def assertCompare(self, ok, ref=None, overrides=None, raw=None):
-        code, out, line = self.run_compare(ref, overrides, raw)
+    def assertCompare(self, ok, ref=None, overrides=None, raw=None, why=None):
+        code, out = self.run_compare(ref, overrides, raw)
         if ok:
-            self.assertTrue(line.startswith("PASS"), out)
-            self.assertEqual(code, 0, out)
+            self.assertPassed(code, out, self.NAME)
         else:
-            self.assertFalse(line.startswith("PASS"), out)
-            self.assertNotEqual(code, 0, out)
+            self.assertFailedCleanly(code, out, self.NAME)
+        if why:
+            self.assertIn(why, check_line(out, self.NAME))
 
     def test_full_correct_reference_passes(self):
         self.assertCompare(True, [reply_to(p) for p in PROMPTS])
 
     def test_empty_reference_fails(self):
-        self.assertCompare(False, [])
+        self.assertCompare(False, [], why="holds 0 replies, not 8")
 
     def test_short_reference_fails(self):
-        self.assertCompare(False, [reply_to(PROMPTS[0])])
+        self.assertCompare(False, [reply_to(PROMPTS[0])], why="holds 1 replies, not 8")
 
     def test_long_reference_fails(self):
         self.assertCompare(False, [reply_to(p) for p in PROMPTS] + ["one more"])
@@ -142,8 +159,11 @@ class ValidateCompare(unittest.TestCase):
     def test_reference_not_a_list_fails(self):
         self.assertCompare(False, {reply_to(p): 1 for p in PROMPTS})
 
+    def test_reference_null_fails(self):
+        self.assertCompare(False, raw="null")
+
     def test_reference_with_non_string_fails(self):
-        self.assertCompare(False, [reply_to(p) for p in PROMPTS[:-1]] + [None])
+        self.assertCompare(False, [reply_to(p) for p in PROMPTS[:-1]] + [None], why="empty or non-text reply")
 
     def test_reference_not_json_fails(self):
         self.assertCompare(False, raw="not json")
@@ -151,41 +171,84 @@ class ValidateCompare(unittest.TestCase):
     def test_wrong_reply_fails(self):
         self.assertCompare(False, [reply_to(p) for p in PROMPTS[:-1]] + ["something else"])
 
+    def test_whitespace_difference_fails(self):
+        self.assertCompare(False, [reply_to(p) for p in PROMPTS[:-1]] + [reply_to(PROMPTS[-1]) + " "])
+
+    def test_line_ending_difference_fails(self):
+        ref = [reply_to(p) for p in PROMPTS]
+        ref[0] += "\n"
+        self.assertCompare(False, ref, overrides={PROMPTS[0]: reply_to(PROMPTS[0]) + "\r\n"})
+
+    def test_case_difference_fails(self):
+        self.assertCompare(False, [reply_to(p) for p in PROMPTS[:-1]] + [reply_to(PROMPTS[-1]).upper()])
+
     def test_empty_reference_reply_fails(self):
-        self.assertCompare(False, [reply_to(p) for p in PROMPTS[:-1]] + [""])
+        self.assertCompare(False, [reply_to(p) for p in PROMPTS[:-1]] + [""], why="empty or non-text reply")
 
     def test_empty_replies_on_both_sides_fail(self):
         # the server's reply and the saved one are both empty: equal, but not a reply
         self.assertCompare(False, [reply_to(p) for p in PROMPTS[:-1]] + [""], overrides={PROMPTS[-1]: ""})
 
+    def test_error_marked_replies_fail(self):
+        # every reply carries correct-looking choices and an error: an error is never a reply
+        bad = {p: (200, {**completion(reply_to(p))[1], "error": {"message": "engine failed"}}) for p in PROMPTS}
+        self.assertCompare(False, [reply_to(p) for p in PROMPTS], overrides=bad)
 
-class ValidateDebugPrompt(unittest.TestCase):
+
+class ValidateConcurrent(ToolTest):
+    NAME = "concurrent == solo"
+
+    def run_validate(self, overrides):
+        m = Mock(validate_server(overrides))
+        try:
+            return run_tool("validate.py", [m.url])
+        finally:
+            m.close()
+
+    def test_all_replies_pass(self):
+        self.assertPassed(*self.run_validate({}), self.NAME)
+
+    def test_empty_reply_fails_without_compare(self):
+        self.assertFailedCleanly(*self.run_validate({PROMPTS[3]: ""}), self.NAME)
+
+    def test_error_marked_reply_fails_without_compare(self):
+        bad = {PROMPTS[3]: (200, {**completion(reply_to(PROMPTS[3]))[1], "error": {"message": "engine failed"}})}
+        self.assertFailedCleanly(*self.run_validate(bad), self.NAME)
+
+
+class ValidateDebugPrompt(ToolTest):
+    NAME = "debug prompt"
+
     def run_debug(self, debug):
         m = Mock(validate_server(debug=debug))
         try:
             with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
                 f.write(f"{DEBUG_MARK} a long debug prompt")
-            code, out = run_tool("validate.py", [m.url], {"TF_DEBUG_PROMPT_FILE": f.name})
+            return run_tool("validate.py", [m.url], {"TF_DEBUG_PROMPT_FILE": f.name})
         finally:
             m.close()
             os.unlink(f.name)
-        line = next((l for l in out.splitlines() if "debug prompt" in l), "")
-        return code, out, line
 
     def test_valid_reply_passes(self):
-        code, out, line = self.run_debug(completion("Debug reply."))
-        self.assertTrue(line.startswith("PASS"), out)
-        self.assertEqual(code, 0, out)
+        self.assertPassed(*self.run_debug(completion("Debug reply.")), self.NAME)
 
     def test_http_error_fails(self):
-        code, out, line = self.run_debug((500, {"error": {"message": "internal error"}}))
-        self.assertFalse(line.startswith("PASS"), out)
-        self.assertNotEqual(code, 0, out)
+        self.assertFailedCleanly(*self.run_debug((500, {"error": {"message": "internal error"}})), self.NAME)
 
     def test_empty_content_fails(self):
-        code, out, line = self.run_debug(completion(""))
-        self.assertFalse(line.startswith("PASS"), out)
-        self.assertNotEqual(code, 0, out)
+        self.assertFailedCleanly(*self.run_debug(completion("")), self.NAME)
+
+    def test_non_text_content_fails(self):
+        self.assertFailedCleanly(*self.run_debug(completion(42)), self.NAME)
+
+    def test_null_choice_fails(self):
+        self.assertFailedCleanly(*self.run_debug((200, {"choices": [None]})), self.NAME)
+
+    def test_non_object_body_fails(self):
+        self.assertFailedCleanly(*self.run_debug((200, [])), self.NAME)
+
+    def test_wrong_role_fails(self):
+        self.assertFailedCleanly(*self.run_debug(completion("Debug reply.", role="user")), self.NAME)
 
 
 # ---------------------------------------------------------------- needle_bench.py
@@ -216,25 +279,37 @@ def needle_server(mode, calib=(200, None)):
             return 200, {"choices": [], "usage": usage, "detail": code}
         if mode == "null_content":
             return 200, {"choices": [{"message": {"role": "assistant", "content": None}}], "usage": usage, "detail": code}
+        if mode == "error_with_choices":
+            return 200, {"choices": [{"message": {"role": "assistant", "content": code}}], "usage": usage,
+                         "error": {"message": "engine failed"}}
+        if mode in ("number_content", "list_content", "object_content"):
+            content = {"number_content": int(code), "list_content": [code], "object_content": {"text": code}}[mode]
+            return 200, {"choices": [{"message": {"role": "assistant", "content": content}}], "usage": usage}
+        if mode == "wrong_role":
+            return 200, {"choices": [{"message": {"role": "user", "content": code}}], "usage": usage}
+        if mode == "list_body":
+            return 200, [code]
         raise ValueError(mode)
 
     return respond
 
 
 class Needle(unittest.TestCase):
-    def run_needle(self, mode, **kw):
+    def run_needle(self, mode, extra=(), **kw):
         m = Mock(needle_server(mode, **kw))
         try:
-            code, out = run_tool("needle_bench.py", ["--url", m.url, "--lens", "64,128", "--depths", "0,50,100"])
+            code, out = run_tool("needle_bench.py", ["--url", m.url, "--lens", "64,128", "--depths", "0,50,100", *extra])
         finally:
             m.close()
         return code, out
 
     def assertAllFail(self, mode):
+        """Every cell fails, reported as such: exit code 1, 0/6, no cell ok, no traceback."""
         code, out = self.run_needle(mode)
-        self.assertNotEqual(code, 0, out)
+        self.assertEqual(code, 1, out)
         self.assertIn("0/6 passed", out)
         self.assertNotIn("ok=True", out)
+        self.assertNotIn("Traceback", out)
 
     def test_correct_code_passes(self):
         code, out = self.run_needle("correct")
@@ -250,6 +325,9 @@ class Needle(unittest.TestCase):
     def test_error_object_fails(self):
         self.assertAllFail("error_object")
 
+    def test_error_with_choices_fails(self):
+        self.assertAllFail("error_with_choices")
+
     def test_missing_choices_fails(self):
         self.assertAllFail("no_choices")
 
@@ -258,6 +336,37 @@ class Needle(unittest.TestCase):
 
     def test_null_content_fails(self):
         self.assertAllFail("null_content")
+
+    def test_number_content_fails(self):
+        self.assertAllFail("number_content")
+
+    def test_list_content_fails(self):
+        self.assertAllFail("list_content")
+
+    def test_object_content_fails(self):
+        self.assertAllFail("object_content")
+
+    def test_wrong_role_fails(self):
+        self.assertAllFail("wrong_role")
+
+    def test_non_object_body_fails(self):
+        self.assertAllFail("list_body")
+
+    def test_error_diagnostics_kept(self):
+        # a failed cell says why, on the console and in the --json row, with the server's own error
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "out.jsonl")
+            code, out = self.run_needle("http400_echo", extra=("--json", path))
+            with open(path) as f:
+                rows = [json.loads(l) for l in f]
+        self.assertEqual(code, 1, out)
+        self.assertEqual(len(rows), 6)
+        for row in rows:
+            self.assertFalse(row["ok"])
+            self.assertEqual(row["reply"], "")
+            self.assertTrue(row["error"].startswith("error: "), row)
+            self.assertIn("invalid request", row["error"])
+        self.assertEqual(out.count("error: "), 6, out)
 
     def test_failed_calibration_stops(self):
         code, out = self.run_needle("correct", calib=(400, {"error": {"message": "bad"}}))

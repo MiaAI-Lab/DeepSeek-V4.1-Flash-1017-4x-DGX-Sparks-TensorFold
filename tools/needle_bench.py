@@ -52,12 +52,15 @@ def chat(prompt, max_tokens=20):
 
 def text(r):
     """The reply's text when r is a completion with non-empty text content, else None: an HTTP error, an error object,
-    no choices or empty content is never read as the model's reply."""
+    no choices, a non-assistant message or empty content is never read as the model's reply."""
     try:
-        c = r["choices"][0]["message"]["content"]
+        m = r["choices"][0]["message"]
+        c = m["content"]
     except (KeyError, IndexError, TypeError):
         return None
-    return c if isinstance(c, str) and c and "error" not in r else None
+    if "error" in r or m.get("role", "assistant") != "assistant":
+        return None
+    return c if isinstance(c, str) and c else None
 
 
 def problem(r):
@@ -66,7 +69,8 @@ def problem(r):
 
 
 def prompt_tokens(r):
-    return (r.get("usage") or {}).get("prompt_tokens")
+    usage = r.get("usage") if isinstance(r, dict) else None
+    return usage.get("prompt_tokens") if isinstance(usage, dict) else None
 
 
 calib_repeats = 200
