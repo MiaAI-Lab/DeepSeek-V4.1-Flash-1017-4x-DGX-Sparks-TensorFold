@@ -50,6 +50,16 @@ def text(r):
     return ((r.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
 
 
+def reply_text(r):
+    """The reply's text when r is a completion with non-empty text content, else None (an HTTP error, an error
+    object, no choices, empty or non-text content)."""
+    if not isinstance(r, dict) or "error" in r or not isinstance(r.get("choices"), list) or not r["choices"]:
+        return None
+    m = r["choices"][0].get("message") if isinstance(r["choices"][0], dict) else None
+    c = m.get("content") if isinstance(m, dict) else None
+    return c if isinstance(c, str) and c else None
+
+
 def png(w, h, pixel):
     raw = b"".join(b"\0" + b"".join(bytes(pixel(x, y)) for x in range(w)) for y in range(h))
     chunk = lambda t, d: struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xFFFFFFFF)
@@ -122,7 +132,9 @@ if debug_file:
         long_content = _f.read()
     t = time.time()
     r = chat([{"role": "user", "content": long_content}], 32)
-    check("debug prompt (TF_DEBUG_PROMPT_FILE)", True, f"{(r.get('usage') or {}).get('prompt_tokens')} tokens, {text(r)[:80]!r}, {time.time() - t:.1f}s")
+    check("debug prompt (TF_DEBUG_PROMPT_FILE)", reply_text(r) is not None,
+          f"{(r.get('usage') or {}).get('prompt_tokens')} tokens, {text(r)[:80]!r}, {time.time() - t:.1f}s"
+          + ("" if reply_text(r) is not None else f", no reply text: {json.dumps(r)[:160]}"))
 else:
     long = " ".join(f"Item {i}: fox {i} jumps over dog {i * 7}." for i in range(1500))
     t = time.time()
@@ -143,9 +155,24 @@ check("concurrent == solo", same == len(prompts), f"{same} of {len(prompts)} equ
 if SAVE:
     json.dump(solo, open(SAVE, "w"))
 if COMPARE:
-    ref = json.load(open(COMPARE))
-    same = sum(a == b for a, b in zip(solo, ref))
-    check("equal to the saved replies", same == len(ref), f"{same} of {len(ref)} equal")
+    # every reply and its saved reference: as many as the prompts, non-empty text, equal exactly
+    try:
+        ref = json.load(open(COMPARE))
+        why = ""
+    except (OSError, ValueError) as e:
+        ref, why = [], f"cannot read {COMPARE}: {e}"
+    if why:
+        pass
+    elif not isinstance(ref, list):
+        why = f"{COMPARE} holds a {type(ref).__name__}, not a list of replies"
+    elif len(ref) != len(prompts):
+        why = f"{COMPARE} holds {len(ref)} replies, not {len(prompts)}"
+    elif not all(isinstance(x, str) and x for x in ref):
+        why = f"{COMPARE} has an empty or non-text reply"
+    elif not all(solo):
+        why = "an empty reply here"
+    same = 0 if why else sum(a == b for a, b in zip(solo, ref))
+    check("equal to the saved replies", not why and same == len(prompts), why or f"{same} of {len(prompts)} equal")
 
 print(f"\n{'all passed' if not failed else 'FAILED: ' + ', '.join(failed)}")
 sys.exit(1 if failed else 0)

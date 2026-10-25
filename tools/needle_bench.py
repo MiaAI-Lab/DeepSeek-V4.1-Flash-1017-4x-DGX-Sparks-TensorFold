@@ -51,10 +51,18 @@ def chat(prompt, max_tokens=20):
 
 
 def text(r):
+    """The reply's text when r is a completion with non-empty text content, else None: an HTTP error, an error object,
+    no choices or empty content is never read as the model's reply."""
     try:
-        return r["choices"][0]["message"]["content"] or ""
-    except Exception:
-        return json.dumps(r)[:200]
+        c = r["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        return None
+    return c if isinstance(c, str) and c and "error" not in r else None
+
+
+def problem(r):
+    """What went wrong with a reply text() refused, for the log."""
+    return "error: " + json.dumps(r)[:200] if isinstance(r, dict) and "error" in r else "no reply text: " + json.dumps(r)[:200]
 
 
 def prompt_tokens(r):
@@ -85,10 +93,13 @@ for length in LENS:
             dt = time.time() - t0
             tok = prompt_tokens(r)
             reply = text(r)
-            ok = code in reply
-            row = {"length": length, "depth": depth, "rep": rep, "prompt_tokens": tok, "ok": ok, "reply": reply[:40], "seconds": round(dt, 1)}
+            ok = reply is not None and code in reply
+            row = {"length": length, "depth": depth, "rep": rep, "prompt_tokens": tok, "ok": ok, "reply": (reply or "")[:40], "seconds": round(dt, 1)}
+            if reply is None:
+                row["error"] = problem(r)
             results.append(row)
-            print(f"len={length:>8} depth={depth:>3}% tok={tok} ok={ok} {dt:>6.1f}s reply={reply[:30]!r}", flush=True)
+            shown = f"reply={reply[:30]!r}" if reply is not None else row["error"]
+            print(f"len={length:>8} depth={depth:>3}% tok={tok} ok={ok} {dt:>6.1f}s {shown}", flush=True)
             if JSON_OUT:
                 with open(JSON_OUT, "a") as f:
                     f.write(json.dumps(row) + "\n")
