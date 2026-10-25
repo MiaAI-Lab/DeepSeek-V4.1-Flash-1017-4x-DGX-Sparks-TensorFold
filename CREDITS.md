@@ -196,7 +196,6 @@ Back to the prefill plan, written by Mia's AI Lab:
 - [PyAV](https://github.com/PyAV-Org/PyAV) 18.1.0 by the PyAV contributors (BSD-3-Clause; its wheel's FFmpeg
   libraries are LGPL-3.0-or-later), installed into the image for video input.
 - [huggingface_hub](https://github.com/huggingface/huggingface_hub) (Apache-2.0), the `hf` download.
-- [sparkDash](https://github.com/MiaAI-Lab/sparkDash) by Mia's AI Lab, the benchmark client of the performance numbers.
 
 "DeepSeek" belongs to DeepSeek; "DGX Spark" and "GB10" belong to NVIDIA. This recipe is not affiliated with or endorsed
 by DeepSeek, NVIDIA, the TensorFold authors or BertholomusAI.

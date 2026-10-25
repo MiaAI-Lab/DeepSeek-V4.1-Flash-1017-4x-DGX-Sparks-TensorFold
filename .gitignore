@@ -1,3 +1,4 @@
 scripts/local.sh
 .env
 work/
+__pycache__/

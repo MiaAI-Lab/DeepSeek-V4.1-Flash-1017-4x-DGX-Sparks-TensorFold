@@ -9,7 +9,7 @@
 - **2026-10-25** -- WP6(b), `TF_DS_IDX_SHARD` (`0025`): the indexer scores and picks only its own owned quarter of a
   chunk's rows, instead of every node redundantly scoring all of them. On by default (`scripts/local.sh`).
 - **2026-10-25** -- resumable prefill, expert early exit, draft-row costs (`0022`-`0024`, opt-in): `TF_DS_PREFILL_YIELD`
-  and `TF_DS_EXPERT_EXIT` on on this cluster; `TF_DS_DRAFT_ROW_MS` measured mixed, kept off.
+  and `TF_DS_EXPERT_EXIT` on (this cluster); `TF_DS_DRAFT_ROW_MS` measured mixed, kept off.
 - **2026-10-25** -- the decode plan's Gate 0 and draft economics (`0017`-`0021`, `ROUND_MS`, `DRAFT_MS`): 64-row
   drafting slabs fix 13+ concurrent drafting streams failing outright; CUDA graph capture agreed across every rank;
   PDL controls (off); `ROUND_MS`/`DRAFT_MS` set from measurement; `TF_DS_SAMPLE_CAND` opt-in.

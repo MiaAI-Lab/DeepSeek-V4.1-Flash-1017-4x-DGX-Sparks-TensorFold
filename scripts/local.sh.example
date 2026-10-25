@@ -5,7 +5,7 @@ WORKER=user@192.0.2.2          # NCCL rank 1 (spark2)
 WORKER2=user@192.0.2.3         # NCCL rank 2 (spark3)
 WORKER3=user@192.0.2.4         # NCCL rank 3 (spark4)
 # FABRIC_PEER=192.0.2.12       # a worker's CX7 address when WORKER is reached over another network (FABRIC_PEER2/3 too)
-# NFS_SERVER3=10.0.41.1        # the head's address a worker mounts the weights from, when the link's is not the one
+# NFS_SERVER3=192.0.2.21       # the head's address a worker mounts the weights from, when the link's is not the one
 # NFS_PATH=/huggingface        # HF_CACHE's path in this Spark's NFS export (an export with fsid=0 at its root)
 # PORT=8888
 # DERISKED=1                  # use Blackfrost-AI/DeepSeek-V4.1-Flash-1017-DERISKED-FP8

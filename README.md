@@ -7,6 +7,8 @@
   <a href="https://x.com/MiaAI_lab" target="_blank" rel="noopener noreferrer" style="display:inline-block;margin:0 8px;vertical-align:middle;"><img src="https://img.shields.io/badge/Follow%20me%20on%20X-000000?style=for-the-badge&logo=x&logoColor=white" alt="Follow Mia on X" height="28" style="height:28px;width:auto;vertical-align:middle;border:0;" /></a>
 </p>
 
+<img src=".github/pic.png" alt="DeepSeek V4.1 Flash on 4x DGX Sparks: 1M context, 16M KV pool, 65 tok/s prose, 16 concurrent sessions" width="100%" />
+
 Serve DeepSeek's own **[DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017)**
 (FP8 / MXFP4, as published, no re-quantization) from four NVIDIA DGX Sparks (GB10, 128 GB each) over their
 ConnectX-7 ports, with tensor parallelism over all four (TP4), through an OpenAI-compatible API: text,
