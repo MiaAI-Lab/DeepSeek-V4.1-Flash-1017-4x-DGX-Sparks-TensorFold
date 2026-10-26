@@ -1,4 +1,4 @@
-"""Regression tests for stop.sh, the ring's NCCL graph files under DRY_RUN=1, and the prepared marker.
+"""Regression tests for stop.sh, ./start.sh restart, the ring's NCCL graph files under DRY_RUN=1, and the prepared marker.
 
 Offline: no Spark, GPU, Docker or network. Each test copies the scripts into a temporary folder and puts fake `ssh`,
 `docker`, `curl` and `getent` first on PATH. The fake ssh runs a worker's command locally with that worker's own HOME
@@ -31,32 +31,36 @@ def find_bash():
 BASH = find_bash()
 
 FAKE_SSH = r"""#!BASH
-# fake ssh: ssh [-o opt]... host command...; a host listed in $SIM/unreachable cannot be reached
+# fake ssh: ssh [-o opt]... host command...; a host listed in $SIM/unreachable cannot be reached, one in $SIM/flaky
+# answers `true` (the reachability probe) and drops every other command
 while [[ "$1" == -o ]]; do shift 2; done
 host=$1; shift
 echo "$host $*" >> "$SIM/ssh.log"
 grep -qxF "$host" "$SIM/unreachable" 2>/dev/null && { echo "ssh: connect to host $host: No route to host" >&2; exit 255; }
+grep -qxF "$host" "$SIM/flaky" 2>/dev/null && [[ "$*" != true ]] && { echo "Connection to $host closed by remote host." >&2; exit 255; }
 mkdir -p "$SIM/home/$host"
 SIM_HOST=$host HOME="$SIM/home/$host" exec BASH -c "$*"
 """
 
 FAKE_DOCKER = r"""#!BASH
 # fake docker: each Spark's containers are lines in $SIM/hosts/<host>/containers; a container named in
-# $SIM/hosts/<host>/stuck cannot be stopped or removed
+# $SIM/hosts/<host>/stuck cannot be stopped or removed; with $SIM/hosts/<host>/ps_fails `docker ps` fails; with
+# $SIM/image the image exists (its identity: "image-ident"); `run -d --name N` adds N
 h=${SIM_HOST:-head}; d="$SIM/hosts/$h"; mkdir -p "$d"; touch "$d/containers"
 echo "$h docker $*" >> "$SIM/docker.log"
 has() { grep -qxF "$1" "$d/containers"; }
 stuck() { grep -qxF "$1" "$d/stuck" 2>/dev/null; }
 last=${!#}
 case "$1" in
-  ps) cat "$d/containers" ;;
+  ps) [[ ! -e "$d/ps_fails" ]] || { echo "Cannot connect to the Docker daemon" >&2; exit 1; }; cat "$d/containers" ;;
   inspect) has "$last" || { echo "Error: No such object: $last" >&2; exit 1; }
            [[ "$*" != *State.Running* ]] || echo true ;;
   stop) stuck "$last" && { echo "Error response from daemon: cannot stop container: $last" >&2; exit 1; }; true ;;
   rm) stuck "$last" && { echo "Error response from daemon: cannot remove container: $last" >&2; exit 1; }
       grep -vxF "$last" "$d/containers" > "$d/c.new" || true; mv "$d/c.new" "$d/containers" ;;
   logs) echo "a log line" ;;
-  image) exit 1 ;;
+  image) [[ -e "$SIM/image" ]] || exit 1; echo image-ident ;;
+  run) n=""; prev=""; for a in "$@"; do [[ "$prev" != --name ]] || n=$a; prev=$a; done; echo "$n" >> "$d/containers"; echo container-id ;;
   *) exit 0 ;;
 esac
 """
@@ -132,6 +136,14 @@ class ScriptTest(unittest.TestCase):
     def unreachable(self, *hosts):
         (self.sim / "unreachable").write_text("".join(h + "\n" for h in hosts))
 
+    def flaky(self, *hosts):
+        (self.sim / "flaky").write_text("".join(h + "\n" for h in hosts))
+
+    def ps_fails(self, host):
+        d = self.sim / "hosts" / host
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "ps_fails").write_text("")
+
     def run_script(self, args, extra_env=None, timeout=60):
         env = {**self.env, **(extra_env or {})}
         r = subprocess.run([BASH, *args], cwd=self.repo, env=env, capture_output=True, text=True, timeout=timeout)
@@ -199,6 +211,49 @@ class StopSh(ScriptTest):
         self.assertIn("rank 2 was left alone", out)
         self.assertNoTraceback(out)
 
+    def test_container_list_failing_on_a_worker_fails(self):
+        self.all_up()
+        self.ps_fails("w2")
+        code, out = self.run_script(["stop.sh"])
+        self.assertEqual(code, 1, out)
+        self.assertIn("rank 2 was left alone", out)
+        self.assertNotIn("its GPU memory is free again", out)
+        self.assertEqual(self.left("w2"), [NAME])
+        for h in ["head", "w1", "w3"]:
+            self.assertEqual(self.left(h), [], h)
+        self.assertNoTraceback(out)
+
+    def test_ssh_dropping_after_the_probe_fails(self):
+        self.all_up()
+        self.flaky("w1")
+        code, out = self.run_script(["stop.sh"])
+        self.assertEqual(code, 1, out)
+        self.assertIn("rank 1 was left alone", out)
+        self.assertNotIn("its GPU memory is free again", out)
+        self.assertEqual(self.left("w1"), [NAME])
+        self.assertNoTraceback(out)
+
+    def test_container_list_failing_here_fails(self):
+        self.all_up()
+        self.ps_fails("head")
+        code, out = self.run_script(["stop.sh"])
+        self.assertEqual(code, 1, out)
+        self.assertIn("rank 0 was left alone", out)
+        self.assertNotIn("nothing to stop", out)
+        self.assertNotIn("its GPU memory is free again", out)
+        self.assertEqual(self.left("head"), [NAME])
+        for h in ["w1", "w2", "w3"]:
+            self.assertEqual(self.left(h), [], h)
+        self.assertNoTraceback(out)
+
+    def test_container_list_failing_here_alone_is_not_nothing_to_stop(self):
+        self.containers("head", NAME)
+        self.ps_fails("head")
+        code, out = self.run_script(["stop.sh"])
+        self.assertEqual(code, 1, out)
+        self.assertNotIn("nothing to stop", out)
+        self.assertEqual(self.left("head"), [NAME])
+
     def test_dry_run_stops_nothing(self):
         self.all_up()
         code, out = self.run_script(["stop.sh"], {"DRY_RUN": "1"})
@@ -206,6 +261,78 @@ class StopSh(ScriptTest):
         self.assertIn("nothing is stopped", out)
         for h in ["head", "w1", "w2", "w3"]:
             self.assertEqual(self.left(h), [NAME], h)
+
+
+class StartRestart(ScriptTest):
+    """./start.sh with only what needs a Spark replaced: the links (detect_links), flock, ss, free, hostname, curl's
+    answers (the server ready, the smoke test's reply) and scripts/prepare.sh (it records that it ran)."""
+    FAKES = {
+        "flock": "#!/bin/sh\nexit 0\n",
+        "ss": "#!/bin/sh\nexit 0\n",
+        "free": "#!/bin/sh\necho 'Mem: 128 1 1 0 0 120'\n",
+        "hostname": "#!/bin/sh\necho 10.0.0.1\n",
+        "curl": "#!/bin/sh\ncase \"$*\" in *completions*) echo '{\"choices\": [{\"message\": {\"content\": \"OK\"}}], \"usage\": {\"completion_tokens\": 1}}' ;; "
+                "*) echo '{\"requests_running\": 0}' ;; esac\n",
+    }
+
+    def setUp(self):
+        super().setUp()
+        bin_ = self.tmp / "bin"
+        for name, body in self.FAKES.items():
+            (bin_ / name).write_text(body)
+            (bin_ / name).chmod(0o755)
+        nodes = self.repo / "scripts" / "nodes.sh"
+        nodes.write_text(nodes.read_text() + """
+detect_links() {
+  FABRIC=mesh; MASTER_ADDR=127.0.0.1
+  for r in 0 1 2 3; do NODE_DEV[r]=fake; NODE_HCAS[r]=fake; NODE_GID[r]=0; LINK_HEAD_ADDR[r]=127.0.0.1; done
+}
+node_order() { echo 0,1,2,3; }
+""")
+        (self.repo / "scripts" / "prepare.sh").write_text("#!/usr/bin/env bash\necho prepared >> \"$SIM/events\"\n")
+        (self.sim / "image").write_text("")
+
+    def launched(self):
+        log = (self.sim / "docker.log").read_text() if (self.sim / "docker.log").exists() else ""
+        return [l.split()[0] for l in log.splitlines() if " docker run -d " in l]
+
+    def prepared(self):
+        return (self.sim / "events").exists()
+
+    def test_restart_starts_every_rank(self):
+        for h in ["head", "w1", "w2", "w3"]:
+            self.containers(h, NAME)
+        code, out = self.run_script(["start.sh", "restart"], {"PREPARE": "0"})
+        self.assertEqual(code, 0, out)
+        self.assertEqual(sorted(self.launched()), ["head", "w1", "w2", "w3"], out)
+        self.assertIn("is now LIVE", out)
+
+    def test_restart_stops_when_a_rank_cannot_be_stopped(self):
+        for h in ["head", "w1", "w2", "w3"]:
+            self.containers(h, NAME)
+        self.stuck("w2")
+        code, out = self.run_script(["start.sh", "restart"], {"PREPARE": "0"})
+        self.assertNotEqual(code, 0, out)
+        self.assertIn("could not stop rank 2", out)
+        self.assertEqual(self.launched(), [], out)
+        self.assertNotIn("is now LIVE", out)
+
+    def test_restart_stops_when_a_worker_cannot_be_checked(self):
+        for h in ["head", "w1", "w2", "w3"]:
+            self.containers(h, NAME)
+        self.ps_fails("w3")
+        code, out = self.run_script(["start.sh", "restart"], {"PREPARE": "0"})
+        self.assertNotEqual(code, 0, out)
+        self.assertEqual(self.launched(), [], out)
+
+    def test_old_marker_runs_prepare_once(self):
+        state = self.home / ".local/state/dsv41-tensorfold"
+        state.mkdir(parents=True)
+        (state / "prepared").write_text("model=old image=old kit=old\n")
+        code, out = self.run_script(["start.sh"])
+        self.assertEqual(code, 0, out)
+        self.assertTrue(self.prepared(), out)
+        self.assertIn("Not ready yet", out)
 
 
 class RingGraphs(ScriptTest):

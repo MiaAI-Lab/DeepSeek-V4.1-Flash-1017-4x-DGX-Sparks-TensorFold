@@ -9,32 +9,42 @@
 # Usage: ./stop.sh      Env: CONTAINER_NAME, PORT, WORKER, WORKER2 (see scripts/config.sh), STOP_TIMEOUT,
 #                       LOG_DIR, LOG_KEEP
 #   DRY_RUN=1 ./stop.sh   says what it would stop, and on which Spark, and stops nothing
-# Exits 1 when a rank could not be stopped or a worker could not be reached (its rank may still run), so
+# Exits 1 when a rank could not be stopped or a Spark's containers could not be listed (its rank may still run), so
 # ./start.sh restart and scripts do not go on as if every Spark's GPU memory were free.
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
 source ./scripts/config.sh
 source ./scripts/nodes.sh
 
-# Where the containers are: here (rank 0) and on the workers (rank i on worker i)
-here=0; docker ps -a --format '{{.Names}}' | grep -qx "$CONTAINER_NAME" && here=1
+# Where the containers are: here (rank 0) and on the workers (rank i on worker i). A Spark whose containers could
+# not be listed (ssh or docker ps failed) may still run its rank: unknown=1, and stop.sh fails (exit 1).
+unknown=0
+here=0
+if names=$(docker ps -a --format '{{.Names}}'); then
+  grep -qxF -- "$CONTAINER_NAME" <<<"$names" && here=1
+else
+  warn "cannot list the containers here (docker ps failed): rank 0 was left alone"
+  unknown=1
+fi
 workers=$(configured_workers)
 nw=$(wc -w <<<"$workers")
 declare -a there=()
 any=0
-unreached=0   # workers ssh could not reach: whatever runs there is still running, so stop.sh fails (exit 1)
 [[ -n "$workers" ]] || warn "WORKER is not set (scripts/local.sh): rank 1 was left alone"
 for i in $workers; do
   there[i]=0
   if ! worker "$i" true 2>/dev/null; then
     warn "cannot reach the worker ($(worker_host "$i")) over ssh: rank $i was left alone"
-    unreached=1
-  elif worker "$i" "docker ps -a --format '{{.Names}}' | grep -qx '$CONTAINER_NAME'"; then
+    unknown=1
+  elif ! names=$(worker "$i" "docker ps -a --format '{{.Names}}'"); then
+    warn "cannot list the containers on the worker ($(worker_host "$i")): rank $i was left alone"
+    unknown=1
+  elif grep -qxF -- "$CONTAINER_NAME" <<<"$names"; then
     there[i]=1; any=1
   fi
 done
 if (( here == 0 && any == 0 )); then
-  (( unreached == 0 )) || die "No container named $CONTAINER_NAME on the Sparks it reached; a worker it could not reach may still run one"
+  (( unknown == 0 )) || die "No container named $CONTAINER_NAME on the Sparks it could check; one it could not check may still run one"
   if (( nw <= 1 )); then log "No container named $CONTAINER_NAME on either Spark: nothing to stop"
   else log "No container named $CONTAINER_NAME on any Spark: nothing to stop"; fi
   exit 0
@@ -85,5 +95,5 @@ for i in $workers; do if (( there[i] )); then stop_worker "$i" & wpids+=($!); fi
 if (( here )); then stop_here; fi
 failed=0
 for p in "${wpids[@]}"; do wait "$p" || failed=1; done
-(( failed == 0 && unreached == 0 )) || exit 1          # a warning above said what is left
+(( failed == 0 && unknown == 0 )) || exit 1            # a warning above said what is left
 log "Stopped and removed $CONTAINER_NAME $where; its GPU memory is free again"
