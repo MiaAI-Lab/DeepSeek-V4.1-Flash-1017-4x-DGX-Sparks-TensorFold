@@ -302,6 +302,9 @@ class ValidateFeatures(ToolTest):
             "a null call after a good one": [good, None],
             "arguments not an object": [{**good, "function": {"name": "get_weather", "arguments": "[\"Tokyo\"]"}}],
             "city not a string": [{**good, "function": {"name": "get_weather", "arguments": "{\"city\": [\"Tokyo\"]}"}}],
+            "a nameless call after a good one": [good, {**good, "id": "call_1", "function": {"name": "", "arguments": "{}"}}],
+            "a name that is not a string": [good, {**good, "id": "call_1", "function": {"name": 7, "arguments": "{}"}}],
+            "NaN in the arguments": [{**good, "function": {"name": "get_weather", "arguments": "{\"city\": \"Tokyo\", \"x\": NaN}"}}],
         }
         for case, calls in cases.items():
             with self.subTest(case=case):

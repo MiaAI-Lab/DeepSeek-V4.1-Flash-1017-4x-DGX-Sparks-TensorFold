@@ -84,15 +84,22 @@ def prompt_tokens(r):
     return usage.get("prompt_tokens") if isinstance(usage, dict) else None
 
 
+def strict_json(s):
+    """json.loads without the NaN / Infinity extensions, which are not JSON."""
+    def refuse(name):
+        raise ValueError(f"{name} is not JSON")
+    return json.loads(s, parse_constant=refuse)
+
+
 def well_formed_call(c):
     """An OpenAI tool call: an id, type "function", and a function with a name and JSON-object arguments."""
     if not isinstance(c, dict) or not isinstance(c.get("id"), str) or not c["id"] or c.get("type") != "function":
         return False
     f = c.get("function")
-    if not isinstance(f, dict) or not isinstance(f.get("name"), str) or not isinstance(f.get("arguments"), str):
+    if not isinstance(f, dict) or not isinstance(f.get("name"), str) or not f["name"] or not isinstance(f.get("arguments"), str):
         return False
     try:
-        return isinstance(json.loads(f["arguments"]), dict)
+        return isinstance(strict_json(f["arguments"]), dict)
     except ValueError:
         return False
 
@@ -104,7 +111,7 @@ def tool_calls_ok(r, name, city):
     if not isinstance(calls, list) or not calls or not all(well_formed_call(c) for c in calls):
         return False, []
     f = calls[0]["function"]
-    got = json.loads(f["arguments"]).get("city")
+    got = strict_json(f["arguments"]).get("city")
     return f["name"] == name and isinstance(got, str) and city in got.lower(), calls
 
 
