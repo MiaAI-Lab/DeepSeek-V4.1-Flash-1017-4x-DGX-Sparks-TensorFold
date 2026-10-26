@@ -1,5 +1,11 @@
 # Changelog
 
+- **2026-10-26** -- `0027` (uchkw): park the three RDMA proxy threads when no streams are live.
+  Synchronize CUDA on every rank, agree READY/COMMIT, then block in futex waits; wake before compute and before stop/join.
+  Idle followers block on the control link instead of spinning. A four-GB10 ring measured about 300% CPU per node
+  before and 0.21-0.32% after; three idle/wake chat cycles passed. Numerical kernels and weights are unchanged.
+  All ranks must run the updated image (new idle control frame).
+
 - **2026-10-26** -- `0026` (knapcio): the RDMA rings' queue pairs take the port's active MTU (`ibv_query_port`,
   capped at 4096) as their path MTU instead of a fixed 4096. On a switched fabric whose Ethernet MTU is 1500 the RoCE
   active MTU is 1024, and with the fixed 4096 every request failed (`RDMA=1`); with the port's MTU it serves. On a

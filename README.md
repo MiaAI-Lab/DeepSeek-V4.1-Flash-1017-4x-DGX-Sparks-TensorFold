@@ -52,8 +52,8 @@ rank's rendezvous address). Full list: [Credits](#credits) and [`CREDITS.md`](CR
 - One command on spark1: `./start.sh` (a switch) or `./start-switchless.sh` (a ring) sets up all four Sparks and
   starts the four ranks; `./stop.sh` stops them
 
-**This recipe's own patches** ([`zig/patches`](zig/patches)) **are Mia's AI Lab's work, every one except `0008`**
-(Hector's) -- see [What the patches change](#what-the-patches-change) and [Credits](#credits) for who found or
+**This recipe's own patches** ([`zig/patches`](zig/patches)) **are Mia's AI Lab's work, except `0008`, `0026` and `0027`**
+(Hector, knapcio and uchkw, respectively) -- see [What the patches change](#what-the-patches-change) and [Credits](#credits) for who found or
 shaped each specific fix along the way.
 
 ## Contents
@@ -342,6 +342,21 @@ measurements and rationale: [`CHANGELOG.md`](CHANGELOG.md); authorship: [`CREDIT
 | `0024` | Mia's AI Lab | `TF_DS_DRAFT_ROW_MS` | Draft rows priced at a measured constant instead of the round table (mixed; kept for later) |
 | `0025` | Mia's AI Lab | `TF_DS_IDX_SHARD` (on, this cluster) | Indexer scores and picks only its own owned quarter of rows |
 | `0026` | knapcio | -- (on) | RDMA queue pairs use the port's active MTU (capped at 4096) instead of a fixed 4096, so RDMA works on a switch whose Ethernet MTU is 1500 |
+| `0027` | uchkw | -- (on with RDMA) | Parks idle RDMA proxies with a futex after all ranks quiesce; wakes before the next compute frame |
+
+### Idle RDMA CPU use
+
+Patch `0027` stops the three RDMA proxy threads from busy-polling while the engine has no live streams.
+All ranks first synchronize their CUDA contexts and complete a READY/COMMIT handshake, then park the proxies
+in a Linux futex wait. A compute frame wakes them before GPU work is enqueued. Active RDMA polling and numerical
+kernels stay unchanged. All ranks must use the same image because the idle handshake adds a wire frame.
+
+On one four-GB10 switchless-ring deployment (2026-10-26), Container idle CPU fell from about 300% per node
+(three cores) to 0.21-0.32%; three idle/wake chat cycles passed. The deployment used a 2,097,152-position pool,
+1,048,576-token context, 16 streams and the original 1017 weights. This verifies that configuration, not the
+full feature matrix. A repeated A/B/A/B recheck with 60-second cgroup CPU windows confirmed the reduction
+([measurements](docs/idle-cpu-validation.md)). Shared-circuit wall-power readings were noisy and incomplete; no isolated watts-saved
+claim is made. Rebuild and replace all four images; weight conversion is not required for this patch.
 
 ## Repository layout
 

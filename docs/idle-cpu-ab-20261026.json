@@ -1,0 +1,249 @@
+{
+  "date": "2026-10-26",
+  "recipe": "6beaad9cb7051838e109ddd51c38a297bad50c8a",
+  "engine": "59402086381a42c74d53053443224eec2790b4c5",
+  "cpu_metric": "100 * delta cgroup-v2 cpu.stat usage_usec / 1e6 / monotonic elapsed seconds; one CPU core=100%",
+  "settle_seconds": 30,
+  "source_changes": [
+    "families/dsv41/idle_gate.zig",
+    "families/dsv41/lanes.zig",
+    "families/dsv41/native.zig",
+    "families/dsv41/rdma.zig"
+  ],
+  "image_environment_equal": true,
+  "launch_arguments_and_environment_values_equal": true,
+  "phases": [
+    {
+      "label": "A1",
+      "patched": false,
+      "utc_start": "2026-10-26T16:37:40.460692+00:00",
+      "utc_end": "2026-10-26T16:38:45.528530+00:00",
+      "inference_counters_before": {
+        "tensorfold:prompt_tokens_total": "26",
+        "tensorfold:generation_tokens_total": "4",
+        "tensorfold:request_latency_seconds_count": "2",
+        "tensorfold:client_disconnections_total": "0"
+      },
+      "inference_counters_after": {
+        "tensorfold:prompt_tokens_total": "26",
+        "tensorfold:generation_tokens_total": "4",
+        "tensorfold:request_latency_seconds_count": "2",
+        "tensorfold:client_disconnections_total": "0"
+      },
+      "inference_post_count": 0,
+      "idle_health_checks": 14,
+      "nodes": [
+        {
+          "rank": 0,
+          "image_id": "sha256:ea9f6657549c90b9f5902442a3ba4b9515089ec1ba9b39bc61742a88510641fa",
+          "elapsed_seconds": 60.00007142708637,
+          "usage_usec_before": 139534684,
+          "usage_usec_after": 319601377,
+          "cpu_percent": 300.11079773266886,
+          "restart_count": 0
+        },
+        {
+          "rank": 1,
+          "image_id": "sha256:ea9f6657549c90b9f5902442a3ba4b9515089ec1ba9b39bc61742a88510641fa",
+          "elapsed_seconds": 60.00016311102081,
+          "usage_usec_before": 140291905,
+          "usage_usec_after": 320344766,
+          "cpu_percent": 300.08728587427447,
+          "restart_count": 0
+        },
+        {
+          "rank": 2,
+          "image_id": "sha256:ea9f6657549c90b9f5902442a3ba4b9515089ec1ba9b39bc61742a88510641fa",
+          "elapsed_seconds": 60.00042618205771,
+          "usage_usec_before": 139688094,
+          "usage_usec_after": 319761289,
+          "cpu_percent": 300.11985990500915,
+          "restart_count": 0
+        },
+        {
+          "rank": 3,
+          "image_id": "sha256:ea9f6657549c90b9f5902442a3ba4b9515089ec1ba9b39bc61742a88510641fa",
+          "elapsed_seconds": 60.000155649962835,
+          "usage_usec_before": 139967155,
+          "usage_usec_after": 320021995,
+          "cpu_percent": 300.0906215150986,
+          "restart_count": 0
+        }
+      ]
+    },
+    {
+      "label": "B1",
+      "patched": true,
+      "utc_start": "2026-10-26T16:41:24.611366+00:00",
+      "utc_end": "2026-10-26T16:42:29.670002+00:00",
+      "inference_counters_before": {
+        "tensorfold:prompt_tokens_total": "26",
+        "tensorfold:generation_tokens_total": "4",
+        "tensorfold:request_latency_seconds_count": "2",
+        "tensorfold:client_disconnections_total": "0"
+      },
+      "inference_counters_after": {
+        "tensorfold:prompt_tokens_total": "26",
+        "tensorfold:generation_tokens_total": "4",
+        "tensorfold:request_latency_seconds_count": "2",
+        "tensorfold:client_disconnections_total": "0"
+      },
+      "inference_post_count": 0,
+      "idle_health_checks": 14,
+      "nodes": [
+        {
+          "rank": 0,
+          "image_id": "sha256:ddb2572ad9f14129fee52d461a666c2923a30f35250a187ed1be2401040cae73",
+          "elapsed_seconds": 60.00008223508485,
+          "usage_usec_before": 35063044,
+          "usage_usec_after": 35252546,
+          "cpu_percent": 0.3158362337863419,
+          "restart_count": 0
+        },
+        {
+          "rank": 1,
+          "image_id": "sha256:ddb2572ad9f14129fee52d461a666c2923a30f35250a187ed1be2401040cae73",
+          "elapsed_seconds": 60.0005360780051,
+          "usage_usec_before": 33930193,
+          "usage_usec_after": 34056979,
+          "cpu_percent": 0.2113081120394806,
+          "restart_count": 0
+        },
+        {
+          "rank": 2,
+          "image_id": "sha256:ddb2572ad9f14129fee52d461a666c2923a30f35250a187ed1be2401040cae73",
+          "elapsed_seconds": 60.00008879089728,
+          "usage_usec_before": 35453662,
+          "usage_usec_after": 35580132,
+          "cpu_percent": 0.21078302140643998,
+          "restart_count": 0
+        },
+        {
+          "rank": 3,
+          "image_id": "sha256:ddb2572ad9f14129fee52d461a666c2923a30f35250a187ed1be2401040cae73",
+          "elapsed_seconds": 60.00052920496091,
+          "usage_usec_before": 33352109,
+          "usage_usec_after": 33479717,
+          "cpu_percent": 0.21267812416136025,
+          "restart_count": 0
+        }
+      ]
+    },
+    {
+      "label": "A2",
+      "patched": false,
+      "utc_start": "2026-10-26T16:45:09.320791+00:00",
+      "utc_end": "2026-10-26T16:46:14.367237+00:00",
+      "inference_counters_before": {
+        "tensorfold:prompt_tokens_total": "26",
+        "tensorfold:generation_tokens_total": "4",
+        "tensorfold:request_latency_seconds_count": "2",
+        "tensorfold:client_disconnections_total": "0"
+      },
+      "inference_counters_after": {
+        "tensorfold:prompt_tokens_total": "26",
+        "tensorfold:generation_tokens_total": "4",
+        "tensorfold:request_latency_seconds_count": "2",
+        "tensorfold:client_disconnections_total": "0"
+      },
+      "inference_post_count": 0,
+      "idle_health_checks": 14,
+      "nodes": [
+        {
+          "rank": 0,
+          "image_id": "sha256:ea9f6657549c90b9f5902442a3ba4b9515089ec1ba9b39bc61742a88510641fa",
+          "elapsed_seconds": 60.000072170980275,
+          "usage_usec_before": 136532598,
+          "usage_usec_after": 316606737,
+          "cpu_percent": 300.12320399690276,
+          "restart_count": 0
+        },
+        {
+          "rank": 1,
+          "image_id": "sha256:ea9f6657549c90b9f5902442a3ba4b9515089ec1ba9b39bc61742a88510641fa",
+          "elapsed_seconds": 60.00015895208344,
+          "usage_usec_before": 137239383,
+          "usage_usec_after": 317289492,
+          "cpu_percent": 300.08272002044083,
+          "restart_count": 0
+        },
+        {
+          "rank": 2,
+          "image_id": "sha256:ea9f6657549c90b9f5902442a3ba4b9515089ec1ba9b39bc61742a88510641fa",
+          "elapsed_seconds": 60.00040066905785,
+          "usage_usec_before": 138448546,
+          "usage_usec_after": 318504804,
+          "cpu_percent": 300.0917593752917,
+          "restart_count": 0
+        },
+        {
+          "rank": 3,
+          "image_id": "sha256:ea9f6657549c90b9f5902442a3ba4b9515089ec1ba9b39bc61742a88510641fa",
+          "elapsed_seconds": 60.00042384094559,
+          "usage_usec_before": 138296422,
+          "usage_usec_after": 318341028,
+          "cpu_percent": 300.0722236184166,
+          "restart_count": 0
+        }
+      ]
+    },
+    {
+      "label": "B2",
+      "patched": true,
+      "utc_start": "2026-10-26T16:48:53.608768+00:00",
+      "utc_end": "2026-10-26T16:49:58.667677+00:00",
+      "inference_counters_before": {
+        "tensorfold:prompt_tokens_total": "26",
+        "tensorfold:generation_tokens_total": "4",
+        "tensorfold:request_latency_seconds_count": "2",
+        "tensorfold:client_disconnections_total": "0"
+      },
+      "inference_counters_after": {
+        "tensorfold:prompt_tokens_total": "26",
+        "tensorfold:generation_tokens_total": "4",
+        "tensorfold:request_latency_seconds_count": "2",
+        "tensorfold:client_disconnections_total": "0"
+      },
+      "inference_post_count": 0,
+      "idle_health_checks": 14,
+      "nodes": [
+        {
+          "rank": 0,
+          "image_id": "sha256:ddb2572ad9f14129fee52d461a666c2923a30f35250a187ed1be2401040cae73",
+          "elapsed_seconds": 60.0003464090405,
+          "usage_usec_before": 33393773,
+          "usage_usec_after": 33562791,
+          "cpu_percent": 0.28169504030485626,
+          "restart_count": 0
+        },
+        {
+          "rank": 1,
+          "image_id": "sha256:ddb2572ad9f14129fee52d461a666c2923a30f35250a187ed1be2401040cae73",
+          "elapsed_seconds": 60.000090985093266,
+          "usage_usec_before": 33653032,
+          "usage_usec_after": 33786248,
+          "cpu_percent": 0.2220263299818943,
+          "restart_count": 0
+        },
+        {
+          "rank": 2,
+          "image_id": "sha256:ddb2572ad9f14129fee52d461a666c2923a30f35250a187ed1be2401040cae73",
+          "elapsed_seconds": 60.00079498498235,
+          "usage_usec_before": 32146214,
+          "usage_usec_after": 32283519,
+          "cpu_percent": 0.22883863461203502,
+          "restart_count": 0
+        },
+        {
+          "rank": 3,
+          "image_id": "sha256:ddb2572ad9f14129fee52d461a666c2923a30f35250a187ed1be2401040cae73",
+          "elapsed_seconds": 60.00053801597096,
+          "usage_usec_before": 33386442,
+          "usage_usec_after": 33532256,
+          "cpu_percent": 0.24302115417896286,
+          "restart_count": 0
+        }
+      ]
+    }
+  ]
+}

@@ -44,7 +44,7 @@ DGX Sparks. Almost everything that makes it work was built by others. Its own wo
 
 ## This recipe's patches (`zig/patches`)
 
-**Every patch is Mia's AI Lab's own work, except `0008`, which is Hector's, and `0026`, which is knapcio's.** At a glance:
+**Every patch is Mia's AI Lab's own work, except `0008`, which is Hector's, `0026`, which is knapcio's, and `0027`, which is uchkw's (Codex-assisted).** At a glance:
 
 | Patches | Author | What |
 | --- | --- | --- |
@@ -54,6 +54,7 @@ DGX Sparks. Almost everything that makes it work was built by others. Its own wo
 | `0017`-`0024` | Mia's AI Lab | the decode plan: G0.1-G0.3, tracks A2/B/C/D/A3 |
 | `0025` | Mia's AI Lab | WP6(b), the indexer's own row-sharding |
 | `0026` | knapcio | the RDMA queue pairs' path MTU from the port's active MTU |
+| `0027` | [uchkw](https://github.com/uchkw) (Codex-assisted) | globally quiesce and futex-park idle RDMA proxies; wake before compute |
 
 The per-patch notes below also credit everyone who helped find or shape a specific fix along the way -- Hector's
 reviewer, Codex and Grok's live-bug diagnosis and design reviews, an outside reviewer's observation -- without
