@@ -262,6 +262,18 @@ class StopSh(ScriptTest):
         for h in ["head", "w1", "w2", "w3"]:
             self.assertEqual(self.left(h), [NAME], h)
 
+    def test_dry_run_with_a_spark_it_cannot_list_fails(self):
+        for case, setup in [("docker ps fails", lambda: self.ps_fails("w2")), ("unreachable", lambda: self.unreachable("w2"))]:
+            with self.subTest(case=case):
+                self.setUp()
+                self.all_up()
+                setup()
+                code, out = self.run_script(["stop.sh"], {"DRY_RUN": "1"})
+                self.assertEqual(code, 1, out)
+                self.assertIn("nothing is stopped", out)
+                for h in ["head", "w1", "w2", "w3"]:
+                    self.assertEqual(self.left(h), [NAME], h)
+
 
 class StartRestart(ScriptTest):
     """./start.sh with only what needs a Spark replaced: the links (detect_links), flock, ss, free, hostname, curl's
@@ -324,6 +336,22 @@ node_order() { echo 0,1,2,3; }
         code, out = self.run_script(["start.sh", "restart"], {"PREPARE": "0"})
         self.assertNotEqual(code, 0, out)
         self.assertEqual(self.launched(), [], out)
+
+    def test_template_that_cannot_be_hashed_starts_nothing(self):
+        # no marker yet, or an empty one: a failed hash must not read as "Ready" and start the ranks
+        (self.repo / "model" / "chat_template.jinja").unlink()
+        state = self.home / ".local/state/dsv41-tensorfold"
+        for marker in [None, ""]:
+            with self.subTest(marker=marker):
+                if marker is not None:
+                    state.mkdir(parents=True, exist_ok=True)
+                    (state / "prepared").write_text(marker)
+                code, out = self.run_script(["start.sh"])
+                self.assertNotEqual(code, 0, out)
+                self.assertNotIn("Ready:", out)
+                self.assertIn("chat_template", out)
+                self.assertEqual(self.launched(), [], out)
+                self.assertFalse(self.prepared(), out)
 
     def test_old_marker_runs_prepare_once(self):
         state = self.home / ".local/state/dsv41-tensorfold"
@@ -440,6 +468,28 @@ class PreparedState(ScriptTest):
         code, out = self.bash(self.BODY)
         self.assertNotEqual(code, 0, out)
         self.assertIn("chat_template", out)
+
+    def test_marker_does_not_depend_on_the_locale(self):
+        a = self.state({"HF_CACHE": "/data/\u00e5", "LC_ALL": "C"})
+        b = self.state({"HF_CACHE": "/data/\u00e5", "LC_ALL": "en_US.UTF-8"})
+        self.assertEqual(a, b)
+
+    def test_writing_the_marker(self):
+        marker = self.home / ".local/state/dsv41-tensorfold/prepared"
+        body = 'image_ident() { echo image-ident; }\nmkdir -p "$STATE_DIR"\nwrite_prepared_marker'
+        code, out = self.bash(body)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(marker.read_text().strip(), self.state())
+
+    def test_failed_hash_keeps_the_previous_marker(self):
+        marker = self.home / ".local/state/dsv41-tensorfold/prepared"
+        marker.parent.mkdir(parents=True)
+        marker.write_text("model=valid-before\n")
+        (self.repo / "model" / "chat_template.jinja").unlink()
+        code, out = self.bash('image_ident() { echo image-ident; }\nwrite_prepared_marker')
+        self.assertNotEqual(code, 0, out)
+        self.assertEqual(marker.read_text(), "model=valid-before\n")
+        self.assertFalse(marker.with_name("prepared.new").exists(), out)
 
     def test_existing_fields_still_change_marker(self):
         for var, value in [("ORDER", "0,1,2,3"), ("ABLIT", "1"), ("WORKER2", "w9")]:

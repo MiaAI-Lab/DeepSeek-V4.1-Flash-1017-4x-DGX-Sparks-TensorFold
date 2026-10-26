@@ -70,6 +70,7 @@ if [[ "${DRY_RUN:-0}" == 1 ]]; then
   for i in $workers; do
     if (( there[i] )); then printf '[dry-run] rank %s on %s:\n  docker stop -t %s %s; (its log saved to ~/.cache/dsv41-tensorfold/logs there); docker rm -f %s\n' "$i" "$(worker_host "$i")" "${STOP_TIMEOUT:-30}" "$CONTAINER_NAME" "$CONTAINER_NAME"; fi
   done
+  (( unknown == 0 )) || exit 1                           # a warning above said which Spark could not be listed
   exit 0
 fi
 log "Stopping $CONTAINER_NAME $where (up to ${STOP_TIMEOUT:-30}s)"

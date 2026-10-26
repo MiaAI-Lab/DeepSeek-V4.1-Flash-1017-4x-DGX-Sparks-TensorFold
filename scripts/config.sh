@@ -206,8 +206,8 @@ served_in_container() { echo "/hf/$DATA_SUB/model"; }
 
 # What scripts/prepare.sh last left ready (start.sh runs it again when this line changes): with where the checkpoint is
 # (HF_CACHE), how the workers mount it (NFS_PATH, NFS_VOLUME, NFS_SERVER*) and the chat template it copies into the
-# served folder, each of which needs prepare.sh's steps again when it changes. Each field is shell-quoted (%q), so no
-# two settings give the same line.
+# served folder, each of which needs prepare.sh's steps again when it changes. Each field is shell-quoted (%q, in the C
+# locale so the line does not depend on it), so no two settings give the same line.
 PREPARED_MARKER="$STATE_DIR/prepared"
 prepared_state() {
   local i tpl f
@@ -217,5 +217,11 @@ prepared_state() {
   [[ "$ENGRAM_PACKED" != 1 ]] || f+=("packed=$ENGRAM_PACKED_DIR/$(packed_nodes)")
   f+=("hf=$HF_CACHE" "nfs_path=$NFS_PATH" "nfs_volume=$NFS_VOLUME" "template=$tpl")
   for i in 1 2 3; do f+=("w$i=$(worker_host "$i")" "nfs$i=$(wval NFS_SERVER "$i")"); done
-  printf '%q ' "${f[@]}"; echo
+  (export LC_ALL=C; printf '%q ' "${f[@]}"; echo)   # (a prefix LC_ALL=C does not reach the printf builtin)
+}
+# prepare.sh's last step: computed first and swapped in whole, so a failure leaves the previous marker as it was
+write_prepared_marker() {
+  local state
+  state=$(prepared_state) || return 1
+  printf '%s\n' "$state" > "$PREPARED_MARKER.new" && mv -f "$PREPARED_MARKER.new" "$PREPARED_MARKER"
 }

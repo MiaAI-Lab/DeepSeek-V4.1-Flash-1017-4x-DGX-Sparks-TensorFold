@@ -78,7 +78,15 @@ fi
 
 # ---------------------------------------------------------------- 1. setup
 step 1 "Setup: image, checkpoint, weight files and kit on spark1; NFS volumes on the workers"
-if [[ "${PREPARE:-auto}" == 1 || ( "${PREPARE:-auto}" != 0 && "$(prepared_state 2>/dev/null)" != "$(cat "$PREPARED_MARKER" 2>/dev/null)" ) ]]; then
+need_prepare=0
+case "${PREPARE:-auto}" in
+  1) need_prepare=1 ;;
+  0) ;;
+  *) # (computed on its own: a failure inside $(...) would otherwise read as an empty line equal to an empty marker)
+     state=$(prepared_state) || die "cannot tell whether the setup is ready: see the error above"
+     [[ "$state" == "$(cat "$PREPARED_MARKER" 2>/dev/null)" ]] || need_prepare=1 ;;
+esac
+if (( need_prepare )); then
   if (( DRY )); then log "DRY_RUN: scripts/prepare.sh would run now (not ready yet)"
   else
     log "Not ready yet: running scripts/prepare.sh (the first time this builds the image, downloads ~510 GB and writes four ~80 GB weight files)"
