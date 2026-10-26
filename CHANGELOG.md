@@ -1,5 +1,9 @@
 # Changelog
 
+- **2026-10-26** -- `stop.sh` exits 1 when a rank may still run (a rank it could not stop, or a Spark whose containers
+  it could not list); `DRY_RUN=1` writes no NCCL graph files; the prepared marker also covers `HF_CACHE`, the NFS
+  settings and the chat template, and a state that cannot be computed never reads as ready. Offline regression tests
+  in `tests/test_scripts.py` (standard library only, no Spark).
 - **2026-10-26** -- `0026` (knapcio): the RDMA rings' queue pairs take the port's active MTU (`ibv_query_port`,
   capped at 4096) as their path MTU instead of a fixed 4096. On a switched fabric whose Ethernet MTU is 1500 the RoCE
   active MTU is 1024, and with the fixed 4096 every request failed (`RDMA=1`); with the port's MTU it serves. On a
