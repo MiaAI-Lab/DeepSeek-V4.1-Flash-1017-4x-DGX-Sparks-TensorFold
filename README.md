@@ -341,6 +341,7 @@ measurements and rationale: [`CHANGELOG.md`](CHANGELOG.md); authorship: [`CREDIT
 | `0023` | Mia's AI Lab | `TF_DS_PREFILL_YIELD` (on, this cluster) | Other requests get a round between a long prompt's prefill chunks |
 | `0024` | Mia's AI Lab | `TF_DS_DRAFT_ROW_MS` | Draft rows priced at a measured constant instead of the round table (mixed; kept for later) |
 | `0025` | Mia's AI Lab | `TF_DS_IDX_SHARD` (on, this cluster) | Indexer scores and picks only its own owned quarter of rows |
+| `0026` | knapcio | -- (on) | RDMA queue pairs use the port's active MTU (capped at 4096) instead of a fixed 4096, so RDMA works on a switch whose Ethernet MTU is 1500 |
 
 ## Repository layout
 

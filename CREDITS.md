@@ -44,7 +44,7 @@ DGX Sparks. Almost everything that makes it work was built by others. Its own wo
 
 ## This recipe's patches (`zig/patches`)
 
-**Every patch is Mia's AI Lab's own work, except `0008`, which is Hector's.** At a glance:
+**Every patch is Mia's AI Lab's own work, except `0008`, which is Hector's, and `0026`, which is knapcio's.** At a glance:
 
 | Patches | Author | What |
 | --- | --- | --- |
@@ -53,6 +53,7 @@ DGX Sparks. Almost everything that makes it work was built by others. Its own wo
 | `0009`-`0016` | Mia's AI Lab | the prefill plan: WP0 tooling and timing, WP1 hardening, WP2 projection-tile tuning, WP4 quarter-HC, WP5 owner-row transport, WP6(a) indexer RB=2 |
 | `0017`-`0024` | Mia's AI Lab | the decode plan: G0.1-G0.3, tracks A2/B/C/D/A3 |
 | `0025` | Mia's AI Lab | WP6(b), the indexer's own row-sharding |
+| `0026` | knapcio | the RDMA queue pairs' path MTU from the port's active MTU |
 
 The per-patch notes below also credit everyone who helped find or shape a specific fix along the way -- Hector's
 reviewer, Codex and Grok's live-bug diagnosis and design reviews, an outside reviewer's observation -- without
@@ -166,6 +167,14 @@ Back to the prefill plan, written by Mia's AI Lab:
   straight at this gap. Checked bit-identical to the full, unsharded computation offline first
   (`tf-dsv41-wp6b-idx-shard-replay`: the real AOT scoring kernel, a full 2048-row launch against four 512-row
   launches at row offsets into the same buffers, RB=1 and RB=2, keyed and plain, 5 seeds) before any live attempt.
+
+Contributed by knapcio ([knapcio](https://github.com/knapcio)):
+
+- `0026` (RDMA path MTU): the queue pairs' path MTU comes from the port's active MTU (`ibv_query_port`, capped at
+  4096) instead of a fixed 4096, found running this recipe's switched mode (`./start.sh`) on four Sparks behind a
+  MikroTik CRS812 whose ports keep the default Ethernet MTU 1500. The idea is BertholomusAI's
+  [TensorFold#12](https://github.com/bertholomus/TensorFold/pull/12) (negotiated MTU), ported to this recipe's engine
+  pin for the local endpoint only.
 
 ## Chat template
 
