@@ -411,6 +411,36 @@ class PreparedState(ScriptTest):
         tpl = self.repo / "model" / "chat_template.jinja"
         self.assertChanges(edit=lambda: tpl.write_text(tpl.read_text() + "\n{# changed #}\n"))
 
+    def test_same_length_template_change_changes_marker(self):
+        tpl = self.repo / "model" / "chat_template.jinja"
+        def edit():
+            t = tpl.read_text()
+            i = next(k for k, ch in enumerate(t) if ch.isalpha())
+            tpl.write_text(t[:i] + ("X" if t[i] != "X" else "Y") + t[i + 1:])
+        self.assertChanges(edit=edit)
+
+    def test_spaces_in_paths_count(self):
+        a = self.state({"HF_CACHE": "/data/hf cache"})
+        b = self.state({"HF_CACHE": "/data/hfcache"})
+        self.assertNotEqual(a, b)
+
+    def test_no_two_settings_give_the_same_marker(self):
+        # a field's value holding the next field's text must not shift it into that field
+        pairs = [
+            ({"HF_CACHE": "/a nfs=vol:/b", "NFS_PATH": "/c", "NFS_VOLUME": "vol"},
+             {"HF_CACHE": "/a", "NFS_PATH": "/b nfs=vol:/c", "NFS_VOLUME": "vol"}),
+            ({"HF_CACHE": "/a nfs_path=/b", "NFS_PATH": "/c"}, {"HF_CACHE": "/a", "NFS_PATH": "/b nfs_path=/c"}),
+        ]
+        for a, b in pairs:
+            with self.subTest(a=a, b=b):
+                self.assertNotEqual(self.state(a), self.state(b))
+
+    def test_template_that_cannot_be_hashed_fails(self):
+        (self.repo / "model" / "chat_template.jinja").unlink()
+        code, out = self.bash(self.BODY)
+        self.assertNotEqual(code, 0, out)
+        self.assertIn("chat_template", out)
+
     def test_existing_fields_still_change_marker(self):
         for var, value in [("ORDER", "0,1,2,3"), ("ABLIT", "1"), ("WORKER2", "w9")]:
             with self.subTest(var=var):

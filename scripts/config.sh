@@ -206,14 +206,16 @@ served_in_container() { echo "/hf/$DATA_SUB/model"; }
 
 # What scripts/prepare.sh last left ready (start.sh runs it again when this line changes): with where the checkpoint is
 # (HF_CACHE), how the workers mount it (NFS_PATH, NFS_VOLUME, NFS_SERVER*) and the chat template it copies into the
-# served folder, each of which needs prepare.sh's steps again when it changes.
+# served folder, each of which needs prepare.sh's steps again when it changes. Each field is shell-quoted (%q), so no
+# two settings give the same line.
 PREPARED_MARKER="$STATE_DIR/prepared"
 prepared_state() {
-  local i line tpl
-  tpl=$(sha256sum "$_cfg_root/model/chat_template.jinja" 2>/dev/null | cut -c1-16 || true)
-  line="model=$MODEL_ID@$(snapshot_rev) image=$(image_ident "$IMAGE") kit=$KIT_REF order=${ORDER} engram=$WORKER_ENGRAM_DIR ablit=$ABLIT"
-  [[ "$ENGRAM_PACKED" != 1 ]] || line+=" packed=$ENGRAM_PACKED_DIR/$(packed_nodes)"
-  line+=" hf=$HF_CACHE nfs=$NFS_VOLUME:$NFS_PATH template=${tpl:-missing}"
-  for i in 1 2 3; do line+=" w$i=$(worker_host "$i") nfs$i=$(wval NFS_SERVER "$i")"; done
-  echo "$line"
+  local i tpl f
+  tpl=$(sha256sum "$_cfg_root/model/chat_template.jinja" | cut -c1-64) && [[ -n "$tpl" ]] ||
+    die "cannot hash model/chat_template.jinja (sha256sum)"
+  f=("model=$MODEL_ID@$(snapshot_rev)" "image=$(image_ident "$IMAGE")" "kit=$KIT_REF" "order=$ORDER" "engram=$WORKER_ENGRAM_DIR" "ablit=$ABLIT")
+  [[ "$ENGRAM_PACKED" != 1 ]] || f+=("packed=$ENGRAM_PACKED_DIR/$(packed_nodes)")
+  f+=("hf=$HF_CACHE" "nfs_path=$NFS_PATH" "nfs_volume=$NFS_VOLUME" "template=$tpl")
+  for i in 1 2 3; do f+=("w$i=$(worker_host "$i")" "nfs$i=$(wval NFS_SERVER "$i")"); done
+  printf '%q ' "${f[@]}"; echo
 }
