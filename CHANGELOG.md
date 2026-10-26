@@ -1,5 +1,9 @@
 # Changelog
 
+- **2026-10-26** -- `0026` (knapcio): the RDMA rings' queue pairs take the port's active MTU (`ibv_query_port`,
+  capped at 4096) as their path MTU instead of a fixed 4096. On a switched fabric whose Ethernet MTU is 1500 the RoCE
+  active MTU is 1024, and with the fixed 4096 every request failed (`RDMA=1`); with the port's MTU it serves. On a
+  fabric whose active MTU is 4096 the value is the same as before.
 - **2026-10-25** -- `ABLIT` (new, off by default): grafts drowzeys's Keys abliteration overlay (`attn.wo_b`,
   layers 10-35) onto the checkpoint before the rank caches are baked, applied via a new checkpoint view rather
   than the vendor's own index-remap script (our engine never reads `model.safetensors.index.json`). Live-validated:
