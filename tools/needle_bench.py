@@ -27,9 +27,15 @@ def arg(name, default):
 
 URL = arg("--url", "http://127.0.0.1:8888").rstrip("/")
 MODEL = arg("--model", "DeepSeek-V4.1-Flash-1017")
-LENS = [int(x) for x in arg("--lens", "4096,8192,16384,32768,65536,131072,262144,524288,1000000").split(",")]
-DEPTHS = [int(x) for x in arg("--depths", "0,25,50,75,100").split(",")]
-REPS = int(arg("--reps", "1"))
+try:
+    LENS = [int(x) for x in arg("--lens", "4096,8192,16384,32768,65536,131072,262144,524288,1000000").split(",")]
+    DEPTHS = [int(x) for x in arg("--depths", "0,25,50,75,100").split(",")]
+    REPS = int(arg("--reps", "1"))
+except ValueError as e:
+    sys.exit(f"--lens, --depths and --reps take whole numbers: {e}")
+# a grid with no cells, or cells that cannot be built, would pass with nothing checked
+if not all(x > 0 for x in LENS) or not all(0 <= d <= 100 for d in DEPTHS) or REPS < 1:
+    sys.exit("--lens takes positive token counts, --depths percentages from 0 to 100, --reps at least 1")
 JSON_OUT = arg("--json", None)
 
 FILLER = "The quick brown fox jumps over the lazy dog near the riverbank at dawn. "
@@ -50,16 +56,21 @@ def chat(prompt, max_tokens=20):
     return post(body)
 
 
-def text(r):
-    """The reply's text when r is a completion with non-empty text content, else None: an HTTP error, an error object,
-    no choices, a non-assistant message or empty content is never read as the model's reply."""
+def message(r):
+    """The reply's assistant message when r is a completion, else None: an HTTP error, an error object, no choices or
+    a message that is not the assistant's is never read as the model's reply."""
     try:
         m = r["choices"][0]["message"]
-        c = m["content"]
     except (KeyError, IndexError, TypeError):
         return None
-    if "error" in r or m.get("role", "assistant") != "assistant":
+    if "error" in r or not isinstance(m, dict) or m.get("role", "assistant") != "assistant":
         return None
+    return m
+
+
+def text(r):
+    """The reply's text when r is a completion with non-empty text content, else None."""
+    c = (message(r) or {}).get("content")
     return c if isinstance(c, str) and c else None
 
 
@@ -69,15 +80,18 @@ def problem(r):
 
 
 def prompt_tokens(r):
+    """usage.prompt_tokens when it is a positive count, else None."""
     usage = r.get("usage") if isinstance(r, dict) else None
-    return usage.get("prompt_tokens") if isinstance(usage, dict) else None
+    n = usage.get("prompt_tokens") if isinstance(usage, dict) else None
+    return n if isinstance(n, int) and not isinstance(n, bool) and n > 0 else None
 
 
 calib_repeats = 200
 calib = chat(FILLER * calib_repeats + "\nSay OK.", max_tokens=5)
 calib_tok = prompt_tokens(calib)
-if not calib_tok:
-    print("Calibration request failed:", calib)
+# the haystacks are cut from this count: only a completion's own count of the filler will do
+if message(calib) is None or calib_tok is None or calib_tok < calib_repeats:
+    print("Calibration request failed:", problem(calib) if message(calib) is None else f"prompt_tokens {calib_tok!r} for {calib_repeats} filler repeats")
     sys.exit(1)
 tokens_per_repeat = calib_tok / calib_repeats
 print(f"Calibration: {calib_tok} tokens for {calib_repeats} filler repeats ({tokens_per_repeat:.2f} tokens/repeat)\n", flush=True)

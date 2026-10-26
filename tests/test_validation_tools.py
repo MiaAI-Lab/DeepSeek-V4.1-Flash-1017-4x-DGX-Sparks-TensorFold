@@ -88,38 +88,51 @@ class ToolTest(unittest.TestCase):
 
 # ---------------------------------------------------------------- validate.py
 
-def validate_server(overrides=None, debug=None):
+def validate_server(overrides=None, debug=None, features=None):
     """A server that answers every validate.py check correctly; overrides maps a test prompt to its reply text or a
-    whole (status, body) answer, debug is the (status, body) answer to the TF_DEBUG_PROMPT_FILE prompt."""
+    whole (status, body) answer, debug is the (status, body) answer to the TF_DEBUG_PROMPT_FILE prompt, and
+    features(status, body) -> (status, body) rewrites the answers to the feature checks (text to long prompt)."""
     overrides = overrides or {}
 
     def respond(body):
         msgs = body["messages"]
-        last = msgs[-1]
-        c = last.get("content")
-        if isinstance(c, list):
-            kinds = {part.get("type") for part in c}
-            return completion("Red at first, then blue." if "video_url" in kinds else "A yellow circle.")
-        if last["role"] == "tool":
-            return completion("It is 21 degrees and clear in Tokyo.")
-        if DEBUG_MARK in c:
+        c = msgs[-1].get("content")
+        answer = feature_answer(body)
+        if answer is not None:
+            return features(*answer) if features else answer
+        if isinstance(c, str) and DEBUG_MARK in c:
             return debug or completion("Debug reply.")
-        if "capital of France" in c:
-            return completion("Paris")
-        if "17 * 23" in c:
-            return completion("391", reasoning_content="17 * 23 = 391.")
-        if "weather in Tokyo" in c:
-            # a valid tool call: empty content, the call in tool_calls
-            return completion("", tool_calls=[{"id": "call_0", "type": "function",
-                                               "function": {"name": "get_weather", "arguments": "{\"city\": \"Tokyo\"}"}}])
-        if "item 1234" in c:
-            return completion("8638")
         if c in PROMPTS:
             o = overrides.get(c, reply_to(c))
             return o if isinstance(o, tuple) else completion(o)
         return 400, {"error": {"message": "unexpected prompt"}}
 
     return respond
+
+
+def feature_answer(body):
+    """The correct answer to one of validate.py's feature checks, or None for any other prompt."""
+    msgs = body["messages"]
+    last = msgs[-1]
+    c = last.get("content")
+    if isinstance(c, list):
+        kinds = {part.get("type") for part in c}
+        return completion("Red at first, then blue." if "video_url" in kinds else "A yellow circle.")
+    if last["role"] == "tool":
+        return completion("It is 21 degrees and clear in Tokyo.")
+    if DEBUG_MARK in c:
+        return None
+    if "capital of France" in c:
+        return completion("Paris")
+    if "17 * 23" in c:
+        return completion("391", reasoning_content="17 * 23 = 391.")
+    if "weather in Tokyo" in c:
+        # a valid tool call: empty content, the call in tool_calls
+        return completion("", tool_calls=[{"id": "call_0", "type": "function",
+                                           "function": {"name": "get_weather", "arguments": "{\"city\": \"Tokyo\"}"}}])
+    if "item 1234" in c:
+        return completion("8638")
+    return None
 
 
 class ValidateCompare(ToolTest):
@@ -168,6 +181,19 @@ class ValidateCompare(ToolTest):
     def test_reference_not_json_fails(self):
         self.assertCompare(False, raw="not json")
 
+    def test_missing_reference_file_fails(self):
+        m = Mock(validate_server())
+        try:
+            code, out = run_tool("validate.py", [m.url, "--compare", os.path.join(tempfile.gettempdir(), "no-such-ref.json")])
+        finally:
+            m.close()
+        self.assertFailedCleanly(code, out, self.NAME)
+        self.assertIn("cannot read", check_line(out, self.NAME))
+
+    def test_reordered_reference_fails(self):
+        # the same replies in another order: each reply is compared with its own prompt's saved one
+        self.assertCompare(False, [reply_to(p) for p in reversed(PROMPTS)], why="0 of 8 equal")
+
     def test_wrong_reply_fails(self):
         self.assertCompare(False, [reply_to(p) for p in PROMPTS[:-1]] + ["something else"])
 
@@ -214,6 +240,57 @@ class ValidateConcurrent(ToolTest):
     def test_error_marked_reply_fails_without_compare(self):
         bad = {PROMPTS[3]: (200, {**completion(reply_to(PROMPTS[3]))[1], "error": {"message": "engine failed"}})}
         self.assertFailedCleanly(*self.run_validate(bad), self.NAME)
+
+
+class ValidateFeatures(ToolTest):
+    CHECKS = ["text", "thinking", "tool call", "image", "long prompt"]
+
+    def run_validate(self, features):
+        m = Mock(validate_server(features=features))
+        try:
+            return run_tool("validate.py", [m.url])
+        finally:
+            m.close()
+
+    def assertFeaturesFail(self, features, checks=None):
+        code, out = self.run_validate(features)
+        for name in checks or self.CHECKS:
+            self.assertTrue(check_line(out, name).startswith("FAIL"), f"{name}:\n{out}")
+        self.assertEqual(code, 1, out)
+        self.assertNotIn("Traceback", out)
+
+    def test_correct_features_pass(self):
+        code, out = self.run_validate(None)
+        for name in self.CHECKS + ["tool result"]:
+            self.assertTrue(check_line(out, name).startswith("PASS"), f"{name}:\n{out}")
+        self.assertEqual(code, 0, out)
+
+    def test_error_marked_feature_replies_fail(self):
+        # correct-looking replies that also carry an error: an error is never a reply
+        self.assertFeaturesFail(lambda st, b: (st, {**b, "error": {"message": "engine failed"}}))
+
+    def test_wrong_role_feature_replies_fail(self):
+        def user_role(st, b):
+            msg = {**b["choices"][0]["message"], "role": "user"}
+            return st, {**b, "choices": [{"message": msg}]}
+        self.assertFeaturesFail(user_role)
+
+    def test_malformed_tool_call_fails_cleanly(self):
+        def broken_call(st, b):
+            msg = b["choices"][0]["message"]
+            if msg.get("tool_calls"):
+                return st, {**b, "choices": [{"message": {**msg, "tool_calls": [{"function": None}]}}]}
+            return st, b
+        self.assertFeaturesFail(broken_call, ["tool call"])
+
+    def test_tool_call_arguments_not_json_fail_cleanly(self):
+        def bad_args(st, b):
+            msg = b["choices"][0]["message"]
+            if msg.get("tool_calls"):
+                call = {"id": "call_0", "type": "function", "function": {"name": "get_weather", "arguments": "{city: Tokyo"}}
+                return st, {**b, "choices": [{"message": {**msg, "tool_calls": [call]}}]}
+            return st, b
+        self.assertFeaturesFail(bad_args, ["tool call"])
 
 
 class ValidateDebugPrompt(ToolTest):
@@ -298,7 +375,8 @@ class Needle(unittest.TestCase):
     def run_needle(self, mode, extra=(), **kw):
         m = Mock(needle_server(mode, **kw))
         try:
-            code, out = run_tool("needle_bench.py", ["--url", m.url, "--lens", "64,128", "--depths", "0,50,100", *extra])
+            # extra first: needle_bench.py reads an option's first occurrence
+            code, out = run_tool("needle_bench.py", ["--url", m.url, *extra, "--lens", "64,128", "--depths", "0,50,100"])
         finally:
             m.close()
         return code, out
@@ -368,10 +446,46 @@ class Needle(unittest.TestCase):
             self.assertIn("invalid request", row["error"])
         self.assertEqual(out.count("error: "), 6, out)
 
-    def test_failed_calibration_stops(self):
-        code, out = self.run_needle("correct", calib=(400, {"error": {"message": "bad"}}))
-        self.assertNotEqual(code, 0, out)
+    def test_no_reply_diagnostics_kept(self):
+        # a reply without choices: the cell says so, with what the server sent
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "out.jsonl")
+            code, out = self.run_needle("no_choices", extra=("--json", path))
+            with open(path) as f:
+                rows = [json.loads(l) for l in f]
+        self.assertEqual(code, 1, out)
+        for row in rows:
+            self.assertTrue(row["error"].startswith("no reply text: "), row)
+            self.assertIn("no choices, code", row["error"])
+        self.assertEqual(out.count("no reply text: "), 6, out)
+
+    def assertCalibrationStops(self, calib):
+        code, out = self.run_needle("correct", calib=calib)
+        self.assertEqual(code, 1, out)
         self.assertIn("Calibration request failed", out)
+        self.assertNotIn("passed", out)
+        self.assertNotIn("Traceback", out)
+
+    def test_failed_calibration_stops(self):
+        self.assertCalibrationStops((400, {"error": {"message": "bad"}}))
+
+    def test_error_marked_calibration_stops(self):
+        self.assertCalibrationStops((200, {"error": {"message": "engine failed"}, "usage": {"prompt_tokens": 1}}))
+
+    def test_implausible_calibration_counts_stop(self):
+        for n in (1, -3200, 0, True, "3200", 3200.5):
+            with self.subTest(prompt_tokens=n):
+                self.assertCalibrationStops((200, {"choices": [{"message": {"role": "assistant", "content": "OK"}}],
+                                                   "usage": {"prompt_tokens": n}}))
+
+    def test_bad_grid_arguments_stop(self):
+        for extra in (("--reps", "0"), ("--reps", "-1"), ("--depths", "150"), ("--depths", "-5"), ("--lens", "0"),
+                      ("--lens", "abc"), ("--reps", "x")):
+            with self.subTest(args=extra):
+                code, out = self.run_needle("correct", extra=extra)
+                self.assertNotEqual(code, 0, out)
+                self.assertNotIn("passed", out)
+                self.assertNotIn("Traceback", out)
 
 
 if __name__ == "__main__":

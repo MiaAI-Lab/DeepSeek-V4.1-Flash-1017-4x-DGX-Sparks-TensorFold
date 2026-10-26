@@ -46,20 +46,41 @@ def check(name, ok, detail=""):
         failed.append(name)
 
 
-def text(r):
-    return ((r.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
-
-
-def reply_text(r):
-    """The reply's text when r is a completion with non-empty text content, else None (an HTTP error, an error
-    object, no choices, a non-assistant message, empty or non-text content)."""
+def message(r):
+    """The reply's assistant message when r is a completion, else None: an HTTP error, an error object, no choices or
+    a message that is not the assistant's is never read as the model's reply."""
     if not isinstance(r, dict) or "error" in r or not isinstance(r.get("choices"), list) or not r["choices"]:
         return None
     m = r["choices"][0].get("message") if isinstance(r["choices"][0], dict) else None
     if not isinstance(m, dict) or m.get("role", "assistant") != "assistant":
         return None
-    c = m.get("content")
-    return c if isinstance(c, str) and c else None
+    return m
+
+
+def text(r):
+    """The reply's text content, "" when there is none (a tool call's empty content, or no completion at all)."""
+    c = (message(r) or {}).get("content")
+    return c if isinstance(c, str) else ""
+
+
+def reply_text(r):
+    """The reply's text when r is a completion with non-empty text content, else None."""
+    return text(r) or None
+
+
+def prompt_tokens(r):
+    usage = r.get("usage") if isinstance(r, dict) else None
+    return usage.get("prompt_tokens") if isinstance(usage, dict) else None
+
+
+def tool_calls_ok(r, name, city):
+    """The reply calls the tool `name` with a city argument containing `city`."""
+    try:
+        calls = (message(r) or {}).get("tool_calls") or []
+        f = calls[0]["function"]
+        return f["name"] == name and city in json.loads(f["arguments"]).get("city", "").lower(), calls
+    except (KeyError, IndexError, TypeError, AttributeError, ValueError):
+        return False, []
 
 
 def png(w, h, pixel):
@@ -96,15 +117,14 @@ r = chat([{"role": "user", "content": "What is the capital of France? One word."
 check("text", "paris" in text(r).lower(), repr(text(r)[:60]) + f" {time.time() - t:.1f}s")
 
 r = chat([{"role": "user", "content": "What is 17 * 23? Answer with the number."}], 2000, thinking=True)
-m = (r.get("choices") or [{}])[0].get("message") or {}
-check("thinking", "391" in (m.get("content") or "") and len(m.get("reasoning_content") or "") > 0,
-      f"reasoning {len(m.get('reasoning_content') or '')} chars, answer {(m.get('content') or '')[:40]!r}")
+m = message(r) or {}
+reasoning = m.get("reasoning_content") if isinstance(m.get("reasoning_content"), str) else ""
+check("thinking", "391" in text(r) and len(reasoning) > 0, f"reasoning {len(reasoning)} chars, answer {text(r)[:40]!r}")
 
 tools = [{"type": "function", "function": {"name": "get_weather", "description": "Current weather of a city",
           "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}]
 r = chat([{"role": "user", "content": "What's the weather in Tokyo? Use the tool."}], 300, tools=tools)
-calls = ((r.get("choices") or [{}])[0].get("message") or {}).get("tool_calls") or []
-ok = bool(calls) and calls[0]["function"]["name"] == "get_weather" and "tokyo" in json.loads(calls[0]["function"]["arguments"]).get("city", "").lower()
+ok, calls = tool_calls_ok(r, "get_weather", "tokyo")
 check("tool call", ok, json.dumps(calls)[:120] if calls else json.dumps(r)[:160])
 if ok:
     msgs = [{"role": "user", "content": "What's the weather in Tokyo? Use the tool."},
@@ -135,15 +155,14 @@ if debug_file:
     t = time.time()
     r = chat([{"role": "user", "content": long_content}], 32)
     reply = reply_text(r)
-    usage = r.get("usage") if isinstance(r, dict) else None
     check("debug prompt (TF_DEBUG_PROMPT_FILE)", reply is not None,
-          f"{usage.get('prompt_tokens') if isinstance(usage, dict) else None} tokens, {(reply or '')[:80]!r}, {time.time() - t:.1f}s"
+          f"{prompt_tokens(r)} tokens, {(reply or '')[:80]!r}, {time.time() - t:.1f}s"
           + ("" if reply is not None else f", no reply text: {json.dumps(r)[:160]}"))
 else:
     long = " ".join(f"Item {i}: fox {i} jumps over dog {i * 7}." for i in range(1500))
     t = time.time()
     r = chat([{"role": "user", "content": long + "\nWhat is item 1234's dog number? The number only."}], 20)
-    check("long prompt", "8638" in text(r), f"{(r.get('usage') or {}).get('prompt_tokens')} tokens, {text(r)[:20]!r}, {time.time() - t:.1f}s")
+    check("long prompt", "8638" in text(r), f"{prompt_tokens(r)} tokens, {text(r)[:20]!r}, {time.time() - t:.1f}s")
 
 # ---------------------------------------------------------------- one at a time == several at once
 prompts = ["Write a haiku about the sea.", "List the first ten prime numbers.", "Explain TCP in two sentences.",
