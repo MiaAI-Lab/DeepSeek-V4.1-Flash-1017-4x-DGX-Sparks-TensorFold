@@ -9,6 +9,8 @@
 # Usage: ./stop.sh      Env: CONTAINER_NAME, PORT, WORKER, WORKER2 (see scripts/config.sh), STOP_TIMEOUT,
 #                       LOG_DIR, LOG_KEEP
 #   DRY_RUN=1 ./stop.sh   says what it would stop, and on which Spark, and stops nothing
+# Exits 1 when a rank could not be stopped or a worker could not be reached (its rank may still run), so
+# ./start.sh restart and scripts do not go on as if every Spark's GPU memory were free.
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
 source ./scripts/config.sh
@@ -20,16 +22,19 @@ workers=$(configured_workers)
 nw=$(wc -w <<<"$workers")
 declare -a there=()
 any=0
+unreached=0   # workers ssh could not reach: whatever runs there is still running, so stop.sh fails (exit 1)
 [[ -n "$workers" ]] || warn "WORKER is not set (scripts/local.sh): rank 1 was left alone"
 for i in $workers; do
   there[i]=0
   if ! worker "$i" true 2>/dev/null; then
     warn "cannot reach the worker ($(worker_host "$i")) over ssh: rank $i was left alone"
+    unreached=1
   elif worker "$i" "docker ps -a --format '{{.Names}}' | grep -qx '$CONTAINER_NAME'"; then
     there[i]=1; any=1
   fi
 done
 if (( here == 0 && any == 0 )); then
+  (( unreached == 0 )) || die "No container named $CONTAINER_NAME on the Sparks it reached; a worker it could not reach may still run one"
   if (( nw <= 1 )); then log "No container named $CONTAINER_NAME on either Spark: nothing to stop"
   else log "No container named $CONTAINER_NAME on any Spark: nothing to stop"; fi
   exit 0
@@ -80,5 +85,5 @@ for i in $workers; do if (( there[i] )); then stop_worker "$i" & wpids+=($!); fi
 if (( here )); then stop_here; fi
 failed=0
 for p in "${wpids[@]}"; do wait "$p" || failed=1; done
-(( failed == 0 )) || exit 0                             # a warning above said what is left
+(( failed == 0 && unreached == 0 )) || exit 1          # a warning above said what is left
 log "Stopped and removed $CONTAINER_NAME $where; its GPU memory is free again"
