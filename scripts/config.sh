@@ -217,7 +217,7 @@ prepared_state() {
   [[ "$ENGRAM_PACKED" != 1 ]] || f+=("packed=$ENGRAM_PACKED_DIR/$(packed_nodes)")
   f+=("hf=$HF_CACHE" "nfs_path=$NFS_PATH" "nfs_volume=$NFS_VOLUME" "template=$tpl")
   for i in 1 2 3; do f+=("w$i=$(worker_host "$i")" "nfs$i=$(wval NFS_SERVER "$i")"); done
-  (export LC_ALL=C; printf '%q ' "${f[@]}"; echo)   # (a prefix LC_ALL=C does not reach the printf builtin)
+  (export LC_ALL=C; printf '%q ' "${f[@]}"; echo)   # (a subshell: the caller's locale is left as it was)
 }
 # prepare.sh's last step: computed first and swapped in whole, so a failure leaves the previous marker as it was
 write_prepared_marker() {

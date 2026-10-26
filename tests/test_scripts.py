@@ -491,6 +491,17 @@ class PreparedState(ScriptTest):
         self.assertEqual(marker.read_text(), "model=valid-before\n")
         self.assertFalse(marker.with_name("prepared.new").exists(), out)
 
+    def test_failed_rename_keeps_the_previous_marker(self):
+        marker = self.home / ".local/state/dsv41-tensorfold/prepared"
+        marker.parent.mkdir(parents=True)
+        marker.write_text("model=valid-before\n")
+        fake = self.tmp / "bin" / "mv"
+        fake.write_text("#!/bin/sh\necho 'mv: cannot move' >&2\nexit 1\n")
+        fake.chmod(0o755)
+        code, out = self.bash('image_ident() { echo image-ident; }\nwrite_prepared_marker')
+        self.assertNotEqual(code, 0, out)
+        self.assertEqual(marker.read_text(), "model=valid-before\n")
+
     def test_existing_fields_still_change_marker(self):
         for var, value in [("ORDER", "0,1,2,3"), ("ABLIT", "1"), ("WORKER2", "w9")]:
             with self.subTest(var=var):
