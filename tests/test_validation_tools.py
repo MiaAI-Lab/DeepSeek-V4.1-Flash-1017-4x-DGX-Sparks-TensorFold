@@ -304,6 +304,8 @@ class ValidateFeatures(ToolTest):
             "city not a string": [{**good, "function": {"name": "get_weather", "arguments": "{\"city\": [\"Tokyo\"]}"}}],
             "a nameless call after a good one": [good, {**good, "id": "call_1", "function": {"name": "", "arguments": "{}"}}],
             "a name that is not a string": [good, {**good, "id": "call_1", "function": {"name": 7, "arguments": "{}"}}],
+            "a call to a tool not offered after a good one": [good, {**good, "id": "call_1", "function": {"name": "nonexistent_tool", "arguments": "{}"}}],
+            "a second call without the required city": [good, {**good, "id": "call_1", "function": {"name": "get_weather", "arguments": "{}"}}],
             "NaN in the arguments": [{**good, "function": {"name": "get_weather", "arguments": "{\"city\": \"Tokyo\", \"x\": NaN}"}}],
         }
         for case, calls in cases.items():

@@ -105,14 +105,15 @@ def well_formed_call(c):
 
 
 def tool_calls_ok(r, name, city):
-    """Every call in the reply is well formed, and the first calls the tool `name` with a city argument containing
-    `city`. Returns the calls only when they can be sent back as the conversation's next turn."""
+    """Every call in the reply is well formed and calls the one tool offered, `name`, with its required string `city`;
+    the first asks for `city`. Returns the calls only when they can be sent back as the conversation's next turn."""
     calls = (message(r) or {}).get("tool_calls")
     if not isinstance(calls, list) or not calls or not all(well_formed_call(c) for c in calls):
         return False, []
-    f = calls[0]["function"]
-    got = strict_json(f["arguments"]).get("city")
-    return f["name"] == name and isinstance(got, str) and city in got.lower(), calls
+    got = [strict_json(c["function"]["arguments"]).get("city") for c in calls]
+    if any(c["function"]["name"] != name for c in calls) or not all(isinstance(g, str) and g for g in got):
+        return False, []
+    return city in got[0].lower(), calls
 
 
 def png(w, h, pixel):
