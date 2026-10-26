@@ -292,6 +292,48 @@ class ValidateFeatures(ToolTest):
             return st, b
         self.assertFeaturesFail(bad_args, ["tool call"])
 
+    def test_malformed_tool_calls_fail(self):
+        good = {"id": "call_0", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\": \"Tokyo\"}"}}
+        cases = {
+            "type not function": [{**good, "type": "not-a-function"}],
+            "no id": [{k: v for k, v in good.items() if k != "id"}],
+            "empty id": [{**good, "id": ""}],
+            "no type": [{k: v for k, v in good.items() if k != "type"}],
+            "a null call after a good one": [good, None],
+            "arguments not an object": [{**good, "function": {"name": "get_weather", "arguments": "[\"Tokyo\"]"}}],
+            "city not a string": [{**good, "function": {"name": "get_weather", "arguments": "{\"city\": [\"Tokyo\"]}"}}],
+        }
+        for case, calls in cases.items():
+            with self.subTest(case=case):
+                def bad(st, b, calls=calls):
+                    msg = b["choices"][0]["message"]
+                    if msg.get("tool_calls"):
+                        return st, {**b, "choices": [{"message": {**msg, "tool_calls": calls}}]}
+                    return st, b
+                self.assertFeaturesFail(bad, ["tool call"])
+
+    def test_tool_call_with_null_content_passes(self):
+        def null_content(st, b):
+            msg = b["choices"][0]["message"]
+            if msg.get("tool_calls"):
+                return st, {**b, "choices": [{"message": {**msg, "content": None}}]}
+            return st, b
+        code, out = self.run_validate(null_content)
+        self.assertTrue(check_line(out, "tool call").startswith("PASS"), out)
+        self.assertEqual(code, 0, out)
+
+
+class ValidateArguments(unittest.TestCase):
+    def test_option_without_a_value_stops(self):
+        for argv in (["--model"], ["--compare"], ["--save"], ["http://127.0.0.1:9", "--model"],
+                     ["--model", "--compare", "f.json"]):
+            with self.subTest(args=argv):
+                code, out = run_tool("validate.py", argv)
+                self.assertNotEqual(code, 0, out)
+                self.assertIn("needs a value", out)
+                self.assertNotIn("Traceback", out)
+                self.assertNotIn("PASS", out)
+
 
 class ValidateDebugPrompt(ToolTest):
     NAME = "debug prompt"
@@ -486,6 +528,15 @@ class Needle(unittest.TestCase):
                 self.assertNotEqual(code, 0, out)
                 self.assertNotIn("passed", out)
                 self.assertNotIn("Traceback", out)
+
+    def test_option_without_a_value_stops(self):
+        for argv in (["--lens"], ["--depths"], ["--reps"], ["--model"], ["--url"], ["--reps", "--lens", "64"]):
+            with self.subTest(args=argv):
+                code, out = run_tool("needle_bench.py", argv)
+                self.assertNotEqual(code, 0, out)
+                self.assertIn("needs a value", out)
+                self.assertNotIn("Traceback", out)
+                self.assertNotIn("passed", out)
 
 
 if __name__ == "__main__":

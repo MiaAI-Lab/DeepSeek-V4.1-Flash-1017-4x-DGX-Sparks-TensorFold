@@ -18,10 +18,21 @@ import urllib.request
 import zlib
 
 args = sys.argv[1:]
+
+
+def arg(name, default):
+    if name not in args:
+        return default
+    i = args.index(name) + 1
+    if i >= len(args) or args[i].startswith("--"):
+        sys.exit(f"{name} needs a value")
+    return args[i]
+
+
 URL = args[0].rstrip("/") if args and not args[0].startswith("--") else "http://127.0.0.1:8888"
-MODEL = args[args.index("--model") + 1] if "--model" in args else "DeepSeek-V4.1-Flash-1017"
-SAVE = args[args.index("--save") + 1] if "--save" in args else None
-COMPARE = args[args.index("--compare") + 1] if "--compare" in args else None
+MODEL = arg("--model", "DeepSeek-V4.1-Flash-1017")
+SAVE = arg("--save", None)
+COMPARE = arg("--compare", None)
 failed = []
 
 
@@ -73,14 +84,28 @@ def prompt_tokens(r):
     return usage.get("prompt_tokens") if isinstance(usage, dict) else None
 
 
-def tool_calls_ok(r, name, city):
-    """The reply calls the tool `name` with a city argument containing `city`."""
+def well_formed_call(c):
+    """An OpenAI tool call: an id, type "function", and a function with a name and JSON-object arguments."""
+    if not isinstance(c, dict) or not isinstance(c.get("id"), str) or not c["id"] or c.get("type") != "function":
+        return False
+    f = c.get("function")
+    if not isinstance(f, dict) or not isinstance(f.get("name"), str) or not isinstance(f.get("arguments"), str):
+        return False
     try:
-        calls = (message(r) or {}).get("tool_calls") or []
-        f = calls[0]["function"]
-        return f["name"] == name and city in json.loads(f["arguments"]).get("city", "").lower(), calls
-    except (KeyError, IndexError, TypeError, AttributeError, ValueError):
+        return isinstance(json.loads(f["arguments"]), dict)
+    except ValueError:
+        return False
+
+
+def tool_calls_ok(r, name, city):
+    """Every call in the reply is well formed, and the first calls the tool `name` with a city argument containing
+    `city`. Returns the calls only when they can be sent back as the conversation's next turn."""
+    calls = (message(r) or {}).get("tool_calls")
+    if not isinstance(calls, list) or not calls or not all(well_formed_call(c) for c in calls):
         return False, []
+    f = calls[0]["function"]
+    got = json.loads(f["arguments"]).get("city")
+    return f["name"] == name and isinstance(got, str) and city in got.lower(), calls
 
 
 def png(w, h, pixel):

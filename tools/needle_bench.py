@@ -22,7 +22,12 @@ args = sys.argv[1:]
 
 
 def arg(name, default):
-    return args[args.index(name) + 1] if name in args else default
+    if name not in args:
+        return default
+    i = args.index(name) + 1
+    if i >= len(args) or args[i].startswith("--"):
+        sys.exit(f"{name} needs a value")
+    return args[i]
 
 
 URL = arg("--url", "http://127.0.0.1:8888").rstrip("/")
