@@ -1,4 +1,4 @@
-"""Regression tests for stop.sh.
+"""Regression tests for stop.sh and the ring's NCCL graph files under DRY_RUN=1.
 
 Offline: no Spark, GPU, Docker or network. Each test copies the scripts into a temporary folder and puts fake `ssh`,
 `docker`, `curl` and `getent` first on PATH. The fake ssh runs a worker's command locally with that worker's own HOME
@@ -206,6 +206,45 @@ class StopSh(ScriptTest):
         self.assertIn("nothing is stopped", out)
         for h in ["head", "w1", "w2", "w3"]:
             self.assertEqual(self.left(h), [NAME], h)
+
+
+class RingGraphs(ScriptTest):
+    BODY = """graph_xml() { echo "<graphs rank=\\"$1\\" cr=\\"$2\\" peer=\\"$3\\"/>"; }
+FABRIC=ring
+ring_graphs
+for r in 0 1 2 3; do echo "G$r=${NODE_GRAPH[r]:-}"; done"""
+
+    def graph_files(self):
+        found = sorted(str(p.relative_to(self.tmp)) for p in self.tmp.rglob("nccl-graph-*"))
+        return found
+
+    def test_graph_files_written_on_every_rank(self):
+        code, out = self.bash(self.BODY)
+        self.assertEqual(code, 0, out)
+        files = self.graph_files()
+        self.assertEqual(len(files), 12, files)   # 3 a rank: the ring and the two links
+        for r in range(4):
+            self.assertRegex(out, rf"G{r}=\S*nccl-graph-rank{r}\b")
+
+    def test_dry_run_writes_no_graph_files(self):
+        code, out = self.bash(self.BODY, {"DRY_RUN": "1"})
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.graph_files(), [])
+        ssh = (self.sim / "ssh.log").read_text() if (self.sim / "ssh.log").exists() else ""
+        self.assertNotIn("cat >", ssh)
+        self.assertNotIn("mkdir", ssh)
+        self.assertFalse((self.home / ".local/state/dsv41-tensorfold").exists())
+        # the printed docker commands still name each rank's graph files
+        for r in range(4):
+            self.assertRegex(out, rf"G{r}=\S*nccl-graph-rank{r}\b")
+        self.assertIn("DRY_RUN", out)
+
+    def test_dry_run_skips_a_worker_it_cannot_reach(self):
+        body = "WORKER_DOWN[2]=1\n" + self.BODY
+        code, out = self.bash(body, {"DRY_RUN": "1"})
+        self.assertEqual(code, 0, out)
+        self.assertIn("G2=\n", out)
+        self.assertEqual(self.graph_files(), [])
 
 
 if __name__ == "__main__":
