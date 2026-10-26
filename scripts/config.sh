@@ -204,12 +204,16 @@ model_in_container() {
 # The folder rank 0 serves (prepare.sh): the checkpoint's files linked, with the recipe's chat template.
 served_in_container() { echo "/hf/$DATA_SUB/model"; }
 
-# What scripts/prepare.sh last left ready (start.sh runs it again when this line changes).
+# What scripts/prepare.sh last left ready (start.sh runs it again when this line changes): with where the checkpoint is
+# (HF_CACHE), how the workers mount it (NFS_PATH, NFS_VOLUME, NFS_SERVER*) and the chat template it copies into the
+# served folder, each of which needs prepare.sh's steps again when it changes.
 PREPARED_MARKER="$STATE_DIR/prepared"
 prepared_state() {
-  local i line
+  local i line tpl
+  tpl=$(sha256sum "$_cfg_root/model/chat_template.jinja" 2>/dev/null | cut -c1-16 || true)
   line="model=$MODEL_ID@$(snapshot_rev) image=$(image_ident "$IMAGE") kit=$KIT_REF order=${ORDER} engram=$WORKER_ENGRAM_DIR ablit=$ABLIT"
   [[ "$ENGRAM_PACKED" != 1 ]] || line+=" packed=$ENGRAM_PACKED_DIR/$(packed_nodes)"
-  for i in 1 2 3; do line+=" w$i=$(worker_host "$i")"; done
+  line+=" hf=$HF_CACHE nfs=$NFS_VOLUME:$NFS_PATH template=${tpl:-missing}"
+  for i in 1 2 3; do line+=" w$i=$(worker_host "$i") nfs$i=$(wval NFS_SERVER "$i")"; done
   echo "$line"
 }

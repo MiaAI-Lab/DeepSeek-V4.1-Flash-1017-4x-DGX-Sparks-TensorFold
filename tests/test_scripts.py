@@ -1,4 +1,4 @@
-"""Regression tests for stop.sh and the ring's NCCL graph files under DRY_RUN=1.
+"""Regression tests for stop.sh, the ring's NCCL graph files under DRY_RUN=1, and the prepared marker.
 
 Offline: no Spark, GPU, Docker or network. Each test copies the scripts into a temporary folder and puts fake `ssh`,
 `docker`, `curl` and `getent` first on PATH. The fake ssh runs a worker's command locally with that worker's own HOME
@@ -245,6 +245,49 @@ for r in 0 1 2 3; do echo "G$r=${NODE_GRAPH[r]:-}"; done"""
         self.assertEqual(code, 0, out)
         self.assertIn("G2=\n", out)
         self.assertEqual(self.graph_files(), [])
+
+
+class PreparedState(ScriptTest):
+    BODY = 'image_ident() { echo image-ident; }\nprepared_state'
+
+    def state(self, extra=None):
+        code, out = self.bash(self.BODY, extra)
+        self.assertEqual(code, 0, out)
+        self.assertNoTraceback(out)
+        return out.strip()
+
+    def assertChanges(self, extra=None, edit=None):
+        before = self.state()
+        if edit:
+            edit()
+        after = self.state(extra)
+        self.assertNotEqual(before, after, f"the marker did not change: {after}")
+
+    def test_same_settings_same_marker(self):
+        self.assertEqual(self.state(), self.state())
+
+    def test_hf_cache_changes_marker(self):
+        self.assertChanges({"HF_CACHE": str(self.tmp / "other-hf")})
+
+    def test_nfs_path_changes_marker(self):
+        self.assertChanges({"NFS_PATH": "/other"})
+
+    def test_nfs_volume_changes_marker(self):
+        self.assertChanges({"NFS_VOLUME": "other-volume"})
+
+    def test_each_nfs_server_changes_marker(self):
+        for var in ["NFS_SERVER", "NFS_SERVER2", "NFS_SERVER3"]:
+            with self.subTest(var=var):
+                self.assertChanges({var: "10.9.9.9"})
+
+    def test_chat_template_changes_marker(self):
+        tpl = self.repo / "model" / "chat_template.jinja"
+        self.assertChanges(edit=lambda: tpl.write_text(tpl.read_text() + "\n{# changed #}\n"))
+
+    def test_existing_fields_still_change_marker(self):
+        for var, value in [("ORDER", "0,1,2,3"), ("ABLIT", "1"), ("WORKER2", "w9")]:
+            with self.subTest(var=var):
+                self.assertChanges({var: value})
 
 
 if __name__ == "__main__":
