@@ -1,5 +1,11 @@
 # Changelog
 
+- **2026-10-27** -- `0027` (manuel1618): `/metrics` publishes `prompt_tokens_cached_total`, the prompt tokens of
+  finished requests restored from kept prompt states, and repeats the split under vLLM's `prefix_cache_hits_total` /
+  `prefix_cache_queries_total`. Before, `/metrics` had only `prompt_tokens_total`, which counts cached and computed
+  prompt tokens alike, so a dashboard could not tell them apart (a 93 %-cached agent workload read as all computed).
+  The per-request `usage.prompt_tokens_details.cached_tokens` is unchanged. Backport of BertholomusAI's `ce0d9053`
+  to this recipe's engine pin, plus the one line that turns the series on for the DeepSeek-V4.1 engine.
 - **2026-10-26** -- `0026` (knapcio): the RDMA rings' queue pairs take the port's active MTU (`ibv_query_port`,
   capped at 4096) as their path MTU instead of a fixed 4096. On a switched fabric whose Ethernet MTU is 1500 the RoCE
   active MTU is 1024, and with the fixed 4096 every request failed (`RDMA=1`); with the port's MTU it serves. On a
