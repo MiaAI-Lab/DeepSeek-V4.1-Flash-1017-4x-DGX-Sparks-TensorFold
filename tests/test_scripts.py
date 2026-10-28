@@ -1,4 +1,4 @@
-"""Regression tests for stop.sh, ./start.sh restart, the ring's NCCL graph files under DRY_RUN=1, and the prepared marker.
+"""Regression tests for stop.sh (and its /health warning), ./start.sh restart and its smoke test, the ring's NCCL graph files under DRY_RUN=1, and the prepared marker.
 
 Offline: no Spark, GPU, Docker or network. Each test copies the scripts into a temporary folder and puts fake `ssh`,
 `docker`, `curl` and `getent` first on PATH. The fake ssh runs a worker's command locally with that worker's own HOME
@@ -66,7 +66,8 @@ esac
 """
 
 FAKE_CURL = """#!/bin/sh
-echo '{"requests_running": 0}'
+# fake curl: /health answers $SIM/health if it exists, else the native server's schema with nothing open
+if [ -e "$SIM/health" ]; then cat "$SIM/health"; else echo '{"status": "ok", "live": {"connections": 0, "waiting": 0}}'; fi
 """
 
 FAKE_GETENT = """#!/bin/sh
@@ -275,6 +276,38 @@ class StopSh(ScriptTest):
                     self.assertEqual(self.left(h), [NAME], h)
 
 
+class StopHealth(ScriptTest):
+    """stop.sh's warning about requests it cuts off, read from the native server's /health (live.connections counts
+    the running and the waiting ones)."""
+
+    def stop_with(self, health):
+        for h in ["head", "w1", "w2", "w3"]:
+            self.containers(h, NAME)
+        if health is not None:
+            (self.sim / "health").write_text(health)
+        return self.run_script(["stop.sh"])
+
+    def test_open_requests_warn(self):
+        code, out = self.stop_with('{"status": "ok", "live": {"connections": 4, "waiting": 1}}')
+        self.assertEqual(code, 0, out)
+        self.assertIn("4 request(s) open (running or waiting) will be cut off", out)
+
+    def test_nothing_open_no_warning(self):
+        code, out = self.stop_with(None)
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("cut off", out)
+
+    def test_unreadable_health_is_unknown_not_none(self):
+        cases = {"no answer": "", "an error page": "<html>401</html>", "another schema": '{"requests_running": 3}',
+                 "not a count": '{"live": {"connections": "4"}}', "a negative count": '{"live": {"connections": -1}}'}
+        for name, body in cases.items():
+            with self.subTest(name):
+                code, out = self.stop_with(body)
+                self.assertEqual(code, 0, out)
+                self.assertIn("could not read the open requests from /health", out)
+                self.assertNoTraceback(out)
+
+
 class StartRestart(ScriptTest):
     """./start.sh with only what needs a Spark replaced: the links (detect_links), flock, ss, free, hostname, curl's
     answers (the server ready, the smoke test's reply) and scripts/prepare.sh (it records that it ran)."""
@@ -283,8 +316,12 @@ class StartRestart(ScriptTest):
         "ss": "#!/bin/sh\nexit 0\n",
         "free": "#!/bin/sh\necho 'Mem: 128 1 1 0 0 120'\n",
         "hostname": "#!/bin/sh\necho 10.0.0.1\n",
-        "curl": "#!/bin/sh\ncase \"$*\" in *completions*) echo '{\"choices\": [{\"message\": {\"content\": \"OK\"}}], \"usage\": {\"completion_tokens\": 1}}' ;; "
-                "*) echo '{\"requests_running\": 0}' ;; esac\n",
+        # the smoke test's reply: $SIM/smoke if it exists, else a completion; with -w its HTTP status ($SIM/smoke_status
+        # or 200) on the last line, as curl prints it
+        "curl": "#!/bin/sh\ncase \"$*\" in *completions*)\n"
+                "  if [ -e \"$SIM/smoke\" ]; then cat \"$SIM/smoke\"; else printf '%s' '{\"choices\": [{\"message\": {\"role\": \"assistant\", \"content\": \"OK\"}}], \"usage\": {\"completion_tokens\": 1}}'; fi\n"
+                "  case \"$*\" in *http_code*) printf '\\n%s' \"$(cat \"$SIM/smoke_status\" 2>/dev/null || echo 200)\" ;; esac ;;\n"
+                "*) echo '{\"status\": \"ok\", \"live\": {\"connections\": 0, \"waiting\": 0}}' ;; esac\n",
     }
 
     def setUp(self):
@@ -318,6 +355,23 @@ node_order() { echo 0,1,2,3; }
         self.assertEqual(code, 0, out)
         self.assertEqual(sorted(self.launched()), ["head", "w1", "w2", "w3"], out)
         self.assertIn("is now LIVE", out)
+
+    def test_smoke_test_needs_a_real_completion(self):
+        ok_body = '{"choices": [{"message": {"role": "assistant", "content": "OK"}}], "usage": {"completion_tokens": 1}}'
+        cases = {"HTTP 500 with a completion's body": (ok_body, "500"),
+                 "HTTP 200 with an error object": ('{"error": {"message": "boom"}, "choices": [{"message": {"role": "assistant", "content": "OK"}}], "usage": {"completion_tokens": 1}}', "200"),
+                 "HTTP 200 without reply text": ('{"choices": [{"message": {"role": "assistant", "content": ""}}], "usage": {"completion_tokens": 0}}', "200"),
+                 "HTTP 200, not the assistant's": ('{"choices": [{"message": {"role": "user", "content": "OK"}}], "usage": {"completion_tokens": 1}}', "200")}
+        for name, (body, status) in cases.items():
+            with self.subTest(name):
+                (self.sim / "smoke").write_text(body)
+                (self.sim / "smoke_status").write_text(status)
+                code, out = self.run_script(["start.sh"], {"PREPARE": "0"})
+                self.assertNotEqual(code, 0, out)
+                self.assertIn("the smoke test request failed", out)
+                self.assertNotIn("is now LIVE", out)
+                for h in ["head", "w1", "w2", "w3"]:
+                    self.containers(h)
 
     def test_restart_stops_when_a_rank_cannot_be_stopped(self):
         for h in ["head", "w1", "w2", "w3"]:
