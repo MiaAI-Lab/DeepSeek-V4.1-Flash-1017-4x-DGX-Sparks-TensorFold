@@ -60,9 +60,19 @@ fi
 if [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null)" == true ]]; then
   api_host="$HOST"; [[ "$HOST" == 0.0.0.0 || "$HOST" == "::" ]] && api_host=127.0.0.1
   [[ "$api_host" == *:* ]] && api_host="[$api_host]"
-  busy=$(curl -s --max-time 3 "http://$api_host:$PORT/health" 2>/dev/null |
-         python3 -c 'import json,sys; print(json.load(sys.stdin).get("requests_running", 0))' 2>/dev/null || echo 0)
-  (( busy == 0 )) || warn "$busy request(s) still running will be cut off"
+  # /health's live.connections counts the requests running and waiting (the server's live.zig); "?" when it cannot
+  # be read (no answer, an HTTP error, an error reply, another schema), which is not the same as none
+  busy=$(curl -s --max-time 3 -w '\n%{http_code}' "http://$api_host:$PORT/health" 2>/dev/null |
+         python3 -c 'import json,sys
+body, _, code = sys.stdin.read().rpartition("\n")
+code == "200" or sys.exit(1)
+r = json.loads(body)
+type(r) is dict and r.get("error") is None or sys.exit(1)
+n = r["live"]["connections"]
+type(n) is int and n >= 0 or sys.exit(1)
+print(n)' 2>/dev/null) || busy="?"
+  if [[ "$busy" == "?" ]]; then warn "could not read the open requests from /health: any still running will be cut off"
+  elif (( busy > 0 )); then warn "$busy request(s) open (running or waiting) will be cut off"; fi
 fi
 if [[ "${DRY_RUN:-0}" == 1 ]]; then
   log "DRY_RUN=1: would stop and remove $CONTAINER_NAME $where (up to ${STOP_TIMEOUT:-30}s); nothing is stopped"

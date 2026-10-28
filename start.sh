@@ -197,12 +197,24 @@ log "Server answered after $((SECONDS - start))s"
 
 # ---------------------------------------------------------------- 5. smoke test
 step 5 "Smoke test: one chat completion through all 4 ranks"
-if smoke=$(curl -s --max-time 300 "$URL/v1/chat/completions" -H 'Content-Type: application/json' \
+# a pass needs HTTP 200, no error object and the assistant's reply text (curl -w adds the status as the last line)
+if smoke=$(curl -s --max-time 300 -w '\n%{http_code}' "$URL/v1/chat/completions" -H 'Content-Type: application/json' \
              -d "{\"model\": \"$SERVED_NAME\", \"max_tokens\": 16, \"temperature\": 0, \"chat_template_kwargs\": {\"enable_thinking\": false}, \"messages\": [{\"role\": \"user\", \"content\": \"Reply with OK.\"}]}" |
-           python3 -c 'import json,sys; r = json.load(sys.stdin); c = r["choices"][0]["message"].get("content") or ""; assert c.strip(); assert len(c.strip()) < 8 or len(set(c.strip())) > 2, "one repeated character"; print(repr(c.strip()[:40]) + ",", r["usage"]["completion_tokens"], "tokens")' 2>/dev/null); then
+           python3 -c 'import json,sys
+def no(why): sys.exit(why)
+body, _, code = sys.stdin.read().rpartition("\n")
+code == "200" or no("HTTP " + code)
+r = json.loads(body)
+r.get("error") is None or no("an error reply")
+m = r["choices"][0]["message"]
+m.get("role", "assistant") == "assistant" or no("not the assistant")
+c = (m.get("content") or "").strip()
+c or no("no reply text")
+len(c) < 8 or len(set(c)) > 2 or no("one repeated character")
+print(repr(c[:40]) + ",", r["usage"]["completion_tokens"], "tokens")' 2>/dev/null); then
   log "OK: $smoke"
 else
-  fail "the smoke test request failed (no reply text, or one character repeated); the ranks are still running"
+  fail "the smoke test request failed (an HTTP error, an error reply, no reply text, or one character repeated); the ranks are still running"
 fi
 IP=$(hostname -I 2>/dev/null | awk '{print $1}')
 [[ "$HOST" == 0.0.0.0 || "$HOST" == "::" ]] || IP="$HOST"
