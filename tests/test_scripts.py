@@ -66,8 +66,10 @@ esac
 """
 
 FAKE_CURL = """#!/bin/sh
-# fake curl: /health answers $SIM/health if it exists, else the native server's schema with nothing open
-if [ -e "$SIM/health" ]; then cat "$SIM/health"; else echo '{"status": "ok", "live": {"connections": 0, "waiting": 0}}'; fi
+# fake curl: /health answers $SIM/health if it exists, else the native server's schema with nothing open; with -w
+# its HTTP status ($SIM/health_status or 200) on the last line, as curl prints it
+if [ -e "$SIM/health" ]; then cat "$SIM/health"; else printf '%s' '{"status": "ok", "live": {"connections": 0, "waiting": 0}}'; fi
+case "$*" in *http_code*) printf '\n%s' "$(cat "$SIM/health_status" 2>/dev/null || echo 200)" ;; esac
 """
 
 FAKE_GETENT = """#!/bin/sh
@@ -299,13 +301,22 @@ class StopHealth(ScriptTest):
 
     def test_unreadable_health_is_unknown_not_none(self):
         cases = {"no answer": "", "an error page": "<html>401</html>", "another schema": '{"requests_running": 3}',
-                 "not a count": '{"live": {"connections": "4"}}', "a negative count": '{"live": {"connections": -1}}'}
+                 "not a count": '{"live": {"connections": "4"}}', "a negative count": '{"live": {"connections": -1}}',
+                 "an error reply": '{"error": {"message": "unauthorized"}, "live": {"connections": 0}}'}
         for name, body in cases.items():
             with self.subTest(name):
                 code, out = self.stop_with(body)
                 self.assertEqual(code, 0, out)
                 self.assertIn("could not read the open requests from /health", out)
                 self.assertNoTraceback(out)
+
+    def test_http_error_is_unknown_not_none(self):
+        for status in ["500", "302", "401"]:
+            with self.subTest(status):
+                (self.sim / "health_status").write_text(status)
+                code, out = self.stop_with('{"status": "ok", "live": {"connections": 0, "waiting": 0}}')
+                self.assertEqual(code, 0, out)
+                self.assertIn("could not read the open requests from /health", out)
 
     def test_stop_health_check_holds_with_python_optimizing(self):
         # the checks are no asserts: PYTHONOPTIMIZE would drop those
@@ -331,7 +342,8 @@ class StartRestart(ScriptTest):
                 "  if [ -e \"$SIM/smoke\" ]; then cat \"$SIM/smoke\"; else printf '%s' '{\"choices\": [{\"message\": {\"role\": \"assistant\", \"content\": \"OK\"}}], \"usage\": {\"completion_tokens\": 1}}'; fi\n"
                 "  case \"$*\" in *http_code*) printf '\\n%s' \"$(cat \"$SIM/smoke_status\" 2>/dev/null || echo 200)\" ;; esac\n"
                 "  if [ -e \"$SIM/smoke_exit\" ]; then exit \"$(cat \"$SIM/smoke_exit\")\"; fi ;;\n"
-                "*) echo '{\"status\": \"ok\", \"live\": {\"connections\": 0, \"waiting\": 0}}' ;; esac\n",
+                "*) printf '%s' '{\"status\": \"ok\", \"live\": {\"connections\": 0, \"waiting\": 0}}'\n"
+                "   case \"$*\" in *http_code*) printf '\\n200' ;; esac ;; esac\n",
     }
 
     def setUp(self):
