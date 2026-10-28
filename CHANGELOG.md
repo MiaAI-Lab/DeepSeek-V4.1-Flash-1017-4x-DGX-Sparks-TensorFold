@@ -2,10 +2,11 @@
 
 - **2026-10-28** -- (SvangenStudios) `stop.sh` reads the native server's `/health` schema: `live.connections`, the
   requests running and waiting. It used to read `requests_running`, which this server does not publish, so it never
-  warned before cutting requests off. A `/health` it cannot read now warns that the open requests are unknown instead
-  of reading as none. `start.sh`'s smoke test passes only on HTTP 200 with the assistant's reply and no `error`
-  object; an HTTP 500 or an error reply shaped like a completion used to end in "is now LIVE". Regression tests in
-  `tests/test_scripts.py` and `tests/test_start_smoke.py` (the real curl against a loopback HTTP server).
+  warned before cutting requests off. It takes the count only from an HTTP 200 without an `error` field; a `/health` it
+  cannot read now warns that the open requests are unknown instead of reading as none. `start.sh`'s smoke test passes
+  only on HTTP 200 with the assistant's reply and no `error` object; an HTTP 500 or an error reply shaped like a
+  completion used to end in "is now LIVE". Regression tests in `tests/test_scripts.py`, `tests/test_start_smoke.py` and
+  `tests/test_stop_health.py` (the real curl against a loopback HTTP server).
 - **2026-10-28** -- `0036`, structured output and required tool calls
   ([#6](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/issues/6)): upstream TensorFold's
   structured output (BobClawblaw's lane-core grammar and libtfgrammar, Ash Hart's required tool calls and grammar-aware
