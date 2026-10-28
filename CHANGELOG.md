@@ -1,5 +1,16 @@
 # Changelog
 
+- **2026-10-28** -- `0035` (Mia's AI Lab), the ranks' startup rendezvous
+  ([#3](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/issues/3)). Rank 0 used to open
+  its ports for workers 1, 2 and 3 one after another, each only once the worker before it had connected, and only
+  after its own weights had loaded; a worker retries its connect for 300 s after loading its own weights. So a worker
+  that loaded more than 300 s before the ones ahead of it exited with `error: ConnectFailed` (in #3: rank 3 loaded in
+  113 s, ranks 1 and 2 in ~843 s over NFS). Rank 0 now opens all three ports when it starts, before its weights load,
+  and a worker that connects early waits in its port's backlog. `TF_DS_CONNECT_S` sets a worker's retry window (300 s
+  by default; it now covers only rank 0's own start), and a worker that gives up logs the address and port it tried.
+  Diagnosed by shanedertrain in #3, reported by tlacerdap. Tested on this cluster with rank 0 and rank 3 started
+  together and ranks 1 and 2 nine minutes later: before `0035` rank 3 exited with `ConnectFailed` 427 s in; with it,
+  rank 3's connection waited on rank 0's port and the server answered 696 s in.
 - **2026-10-28** -- seven pull requests merged (#2, #4, #5, #8, #10, #13, #15), tested together on this cluster. Three
   of them had named their patch `0027`: #10's keeps the number, #8's is `0033` here and #2's `0034`. Against the image
   before them (`0001`-`0025`), on four GB10s with this cluster's switches: `tools/validate.py` passed and its 8 greedy

@@ -63,6 +63,7 @@ Codex-assisted).** At a glance:
 | `0032` | Mia's AI Lab | `0031` behind `TF_DS_PREFILL_YIELD` |
 | `0033` | Manuel ([manuel1618](https://github.com/manuel1618)) | `/metrics`' cached prompt-token counter, backported |
 | `0034` | Hironori Uchikawa ([uchkw](https://github.com/uchkw)) (Codex-assisted) | globally quiesce and futex-park idle RDMA proxies; wake before compute |
+| `0035` | Mia's AI Lab | rank 0's rendezvous ports open before its weights load, so a worker that loads first waits |
 
 The per-patch notes below also credit everyone who helped find or shape a specific fix along the way -- Hector's
 reviewer, Codex and Grok's live-bug diagnosis and design reviews, an outside reviewer's observation -- without
@@ -225,6 +226,12 @@ Written for this recipe by Mia's AI Lab:
 
 - `0032` (`0031` behind `TF_DS_PREFILL_YIELD=1`): the DeepSeek-V4.1 lane offers the host its chunk-at-a-time prefill
   only with that switch set; without it a prompt runs whole, as served before `0031`.
+- `0035` (the startup rendezvous): rank 0 opens every worker's port when it starts, before its weights load, and a
+  worker's connect window is `TF_DS_CONNECT_S`. The failure was reported by
+  [tlacerdap](https://github.com/tlacerdap) in
+  [#3](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/issues/3), and diagnosed there by
+  [shanedertrain](https://github.com/shanedertrain): rank 0's ports open one at a time, each after the worker before
+  it is in, and a worker that loads faster than those ahead of it gives up 300 s after its own load.
 
 ## Chat template
 

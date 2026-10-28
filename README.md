@@ -370,6 +370,7 @@ measurements and rationale: [`CHANGELOG.md`](CHANGELOG.md); authorship: [`CREDIT
 | `0032` | Mia's AI Lab | `TF_DS_PREFILL_YIELD` (on, this cluster) | `0031`'s admission only with the switch set; without it a prompt is read whole, as before |
 | `0033` | manuel1618 | -- (on) | `/metrics` adds `prompt_tokens_cached_total` (and vLLM's `prefix_cache_hits_total` / `prefix_cache_queries_total`): prompt tokens restored from kept prompt states |
 | `0034` | uchkw | -- (on with RDMA) | Parks idle RDMA proxies with a futex after all ranks quiesce; wakes before the next compute frame |
+| `0035` | Mia's AI Lab | `TF_DS_CONNECT_S` (300 s) | Rank 0 opens every worker's rendezvous port before loading its weights, so a worker that loads first waits there instead of exiting with `ConnectFailed` 300 s later ([#3](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/issues/3)) |
 
 ### Idle RDMA CPU use
 

@@ -1,0 +1,224 @@
+diff --git a/zig/src/families/dsv41/link.zig b/zig/src/families/dsv41/link.zig
+index e6a75eca..d10f845d 100644
+--- a/zig/src/families/dsv41/link.zig
++++ b/zig/src/families/dsv41/link.zig
+@@ -29,6 +29,13 @@ pub const Link = struct {
+ 
+     /// Rank 0: listen on `ip`:`port` and take the one peer's connection.
+     pub fn listen(ip: [4]u8, port: u16) !Link {
++        var p = try Ports.open(&.{ip}, port);
++        defer p.close();
++        return p.accept(1);
++    }
++
++    /// A socket bound to `ip`:`port` and listening (a backlog of one: the port is one peer's).
++    fn bound(ip: [4]u8, port: u16) !c.fd_t {
+         const fd = try socket();
+         errdefer _ = c.close(fd);
+         const one: c_int = 1;
+@@ -36,11 +43,7 @@ pub const Link = struct {
+         var a = addr(ip, port);
+         if (c.bind(fd, @ptrCast(&a), @sizeOf(c.sockaddr.in)) != 0) return error.BindFailed;
+         if (c.listen(fd, 1) != 0) return error.ListenFailed;
+-        const peer = c.accept(fd, null, null);
+-        if (peer < 0) return error.AcceptFailed;
+-        _ = c.close(fd);
+-        tune(peer);
+-        return .{ .fd = peer };
++        return fd;
+     }
+ 
+     /// Rank 1: connect to rank 0, retrying for up to `seconds` while it starts.
+@@ -141,6 +144,40 @@ pub const Link = struct {
+     }
+ };
+ 
++/// Rank 0's ports for its followers: follower g's (g = 1 to n) is `port + g - 1` on `ips[g - 1]`. All of them listen
++/// from `open` on, so a follower that is ready early connects into its port's backlog (the kernel completes the
++/// handshake) and waits there while rank 0 loads its weights or takes the followers before it.
++pub const Ports = struct {
++    fds: [3]c.fd_t = .{ -1, -1, -1 },
++
++    pub fn open(ips: []const [4]u8, port: u16) !Ports {
++        if (ips.len > 3) return error.TooManyFollowers;
++        var p: Ports = .{};
++        errdefer p.close();
++        for (ips, 0..) |ip, i| p.fds[i] = try Link.bound(ip, port + @as(u16, @intCast(i)));
++        return p;
++    }
++
++    /// Follower g's link (g from 1): its connection, waited for if it has not come yet; its port then closes.
++    pub fn accept(p: *Ports, g: usize) !Link {
++        const fd = p.fds[g - 1];
++        if (fd < 0) return error.NoSuchFollower;
++        const peer = c.accept(fd, null, null);
++        if (peer < 0) return error.AcceptFailed;
++        _ = c.close(fd);
++        p.fds[g - 1] = -1;
++        Link.tune(peer);
++        return .{ .fd = peer };
++    }
++
++    pub fn close(p: *Ports) void {
++        for (&p.fds) |*fd| if (fd.* >= 0) {
++            _ = c.close(fd.*);
++            fd.* = -1;
++        };
++    }
++};
++
+ /// "192.0.2.7" as four bytes.
+ pub fn parseIp(text: []const u8) ![4]u8 {
+     var out: [4]u8 = undefined;
+@@ -178,3 +215,37 @@ test "frames cross a loopback link in order" {
+     try std.testing.expectEqualStrings("late", try l.recvSpin(&buf, 0));
+     t.join();
+ }
++
++test "followers that are ready first wait in their ports' backlogs" {
++    // followers 3, 2 and 1 connect in that order, each giving up after a second, before rank 0 takes any of them:
++    // with one port listening at a time (each opened after the follower before it was in), 3 and 2 would give up
++    const io = std.testing.io;
++    const lo: [4]u8 = .{ 127, 0, 0, 1 };
++    const port: u16 = 29600 + @as(u16, @intCast(@mod(std.Io.Timestamp.now(io, .awake).nanoseconds, 300)));
++    var ports = try Ports.open(&.{ lo, lo, lo }, port);
++    defer ports.close();
++    const Follower = struct {
++        fn run(p: u16, g: u8, out: *?Link) void {
++            var l = Link.connect(std.testing.io, .{ 127, 0, 0, 1 }, p + g - 1, 1) catch return;
++            l.send(&.{g}) catch {
++                l.close();
++                return;
++            };
++            out.* = l;
++        }
++    };
++    var theirs: [3]?Link = .{ null, null, null };
++    defer for (&theirs) |*l| if (l.*) |*x| x.close();
++    for ([_]u8{ 3, 2, 1 }) |g| {
++        const t = try std.Thread.spawn(.{}, Follower.run, .{ port, g, &theirs[g - 1] });
++        t.join();
++    }
++    for (theirs) |l| try std.testing.expect(l != null);
++    var buf: [4]u8 = undefined;
++    for (1..4) |g| {
++        var l = try ports.accept(g);
++        defer l.close();
++        try std.testing.expectEqualSlices(u8, &.{@as(u8, @intCast(g))}, try l.recv(&buf));
++    }
++    try std.testing.expectError(error.NoSuchFollower, ports.accept(1));
++}
+diff --git a/zig/src/families/dsv41/model.zig b/zig/src/families/dsv41/model.zig
+index 33012f34..90ae861c 100644
+--- a/zig/src/families/dsv41/model.zig
++++ b/zig/src/families/dsv41/model.zig
+@@ -240,6 +240,10 @@ pub const Model = struct {
+         const c = &m.cfg;
+         m.stream = try cuda.Stream.init(d, true);
+         errdefer m.stream.deinit();
++        // rank 0's ports for its followers listen before its weights load: a follower that loads first connects and
++        // waits in its port's backlog instead of retrying until rank 0 and the followers before it are in
++        m.fan = try prompt2d.Fan.listenAt(o.master, o.listen, o.port, o.rank, o.world);
++        errdefer m.fan.close();
+ 
+         // the weights (and the DSpark blocks) from the lane's rank cache
+         m.cache_dir = try std.Io.Dir.cwd().openDir(io, o.cache_dir, .{ .iterate = true });
+@@ -289,9 +293,9 @@ pub const Model = struct {
+         errdefer m.w.deinit();
+         if (o.drafts and m.w.dspark == null) return error.NoDrafter;
+ 
+-        // the ranks' link and NCCL (rank 0 listens: rank 1 retries its connect while rank 0 loads)
+-        m.fan = try prompt2d.Fan.openAt(io, o.master, o.listen, o.port, o.rank, o.world);
+-        errdefer m.fan.close();
++        // the ranks' links (rank 0 takes its followers in order; a follower retries its connect for TF_DS_CONNECT_S)
++        // and NCCL
++        try m.fan.join(io, o.master, o.port, o.rank, o.world, prompt2d.connectSeconds());
+         m.comm = try m.fan.comm(o.rank, o.world);
+         errdefer m.comm.deinit();
+         // world 4 on a ring without a switch (TF_DS_LINK_GRAPHS: this node's NCCL graph files of its links to the previous
+diff --git a/zig/src/families/dsv41/prompt2d.zig b/zig/src/families/dsv41/prompt2d.zig
+index 799e3ab9..bce5c4bb 100644
+--- a/zig/src/families/dsv41/prompt2d.zig
++++ b/zig/src/families/dsv41/prompt2d.zig
+@@ -25,6 +25,7 @@ const rdma_mod = @import("rdma.zig");
+ const round2d = @import("round2d.zig");
+ const round_rows = @import("round.zig").max_rows;
+ const Link = @import("link.zig").Link;
++const Ports = @import("link.zig").Ports;
+ const Comm = @import("comm.zig").Comm;
+ 
+ const nccl = cuda.nccl;
+@@ -38,11 +39,20 @@ pub fn split(g: u32, world: u32) !plan.Split {
+     };
+ }
+ 
+-/// The links of a run and its NCCL world: rank 0 listens on PORT + g - 1 for follower g, one follower at a time (each
+-/// follower retries its connect while rank 0 gets to it), so two ranks link exactly as before (rank 1 on PORT).
+-/// NCCL's unique id goes from rank 0 down every link. (The port's link to N followers replaces this.)
++/// How long a follower retries its connect to rank 0: TF_DS_CONNECT_S seconds, 300 by default. Rank 0's ports listen
++/// from its start (Fan.listenAt, before its weights load), so this covers only rank 0's process starting late.
++pub fn connectSeconds() u32 {
++    const v = std.c.getenv("TF_DS_CONNECT_S") orelse return 300;
++    return std.fmt.parseInt(u32, std.mem.span(v), 10) catch 300;
++}
++
++/// The links of a run and its NCCL world: rank 0 listens on PORT + g - 1 for follower g, all the followers' ports at
++/// once, and takes them in order (a follower that is ready early waits in its port's backlog), so two ranks link
++/// exactly as before (rank 1 on PORT). NCCL's unique id goes from rank 0 down every link. (The port's link to N
++/// followers replaces this.)
+ pub const Fan = struct {
+     links: [3]?Link = .{ null, null, null },
++    ports: ?Ports = null, // rank 0's, from listenAt until join has taken every follower
+ 
+     pub fn open(io: std.Io, ip: [4]u8, port: u16, rank: u32, world: u32) !Fan {
+         return openAt(io, ip, null, port, rank, world);
+@@ -52,19 +62,43 @@ pub const Fan = struct {
+     /// node: on a ring without a switch a follower reaches the head at the address of the cable it comes in on), else
+     /// on `ip` for all of them.
+     pub fn openAt(io: std.Io, ip: [4]u8, listen: ?[3][4]u8, port: u16, rank: u32, world: u32) !Fan {
+-        var f: Fan = .{};
++        var f = try listenAt(ip, listen, port, rank, world);
+         errdefer f.close();
++        try f.join(io, ip, port, rank, world, connectSeconds());
++        return f;
++    }
++
++    /// openAt's first half: rank 0's ports for all its followers, listening from here on (Model.open calls it before
++    /// the weights load, so a follower that loads faster than rank 0 is not left retrying); nothing on a follower.
++    pub fn listenAt(ip: [4]u8, listen: ?[3][4]u8, port: u16, rank: u32, world: u32) !Fan {
+         if (world > 4) return error.UnsupportedWorld;
+-        if (world < 2) return f;
++        var f: Fan = .{};
++        if (rank != 0 or world < 2) return f;
++        var ips: [3][4]u8 = undefined;
++        for (ips[0 .. world - 1], 0..) |*a, i| a.* = if (listen) |l| l[i] else ip;
++        f.ports = try Ports.open(ips[0 .. world - 1], port);
++        return f;
++    }
++
++    /// openAt's second half: rank 0 takes its followers in order; a follower connects to its port on rank 0, retrying
++    /// for `seconds` while rank 0 starts.
++    pub fn join(f: *Fan, io: std.Io, ip: [4]u8, port: u16, rank: u32, world: u32, seconds: u32) !void {
++        if (world < 2) return;
+         if (rank == 0) {
+-            for (1..world) |g| f.links[g - 1] = try Link.listen(if (listen) |l| l[g - 1] else ip, port + @as(u16, @intCast(g - 1)));
+-        } else {
+-            f.links[0] = try Link.connect(io, ip, port + @as(u16, @intCast(rank - 1)), 300);
++            for (1..world) |g| f.links[g - 1] = try f.ports.?.accept(g);
++            f.ports = null;
++            return;
+         }
+-        return f;
++        const at = port + @as(u16, @intCast(rank - 1));
++        f.links[0] = Link.connect(io, ip, at, seconds) catch |err| {
++            if (err == error.ConnectFailed) std.log.err("rank {d}: rank 0 did not answer at {d}.{d}.{d}.{d}:{d} in {d} s (TF_DS_CONNECT_S)", .{ rank, ip[0], ip[1], ip[2], ip[3], at, seconds });
++            return err;
++        };
+     }
+ 
+     pub fn close(f: *Fan) void {
++        if (f.ports) |*p| p.close();
++        f.ports = null;
+         for (&f.links) |*l| {
+             if (l.*) |*x| x.close();
+             l.* = null;
