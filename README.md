@@ -113,7 +113,9 @@ Three opt-in switches (off by default) add more, with the same replies: `TF_DS_E
 +1.6 % to +2.8 % at 4 and +1.9 % to +8.2 % at 8 (measured with `TF_DS_PREFILL_YIELD=1` on as well, which costs nothing
 here). `TF_DS_PREFILL_YIELD=1` (off by default) keeps the other requests going while a long prompt is read: with 15
 requests decoding, a 25,000-token prompt stalled them ~7.5 s, ~1 s with it, for +35-41 % on that prompt's own time to
-first token. Before `zig/patches/0017`, 13 or more drafting requests at once failed.
+first token. With it, `0031` also admits new requests between a long prompt's chunks: a short request arriving 1 s into a
+cold 50,939-token prompt had its first token in 0.31 s, the long one in 13.5 s ([below](#cached-image-and-late-request-latency)).
+Before `zig/patches/0017`, 13 or more drafting requests at once failed.
 
 **Prefill, one request:**
 
@@ -356,14 +358,17 @@ measurements and rationale: [`CHANGELOG.md`](CHANGELOG.md); authorship: [`CREDIT
 | `0025` | Mia's AI Lab | `TF_DS_IDX_SHARD` (on, this cluster) | Indexer scores and picks only its own owned quarter of rows |
 | `0026` | knapcio | -- (on) | RDMA queue pairs use the port's active MTU (capped at 4096) instead of a fixed 4096, so RDMA works on a switch whose Ethernet MTU is 1500 |
 | `0027` | Thomas Kempka | -- (on) | A kept prompt state is keyed by the request's images as well as its tokens: an image's positions hold only its placeholder's token, so a chat with a picture in its history used to keep nothing and re-prefill every turn |
+| `0028` | Mauvis Ledford (backport) | `TF_SSE_KEEPALIVE_S` (15 s) | A silent stream (queued, or a long prompt being read) gets a heartbeat; upstream TensorFold's keepalives ([below](#native-streaming-keepalives)) |
+| `0029` | Mauvis Ledford (backport) | -- | The golden test harness drains the test server's stdout, so a full pipe cannot stall the suite |
 | `0030` | Mauvis Ledford | -- (on) | Skip vision encoding for image spans wholly covered by a verified cached prefix; a span crossing the cut is still encoded |
-| `0031` | Mauvis Ledford | -- (on) | Admit requests between prompt chunks, rotate partially filled prompts, and decode between chunks; coordinated update required on every TP rank |
-| `0027` | manuel1618 | -- (on) | `/metrics` adds `prompt_tokens_cached_total` (and vLLM's `prefix_cache_hits_total` / `prefix_cache_queries_total`): prompt tokens restored from kept prompt states |
-| `0027` | uchkw | -- (on with RDMA) | Parks idle RDMA proxies with a futex after all ranks quiesce; wakes before the next compute frame |
+| `0031` | Mauvis Ledford | `TF_DS_PREFILL_YIELD` (on, this cluster; `0032`) | Admit requests between prompt chunks, rotate partially filled prompts, and decode between chunks; coordinated update required on every TP rank |
+| `0032` | Mia's AI Lab | `TF_DS_PREFILL_YIELD` (on, this cluster) | `0031`'s admission only with the switch set; without it a prompt is read whole, as before |
+| `0033` | manuel1618 | -- (on) | `/metrics` adds `prompt_tokens_cached_total` (and vLLM's `prefix_cache_hits_total` / `prefix_cache_queries_total`): prompt tokens restored from kept prompt states |
+| `0034` | uchkw | -- (on with RDMA) | Parks idle RDMA proxies with a futex after all ranks quiesce; wakes before the next compute frame |
 
 ### Idle RDMA CPU use
 
-Patch `0027` stops the three RDMA proxy threads from busy-polling while the engine has no live streams.
+Patch `0034` stops the three RDMA proxy threads from busy-polling while the engine has no live streams.
 All ranks first synchronize their CUDA contexts and complete a READY/COMMIT handshake, then park the proxies
 in a Linux futex wait. A compute frame wakes them before GPU work is enqueued. Active RDMA polling and numerical
 kernels stay unchanged. All ranks must use the same image because the idle handshake adds a wire frame.
@@ -378,10 +383,10 @@ claim is made. Rebuild and replace all four images; weight conversion is not req
 ## Cached-image and late-request latency
 
 Patches `0030` and `0031` build on the image-keyed cache in `0027` ([PR #10](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/10)).
-The native CUDA server advances admitted prompts one existing 2,048-token chunk per turn. The four ranks select the
-same partially filled slot using a new control frame; install the same image on all ranks together. Other backends
-keep their whole-prefill interface. The standalone DeepSeek path retains `TF_DS_PREFILL_YIELD`; native HTTP admission
-uses bounded prefill automatically.
+With `TF_DS_PREFILL_YIELD=1` (on, this cluster; `0032` makes `0031` depend on it) the native CUDA server advances
+admitted prompts one existing 2,048-token chunk per turn; without it a prompt is read whole, as before. The four ranks
+select the same partially filled slot using a new control frame; install the same image on all ranks together. Other
+backends keep their whole-prefill interface.
 
 The cache optimization skips only image spans completely inside a usable restored prefix. Image placeholders remain
 masked for Engram, and images crossing the cached cut still run through the vision tower. New images and a cold

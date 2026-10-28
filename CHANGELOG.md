@@ -1,28 +1,42 @@
 # Changelog
 
-- **2026-10-26** -- `0027` (uchkw): park the three RDMA proxy threads when no streams are live.
-  Synchronize CUDA on every rank, agree READY/COMMIT, then block in futex waits; wake before compute and before stop/join.
-  Idle followers block on the control link instead of spinning. A four-GB10 ring measured about 300% CPU per node
-  before and 0.21-0.32% after; three idle/wake chat cycles passed. Numerical kernels and weights are unchanged.
-  All ranks must run the updated image (new idle control frame).
-
-- **2026-10-27** -- `0027` (manuel1618): `/metrics` publishes `prompt_tokens_cached_total`, the prompt tokens of
-  finished requests restored from kept prompt states, and repeats the split under vLLM's `prefix_cache_hits_total` /
-  `prefix_cache_queries_total`. Before, `/metrics` had only `prompt_tokens_total`, which counts cached and computed
-  prompt tokens alike, so a dashboard could not tell them apart (a 93 %-cached agent workload read as all computed).
-  The per-request `usage.prompt_tokens_details.cached_tokens` is unchanged. Backport of BertholomusAI's `ce0d9053`
-  to this recipe's engine pin, plus the one line that turns the series on for the DeepSeek-V4.1 engine.
-- **2026-10-28** -- `0030` skips vision work covered by a restored image-keyed prefix; `0031` admits and advances
-  requests between unchanged prompt chunks. Partially filled streams keep separate progress and image rows on the
-  head, and all TP ranks select the same slot when resuming. No arithmetic or checkpoint settings change.
-
-- **2026-10-27** -- image-keyed prompt cache (`0027`): a kept prompt state is keyed by the request's images as well as its
-  tokens, so a chat whose history holds a picture (a screenshot in a tool result, say) resumes its prefill instead of
-  re-running it from 0 on every turn. Measured on 4x GB10 TP4 (16 streams, 2.8k tok/s prefill): one 150k-token prompt
-  replayed in 0.64 s (82x) without an image and 53.6 s (1.0x) with one before this patch; both replay now. Text-only
-  requests are unchanged (the key is 0 for every prefix, so the tokens alone decide), a state kept for a picture is
-  never learned to disk, and it is not resumed by a prompt whose prefix holds no image.
-
+- **2026-10-28** -- seven pull requests merged (#2, #4, #5, #8, #10, #13, #15), tested together on this cluster.
+  Three of them had named their patch `0027`: #10's keeps the number, #8's is `0033` here and #2's `0034`. Against the
+  image before them (`0001`-`0025`), on four GB10s with this cluster's switches: `tools/validate.py` passed and its 8
+  greedy replies were equal; a 131k-token prompt read cold in 34.7 s as before; a follow-up resumed from the previous
+  turn's state gave the same tokens as the same prompt read cold (8 of 8); a 35-image prompt resent read in 1.0 s instead
+  of 20.1 s, its tokens equal; a 12-screenshot history resumed on every turn, and a changed or swapped picture resumed
+  none of what followed it; a 9-token request arriving 1 s into a cold 50,939-token prompt had its first token in 0.3 s;
+  idle CPU fell from ~310 % to 0.15-0.35 % a rank.
+- **2026-10-28** -- `0032` (Mia's AI Lab): `0031`'s bounded admission only with `TF_DS_PREFILL_YIELD=1` (on, this
+  cluster). Without the switch a prompt is read whole, as before `0031`, and its Engram read-ahead keeps running
+  between its chunks.
+- **2026-10-28** -- `0030`, `0031` (Mauvis Ledford): `0030` skips vision work covered by a restored image-keyed prefix;
+  `0031` admits and advances requests between unchanged prompt chunks. Partially filled streams keep separate progress
+  and image rows on the head, and all TP ranks select the same slot when resuming. No arithmetic or checkpoint
+  settings change.
+- **2026-10-28** -- `0028`, `0029` (upstream TensorFold, backported by Mauvis Ledford): native SSE keepalives, every 15
+  seconds during silent streaming generations (Chat/Responses use comments; Messages uses ping events;
+  `TF_SSE_KEEPALIVE_S=0` disables them), and the golden test server's stdout drained so a full log pipe cannot stall the
+  regression suite. Authorship and source commits are recorded in `CREDITS.md`.
+- **2026-10-27** -- `0033` (manuel1618, its PR's `0027`): `/metrics` publishes `prompt_tokens_cached_total`, the prompt
+  tokens of finished requests restored from kept prompt states, and repeats the split under vLLM's
+  `prefix_cache_hits_total` / `prefix_cache_queries_total`. Before, `/metrics` had only `prompt_tokens_total`, which
+  counts cached and computed prompt tokens alike, so a dashboard could not tell them apart (a 93 %-cached agent workload
+  read as all computed). The per-request `usage.prompt_tokens_details.cached_tokens` is unchanged. Backport of
+  BertholomusAI's `ce0d9053` to this recipe's engine pin, plus the one line that turns the series on for the
+  DeepSeek-V4.1 engine.
+- **2026-10-27** -- `0027` (Thomas Kempka), the image-keyed prompt cache: a kept prompt state is keyed by the request's
+  images as well as its tokens, so a chat whose history holds a picture (a screenshot in a tool result, say) resumes
+  its prefill instead of re-running it from 0 on every turn. Measured on 4x GB10 TP4 (16 streams, 2.8k tok/s prefill):
+  one 150k-token prompt replayed in 0.64 s (82x) without an image and 53.6 s (1.0x) with one before this patch; both
+  replay now. Text-only requests are unchanged (the key is 0 for every prefix, so the tokens alone decide), a state
+  kept for a picture is never learned to disk, and it is not resumed by a prompt whose prefix holds no image.
+- **2026-10-26** -- `0034` (uchkw, its PR's `0027`): park the three RDMA proxy threads when no streams are live.
+  Synchronize CUDA on every rank, agree READY/COMMIT, then block in futex waits; wake before compute and before
+  stop/join. Idle followers block on the control link instead of spinning. A four-GB10 ring measured about 300% CPU per
+  node before and 0.21-0.32% after; three idle/wake chat cycles passed. Numerical kernels and weights are unchanged.
+  All ranks must run the updated image (new idle control frame). Ported onto `0031` (its frame value is 11).
 - **2026-10-26** -- `stop.sh` exits 1 when a rank may still run (a rank it could not stop, or a Spark whose containers
   it could not list); `DRY_RUN=1` writes no NCCL graph files; the prepared marker also covers `HF_CACHE`, the NFS
   settings and the chat template, and a state that cannot be computed never reads as ready. Offline regression tests
@@ -71,10 +85,3 @@
   video input, tool-call arguments as objects.
 - **v0.1.0 (unreleased)** -- first version: DeepSeek-V4.1-Flash-1017 on four DGX Sparks, TP4, on BertholomusAI's
   DeepSeek-V4.1-Flash family of TensorFold's native engine.
-
-## Native server update — 2026-10-28
-
-- `0028`: TensorFold native SSE keepalives, enabled every 15 seconds during silent streaming generations.
-  Chat/Responses use comments; Messages uses ping events. `TF_SSE_KEEPALIVE_S=0` disables them.
-- `0029`: drain the golden test server stdout so a full log pipe cannot stall the regression suite.
-  Both fixes are upstream backports; authorship and source commits are recorded in `CREDITS.md`.
