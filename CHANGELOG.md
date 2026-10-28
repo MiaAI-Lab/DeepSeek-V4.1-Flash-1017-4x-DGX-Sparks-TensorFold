@@ -1,5 +1,15 @@
 # Changelog
 
+- **2026-10-28** -- `0037` (shalk3), the weight loader's read-ahead. A rank's weight file holds its tensors in the loader's
+  order and the loader read them one at a time, so every read waited on the disk: ~1 GB/s from an NVMe that reads
+  9 GB/s in parallel. Eight threads now `pread` the file in 32 MiB chunks up to 4 GiB past the loader's furthest
+  read and drop the bytes, so the loader's own reads come from the page cache; `TF_DS_LOAD_PREFETCH=0` turns it off.
+  Measured with `tf-dsv41-load` on one worker (rank 1, 81.2 GB, 1,578 tensors, the file evicted from the page cache
+  before each run): 83.4 s before, 27.2 / 27.3 / 27.4 s with it; the whole file pre-read into the page cache first
+  took 48.0 s (the cache and the landing weights compete for memory, hence the bounded lead). Every weight tensor's
+  sha256 is equal to the old loader's. On the ring: greedy replies byte-identical (3 prompts x 300 tokens) and the
+  same decode and prefill speed. Over NFS the network, not the reads, is the limit: it pays off with the weight file
+  on the worker's own disk.
 - **2026-10-28** -- `0036`, structured output and required tool calls
   ([#6](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/issues/6)): upstream TensorFold's
   structured output (BobClawblaw's lane-core grammar and libtfgrammar, Ash Hart's required tool calls and grammar-aware

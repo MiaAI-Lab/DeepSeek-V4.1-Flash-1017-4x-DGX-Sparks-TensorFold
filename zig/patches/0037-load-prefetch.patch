@@ -1,0 +1,109 @@
+diff --git a/zig/src/families/dsv41/weights.zig b/zig/src/families/dsv41/weights.zig
+index cbfe5d7..6563cca 100644
+--- a/zig/src/families/dsv41/weights.zig
++++ b/zig/src/families/dsv41/weights.zig
+@@ -286,7 +286,7 @@ pub const Weights = struct {
+ 
+ /// Where entries come from: the lane's rank cache file, or the checkpoint read by the split.
+ pub const Source = union(enum) {
+-    cache: struct { file: std.Io.File, index: *const rank_cache.Index, io: std.Io },
++    cache: struct { file: std.Io.File, index: *const rank_cache.Index, io: std.Io, pf: ?*Prefetch = null },
+     shards: *const checkpoint.Shards,
+ 
+     pub fn size(s: Source, key: []const u8) !usize {
+@@ -302,6 +302,7 @@ pub const Source = union(enum) {
+                 const e = c.index.get(key) orelse return error.MissingEntry;
+                 if (e.bytes != out.len) return error.BadSize;
+                 if (try c.file.readPositionalAll(c.io, out, e.offset) != out.len) return error.ShortRead;
++                if (c.pf) |pf| _ = pf.pos.fetchMax(e.offset + e.bytes, .monotonic);
+             },
+             .shards => |sh| try checkpoint.read(sh, key, out),
+         }
+@@ -318,6 +319,69 @@ pub fn strips(src: []const u8, out: []u8, kt: usize, nt: usize, tile: usize) voi
+     };
+ }
+ 
++/// The rank cache read ahead of the loader (TF_DS_LOAD_PREFETCH=0 turns it off). The file
++/// holds the entries in the loader's order and the loader reads them one at a time, so every read waited on the disk:
++/// ~1 GB/s from an NVMe that reads 9 GB/s in parallel, 83 s for a node's 81 GB. A few threads pread the file in chunks
++/// up to `lead` bytes past the loader's furthest read, so its reads come from the page cache (27 s). The threads'
++/// bytes are dropped: the loader's own reads, and so the weights, are unchanged. A bounded lead matters: with the
++/// whole file cached first the load took 48 s, the page cache and the landing weights competing for the same memory.
++const Prefetch = struct {
++    io: std.Io,
++    fd: std.posix.fd_t,
++    size: u64,
++    pos: std.atomic.Value(u64) = .init(0), // the end of the loader's furthest read
++    next: std.atomic.Value(u64) = .init(0), // the next chunk to read ahead
++    stop: std.atomic.Value(bool) = .init(false),
++    threads: [threads_n]std.Thread = undefined,
++    started: usize = 0,
++
++    const threads_n = 8;
++    const chunk: u64 = 32 << 20;
++    const lead: u64 = 4 << 30;
++
++    fn on() bool {
++        const v = std.c.getenv("TF_DS_LOAD_PREFETCH") orelse return true;
++        return !std.mem.eql(u8, std.mem.span(v), "0");
++    }
++
++    fn start(p: *Prefetch) void {
++        for (&p.threads) |*th| {
++            th.* = std.Thread.spawn(.{}, run, .{p}) catch break;
++            p.started += 1;
++        }
++    }
++
++    fn finish(p: *Prefetch) void {
++        p.stop.store(true, .monotonic);
++        for (p.threads[0..p.started]) |th| th.join();
++        p.started = 0;
++    }
++
++    fn run(p: *Prefetch) void {
++        const buf = std.heap.page_allocator.alloc(u8, chunk) catch return;
++        defer std.heap.page_allocator.free(buf);
++        while (!p.stop.load(.monotonic)) {
++            const at = p.next.fetchAdd(chunk, .monotonic);
++            if (at >= p.size) return;
++            while (at > p.pos.load(.monotonic) + lead) {
++                if (p.stop.load(.monotonic)) return;
++                std.Io.sleep(p.io, .fromMilliseconds(2), .awake) catch {};
++            }
++            const n: usize = @intCast(@min(chunk, p.size - at));
++            var done: usize = 0;
++            while (done < n) {
++                const r = std.c.pread(p.fd, buf.ptr + done, n - done, @intCast(at + done));
++                if (r < 0) {
++                    if (std.c.errno(r) == .INTR) continue;
++                    return; // the loader reads it itself
++                }
++                if (r == 0) return;
++                done += @intCast(r);
++            }
++        }
++    }
++};
++
+ const Loader = struct {
+     gpa: std.mem.Allocator,
+     d: *const cuda.Driver,
+@@ -957,7 +1021,17 @@ pub fn load(gpa: std.mem.Allocator, d: *const cuda.Driver, src: Source, c: Confi
+     var w: Weights = .{ .gpa = gpa };
+     errdefer w.deinit();
+     var L: Loader = .{ .gpa = gpa, .d = d, .src = src, .w = &w };
++    var pf: Prefetch = undefined;
++    var pf_on = false;
++    if (src == .cache and Prefetch.on()) {
++        const rc = src.cache;
++        pf = .{ .io = rc.io, .fd = rc.file.handle, .size = rc.index.data_end };
++        L.src.cache.pf = &pf;
++        pf.start();
++        pf_on = true;
++    }
+     defer {
++        if (pf_on) pf.finish();
+         L.host.deinit(gpa);
+         L.aux.deinit(gpa);
+     }
