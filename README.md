@@ -46,7 +46,10 @@ rank's rendezvous address). Full list: [Credits](#credits) and [`CREDITS.md`](CR
 
 - Checkpoint: `deepseek-ai/DeepSeek-V4.1-Flash-1017` @ `1bae0e10`, ~510 GB, downloaded once on spark1; the other three
   Sparks read it, and their weight files, from spark1 over NFS
-- API model id: `DeepSeek-V4.1-Flash-1017`, port 8888
+- API model id: `DeepSeek-V4.1-Flash-1017`, port 8888. Not on this engine pin yet: structured output
+  (`response_format` with `json_schema` or `json_object`, and the `guided_*` fields) and `tool_choice` set to
+  `"required"` or to a named function return HTTP 400; `tool_choice: "auto"` works
+  ([#6](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/issues/6))
 - Engine: TensorFold native (Zig 0.17.0), BertholomusAI's `dsv41` family, plus [`zig/patches`](zig/patches):
   DeepSeek's native FP8 / MXFP4 weights, the ring's node order and links, video input, tool-call arguments
 - One command on spark1: `./start.sh` (a switch) or `./start-switchless.sh` (a ring) sets up all four Sparks and
