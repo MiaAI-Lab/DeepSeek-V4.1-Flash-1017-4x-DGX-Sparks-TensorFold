@@ -330,8 +330,10 @@ class ValidateFeatures(ToolTest):
 
 class ValidateArguments(unittest.TestCase):
     def test_option_without_a_value_stops(self):
-        for argv in (["--model"], ["--compare"], ["--save"], ["http://127.0.0.1:9", "--model"],
-                     ["--model", "--compare", "f.json"]):
+        # every case names a dead URL first: a tool that misreads its options must not reach a live server
+        dead = "http://127.0.0.1:9"
+        for argv in ([dead, "--model"], [dead, "--compare"], [dead, "--save"],
+                     [dead, "--model", "--compare", "f.json"]):
             with self.subTest(args=argv):
                 code, out = run_tool("validate.py", argv)
                 self.assertNotEqual(code, 0, out)
@@ -535,7 +537,11 @@ class Needle(unittest.TestCase):
                 self.assertNotIn("Traceback", out)
 
     def test_option_without_a_value_stops(self):
-        for argv in (["--lens"], ["--depths"], ["--reps"], ["--model"], ["--url"], ["--reps", "--lens", "64"]):
+        # each case but --url's own names a dead URL first: a tool that misreads its options must not reach a live
+        # server (the default grid runs to 1M tokens)
+        dead = ["--url", "http://127.0.0.1:9"]
+        for argv in (dead + ["--lens"], dead + ["--depths"], dead + ["--reps"], dead + ["--model"], ["--url"],
+                     dead + ["--reps", "--lens", "64"]):
             with self.subTest(args=argv):
                 code, out = run_tool("needle_bench.py", argv)
                 self.assertNotEqual(code, 0, out)
