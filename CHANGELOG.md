@@ -1,5 +1,9 @@
 # Changelog
 
+- **2026-10-29** -- (SvangenStudios) `start.sh` puts an IPv6 address in brackets in the URLs it builds: the one
+  its readiness and smoke checks call, and the API address it prints when the server is live. `HOST=::1` used to give
+  `http://::1:8888`, which curl cannot call. The engine's own `--host` stays the raw address, and `0.0.0.0` and `::`
+  still map to `127.0.0.1` for the checks. Regression tests in `tests/test_start_urls.py`.
 - **2026-10-28** -- `0036`, structured output and required tool calls
   ([#6](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/issues/6)): upstream TensorFold's
   structured output (BobClawblaw's lane-core grammar and libtfgrammar, Ash Hart's required tool calls and grammar-aware
