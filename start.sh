@@ -137,18 +137,27 @@ KIT=/hf/$KIT_SUB/kit
 FOLLOW="--pool $POOL --context $CONTEXT --engram $MODEL_ARG --token-map $DATA/dsv41_token_map.json --drafts $DRAFTS --round-rows $ROUND_ROWS --streams $PARALLEL"
 FOLLOW+=" --graphs $GRAPHS --side $SIDE --prefetch $PREFETCH --aio $ENGRAM_AIO"
 step 3 "Launch: container $CONTAINER_NAME, ranks 3 to 1 on the workers, then rank 0 here"
+IFS=, read -r -a ORD <<<"$NODE_ORDER"
 for i in 3 2 1; do
+  # its weight file from its own disk when the copy there (prepare.sh) matches this Spark's, else over NFS
+  rank_dir="$DATA/rank-cache"; rank_mount=""
+  rf=""; [[ "$RANK_LOCAL" != 1 ]] || rf=$(rank_file "${ORD[i]}")
+  if [[ -n "$rf" ]] && worker "$i" "[[ \$(stat -c %s $WORKER_RANK_DIR/${rf##*/} 2>/dev/null) == $(stat -c %s "$rf") ]]" 2>/dev/null; then
+    rank_dir=/rank-local; rank_mount="-v $WORKER_RANK_DIR:/rank-local:ro"
+  elif [[ "$RANK_LOCAL" == 1 ]]; then
+    warn "rank $i reads its weight file over NFS: no matching copy in $WORKER_RANK_DIR on $(worker_host "$i") (scripts/prepare.sh makes one)"
+  fi
   # Engram's tables from the worker's own disk (prepare.sh), the rest over NFS; with packed shards the tables' headers
   # come over NFS and the rows from the shards on the worker's disk
   if [[ "$ENGRAM_PACKED" == 1 ]]; then
-    cmd="tf-dsv41-lanes $MODEL_ARG $DATA/rank-cache $i 4 ${LINK_HEAD_ADDR[i]:-$MASTER_ADDR} $MASTER_PORT $KIT $FOLLOW"
+    cmd="tf-dsv41-lanes $MODEL_ARG $rank_dir $i 4 ${LINK_HEAD_ADDR[i]:-$MASTER_ADDR} $MASTER_PORT $KIT $FOLLOW"
     engram_mount="-v $ENGRAM_PACKED_DIR:/engram-packed:ro"
   else
-    cmd="tf-dsv41-lanes $MODEL_ARG $DATA/rank-cache $i 4 ${LINK_HEAD_ADDR[i]:-$MASTER_ADDR} $MASTER_PORT $KIT ${FOLLOW/--engram $MODEL_ARG/--engram /engram}"
+    cmd="tf-dsv41-lanes $MODEL_ARG $rank_dir $i 4 ${LINK_HEAD_ADDR[i]:-$MASTER_ADDR} $MASTER_PORT $KIT ${FOLLOW/--engram $MODEL_ARG/--engram /engram}"
     engram_mount="-v $WORKER_ENGRAM_DIR:/engram:ro"
   fi
   [[ "$RDMA" == 0 ]] || cmd+=" --rdma ${NODE_HCAS[i]}"   # this node's RoCE devices
-  remote="mkdir -p \$HOME/.cache/dsv41-tensorfold && docker run -d --name $CONTAINER_NAME $RUN_ARGS -v $NFS_VOLUME:/hf:ro $engram_mount $(envs "${ENGINE_ENV[@]}") $(rank_nccl_env "$i") $IMAGE $cmd"
+  remote="mkdir -p \$HOME/.cache/dsv41-tensorfold && docker run -d --name $CONTAINER_NAME $RUN_ARGS -v $NFS_VOLUME:/hf:ro $engram_mount $rank_mount $(envs "${ENGINE_ENV[@]}") $(rank_nccl_env "$i") $IMAGE $cmd"
   if (( DRY )); then printf '[dry-run] rank %s on %s:\n  %s\n' "$i" "$(worker_host "$i")" "$remote"; continue; fi
   log "Rank $i on $(worker_host "$i"): $cmd"
   worker "$i" "$remote" >/dev/null || die "could not start rank $i on $(worker_host "$i")"

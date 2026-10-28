@@ -219,5 +219,24 @@ for i in 1 2 3; do
     die "copying Engram's tables to $(worker_host "$i") failed"
 done
 
+# ---------------------------------------------------------------- 8. each worker's weight file on its disk
+# start.sh mounts it when it matches this Spark's copy, so a start reads no weights over NFS (RANK_LOCAL=0: none)
+IFS=, read -r -a ord <<<"$(node_order)"
+for i in 1 2 3; do
+  [[ "$RANK_LOCAL" == 1 ]] || break
+  rf=$(rank_file "${ord[i]}"); [[ -n "$rf" ]] || die "no weight file of node ${ord[i]} in $DATA_DIR/rank-cache"
+  name=${rf##*/}; size=$(stat -c %s "$rf")
+  have=$(worker "$i" "stat -c %s $WORKER_RANK_DIR/$name 2>/dev/null || echo 0")
+  if [[ "$have" == "$size" ]]; then log "Worker $i ($(worker_host "$i")): its weight file on its disk"; continue; fi
+  free=$(worker "$i" "mkdir -p $WORKER_RANK_DIR && df -B1 --output=avail $WORKER_RANK_DIR | tail -1")
+  if ! (( ${free:-0} > size + 10 * 1024 ** 3 )); then
+    warn "$(worker_host "$i") has $(( ${free:-0} / 1024 ** 3 )) GiB free in WORKER_RANK_DIR, its weight file $(( size / 1024 ** 3 )) GiB and 10 to spare: rank $i keeps reading it over NFS"
+    continue
+  fi
+  log "Worker $i ($(worker_host "$i")): copying its weight file to its disk ($(( size / 1024 ** 3 )) GiB over NFS, once)"
+  worker "$i" "docker run --rm --network none --user \$(id -u):\$(id -g) -v '$NFS_VOLUME:/hf:ro' -v $WORKER_RANK_DIR:/out --entrypoint bash '$BASE_IMAGE' -c 'cp /hf/$DATA_SUB/rank-cache/$name /out/$name.part && mv /out/$name.part /out/$name'" ||
+    die "copying the weight file to $(worker_host "$i") failed"
+done
+
 write_prepared_marker || die "cannot record the prepared state (the previous marker is left as it was): see the error above"
 log "Done: all 4 Sparks are ready. Start the server with ./start.sh (port $PORT)."

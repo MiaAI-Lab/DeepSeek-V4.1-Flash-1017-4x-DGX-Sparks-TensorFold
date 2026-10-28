@@ -172,6 +172,14 @@ NFS_VOLUME="${NFS_VOLUME:-dsv41-hf}"
 # random 4 KiB rows from them, which over NFS took ~10 ms each and most of the round. prepare.sh copies them there once
 # (from the NFS volume); the main weights and the weight files still load over NFS. A path on the worker.
 WORKER_ENGRAM_DIR="${WORKER_ENGRAM_DIR:-\$HOME/.cache/dsv41-tensorfold/engram-${MODEL_REVISION:0:8}}"
+# Each worker's own weight file on its own disk: read over NFS, a worker's ~77-81 GB file was most of a start (~0.7
+# GB/s over a CX7 cable, ~0.27 GB/s over a 2.5 GbE LAN). prepare.sh copies the file each worker reads there once (a
+# worker short of disk keeps NFS, with a warning); start.sh mounts the copy when its name and size match this Spark's,
+# else that worker reads over NFS as before. RANK_LOCAL=0: no copies, every worker reads over NFS. A path on the worker.
+RANK_LOCAL="${RANK_LOCAL:-1}"
+WORKER_RANK_DIR="${WORKER_RANK_DIR:-\$HOME/.cache/dsv41-tensorfold/rank-cache-${DATA_SUB//\//-}}"
+# rank_file <node>: this Spark's weight file of 2D node <node> (its name carries the index's hash), empty if none
+rank_file() { local f; for f in "$DATA_DIR"/rank-cache/rank"$1"of4-*.bin; do [[ -f "$f" ]] && { echo "$f"; return 0; }; done; return 0; }
 # With ENGRAM_PACKED=1 the packed shards replace that copy, on every Spark's own disk (this one's too): a path on each.
 ENGRAM_PACKED_DIR="${ENGRAM_PACKED_DIR:-\$HOME/.cache/dsv41-tensorfold/engram-packed-${MODEL_REVISION:0:8}}"
 packed_dir_here() { echo "${ENGRAM_PACKED_DIR//\$HOME/$HOME}"; }
