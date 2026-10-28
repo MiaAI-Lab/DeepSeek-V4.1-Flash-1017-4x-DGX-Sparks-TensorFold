@@ -1,3 +1,6 @@
+diff --git a/zig/src/families/dsv41/idle_gate.zig b/zig/src/families/dsv41/idle_gate.zig
+new file mode 100644
+index 00000000..b6c8d4b7
 --- /dev/null
 +++ b/zig/src/families/dsv41/idle_gate.zig
 @@ -0,0 +1,84 @@
@@ -85,66 +88,20 @@
 +        try ctx.done.wait();
 +    }
 +}
---- a/zig/src/families/dsv41/rdma.zig
-+++ b/zig/src/families/dsv41/rdma.zig
-@@ -19,6 +19,7 @@
- const cuda = @import("cuda");
- const fabric = @import("fabric");
- const seqs = @import("rdma_seq.zig");
-+const IdleGate = @import("idle_gate.zig").Gate;
- 
- const vabi = fabric.verbs_abi;
- const Verbs = fabric.verbs.Verbs;
-@@ -234,6 +235,7 @@
-     jobs: [2 * max_ranks]Job = undefined, // the relays this rank runs (on a ring of four: two)
-     n_jobs: u32 = 0,
-     proxy: ?std.Thread = null,
-+    idle_gate: IdleGate = .{},
-     running: std.atomic.Value(bool) = .init(false),
-     failed: std.atomic.Value(bool) = .init(false),
-     why: [128]u8 = @splat(0),
-@@ -468,9 +470,16 @@
-     }
- 
-     pub fn stop(r: *Ring) void {
--        if (r.running.swap(false, .acq_rel)) if (r.proxy) |t| t.join();
-+        if (r.running.swap(false, .acq_rel)) {
-+            r.idle_gate.wake(); // a parked proxy must wake before join
-+            if (r.proxy) |t| t.join();
-+        }
-         r.proxy = null;
-     }
-+
-+    /// Only the CPU control protocol calls these at globally quiescent boundaries.
-+    pub fn park(r: *Ring) void { r.idle_gate.park(); }
-+    pub fn wake(r: *Ring) void { r.idle_gate.wake(); }
- 
-     /// Every wait on this rank gives up from now on (a watchdog lost a peer); `failure` says why.
-     pub fn abort(r: *Ring, why: []const u8) void {
-@@ -511,6 +520,11 @@
-         var posted: u64 = 0;
-         var wc: [64]vabi.Wc = undefined;
-         while (r.running.load(.monotonic)) {
-+            r.idle_gate.wait() catch {
-+                r.fail("RDMA idle futex wait failed");
-+                return;
-+            };
-+            if (!r.running.load(.acquire)) break;
-             const ring = @atomicLoad(u64, r.doorbell(), .acquire);
-             // a relaying rank's own sequence q goes out once its relays of every sequence up to q - (slots - 1) are
-             // done: an owner sends q + 1 (into the slot of q + 1 - slots) only after collecting this rank's q
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index ad742c17..49be25bd 100644
 --- a/zig/src/families/dsv41/lanes.zig
 +++ b/zig/src/families/dsv41/lanes.zig
-@@ -37,7 +37,7 @@
+@@ -37,7 +37,7 @@ pub const image_piece = 32 << 10;
  pub var logits_sha = false;
  
  /// The primitives rank 0 sends rank 1 (each frame: kind u8, step u64, its fields little-endian).
--pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9 };
-+pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9, rdma_idle = 10 };
+-pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9, fill_resume = 10 };
++pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9, fill_resume = 10, rdma_idle = 11 };
  
  /// A frame being written.
  pub const Wire = struct {
-@@ -310,6 +310,7 @@
+@@ -324,6 +324,7 @@ pub const Lanes = struct {
      peer: ?link.Link, // rank 1 (null: one rank); every follower gets each frame (Model.followers)
      vision: ?*@import("vision.zig").Vision = null, // rank 0's tower (a vision checkpoint served with its kit's vision/)
      step: u64 = 0,
@@ -152,7 +109,7 @@
      wire: Wire = .{},
      streams: std.AutoHashMapUnmanaged(*const lanes.Stream, Lane) = .empty,
      wc: [window_rows]lanes.config.Cost = undefined, // the window costs (init)
-@@ -449,6 +450,10 @@
+@@ -476,6 +477,10 @@ pub const Lanes = struct {
      }
  
      fn begin(self: *Lanes, kind: Kind) !bool {
@@ -163,12 +120,10 @@
          if (self.peer == null) return false;
          try self.wire.begin(self.gpa, kind, self.step);
          self.step += 1;
-@@ -457,6 +462,23 @@
- 
-     fn send(self: *Lanes, kind: Kind) !void {
+@@ -486,6 +491,23 @@ pub const Lanes = struct {
          if (try self.begin(kind)) try self.flush();
-+    }
-+
+     }
+ 
 +    /// Two-phase world-wide idle boundary. No rank parks while another may
 +    /// still need it as an RDMA relay. All streams/CUDA graphs finish first.
 +    pub fn idleRdma(self: *Lanes) !void {
@@ -184,10 +139,12 @@
 +        for (self.m.followers()) |l| try l.?.send(idle_commit);
 +        setRdmaIdle(self.m, true);
 +        self.rdma_idle = true;
-     }
- 
++    }
++
      // -- the vtable ---------------------------------------------------------------------------------------------
-@@ -518,6 +540,7 @@
+ 
+     /// The whole prompt (TF_DS_PREFILL_YIELD unset, and the standalone path); the served host with it set advances
+@@ -574,6 +596,7 @@ pub const Lanes = struct {
          errdefer {
              _ = self.streams.remove(s);
              self.used[slot] = false;
@@ -195,17 +152,37 @@
          }
          const seq = &self.seqs[slot];
          try seq.resize(gpa, len);
-@@ -945,10 +968,31 @@
+@@ -1029,21 +1052,44 @@ pub const Lanes = struct {
  
      fn releaseFn(ptr: *anyopaque, s: *lanes.Stream) void {
          const self = of(ptr);
 -        const kv = self.streams.fetchRemove(s) orelse return;
--        self.used[kv.value.slot] = false;
-+        if (self.streams.fetchRemove(s)) |kv| self.used[kv.value.slot] = false;
+-        const slot = kv.value.slot;
+-        if (self.fills[slot]) |*f| {
+-            if (self.filling_slot == slot) {
+-                self.m.joinAhead();
+-                self.m.fill_seq = &.{};
++        if (self.streams.fetchRemove(s)) |kv| {
++            const slot = kv.value.slot;
++            if (self.fills[slot]) |*f| {
++                if (self.filling_slot == slot) {
++                    self.m.joinAhead();
++                    self.m.fill_seq = &.{};
++                }
++                f.deinit(self.gpa);
++                self.fills[slot] = null;
+             }
+-            f.deinit(self.gpa);
+-            self.fills[slot] = null;
++            if (self.filling_slot == slot) self.filling_slot = null;
++            self.used[slot] = false;
+         }
+-        if (self.filling_slot == slot) self.filling_slot = null;
+-        self.used[slot] = false;
 +        self.idleRdma() catch |err| std.debug.panic("RDMA idle transition failed: {s}", .{@errorName(err)});
      }
  };
-+
+ 
 +const idle_ready = "rdma-idle-ready-v1";
 +const idle_commit = "rdma-idle-commit-v1";
 +
@@ -226,10 +203,11 @@
 +        }
 +    }
 +}
- 
++
  /// Prefix survivals: out[j] = the product of sigmoid(conf[i]) for i <= j, in float64 (libm's exp, as chooseK).
  pub fn survivals(conf: []const f32, out: []f64) void {
-@@ -979,6 +1023,7 @@
+     var surv: f64 = 1.0;
+@@ -1073,6 +1119,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
      defer for (&win_ids) |*q| q.deinit(gpa);
      var built: Built = .{};
      var step: u64 = 0;
@@ -237,7 +215,7 @@
      var slot: usize = 0;
      var img_rows: std.ArrayList(u8) = .empty; // a prompt's image rows as their pieces come
      defer img_rows.deinit(gpa);
-@@ -991,7 +1036,7 @@
+@@ -1085,7 +1132,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
      while (true) {
          // the next primitive, polled for 20 ms before the read blocks (rank 0 sends it a fraction of a millisecond
          // after this rank's GPU goes idle in a decode; a sleeping thread would add its core's wake-up to every frame)
@@ -246,11 +224,11 @@
          const kind: Kind = switch (try r.int(u8)) {
              1 => .fill_begin,
              2 => .fill_chunk,
-@@ -1002,8 +1047,13 @@
-             7 => .snap_drop,
+@@ -1097,8 +1144,13 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
              8 => .fill_images,
              9 => .done,
-+            10 => .rdma_idle,
+             10 => .fill_resume,
++            11 => .rdma_idle,
              else => return error.BadFrame,
          };
 +        if (usesRdma(kind) and rdma_idle) {
@@ -260,7 +238,7 @@
          if (try r.int(u64) != step) return error.OutOfStep;
          step += 1;
          // a chunk's read-ahead of the next is done before anything but that chunk (a prompt's ids may change)
-@@ -1117,6 +1167,13 @@
+@@ -1220,6 +1272,13 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                      b.free();
                  }
              },
@@ -274,9 +252,11 @@
              .done => return,
          }
      }
+diff --git a/zig/src/families/dsv41/native.zig b/zig/src/families/dsv41/native.zig
+index aa6672e1..b88ae94e 100644
 --- a/zig/src/families/dsv41/native.zig
 +++ b/zig/src/families/dsv41/native.zig
-@@ -163,6 +163,7 @@
+@@ -163,6 +163,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
      });
      errdefer st.m.close();
      st.lanes = lanes_mod.Lanes.init(gpa, st.m);
@@ -284,7 +264,7 @@
      if (getenv("TF_DS_FIX_K")) |t| st.lanes.fix_k = std.fmt.parseInt(usize, t, 10) catch return error.BadFixK;
      if (getenv("TF_DS_SERVED_K")) |t| st.lanes.served_k = if (std.mem.eql(u8, t, "1") or std.mem.eql(u8, t, "all")) .all else if (std.mem.eql(u8, t, "solo")) .solo else .off;
      // a vision checkpoint's tower on this rank, from the kit's vision/ (torch's attention cubin, the routing bias)
-@@ -173,6 +174,7 @@
+@@ -173,6 +174,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
      // the pool is the model's (preallocated): a stream takes no device memory of its own
      const L = lanes_mod.Lanes;
      const snaps: Snaps = .{ .ptr = &st.lanes, .bytes = L.snapBytesFn, .save = L.snapSaveFn, .restore = L.snapRestoreFn, .drop = L.snapDropFn };
@@ -292,3 +272,54 @@
      return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .vision = if (st.vision) |v| v.hook() else null };
  }
  
+diff --git a/zig/src/families/dsv41/rdma.zig b/zig/src/families/dsv41/rdma.zig
+index 56b37fa8..4c4d8d28 100644
+--- a/zig/src/families/dsv41/rdma.zig
++++ b/zig/src/families/dsv41/rdma.zig
+@@ -19,6 +19,7 @@ const std = @import("std");
+ const cuda = @import("cuda");
+ const fabric = @import("fabric");
+ const seqs = @import("rdma_seq.zig");
++const IdleGate = @import("idle_gate.zig").Gate;
+ 
+ const vabi = fabric.verbs_abi;
+ const Verbs = fabric.verbs.Verbs;
+@@ -235,6 +236,7 @@ pub const Ring = struct {
+     jobs: [2 * max_ranks]Job = undefined, // the relays this rank runs (on a ring of four: two)
+     n_jobs: u32 = 0,
+     proxy: ?std.Thread = null,
++    idle_gate: IdleGate = .{},
+     running: std.atomic.Value(bool) = .init(false),
+     failed: std.atomic.Value(bool) = .init(false),
+     why: [128]u8 = @splat(0),
+@@ -474,10 +476,17 @@ pub const Ring = struct {
+     }
+ 
+     pub fn stop(r: *Ring) void {
+-        if (r.running.swap(false, .acq_rel)) if (r.proxy) |t| t.join();
++        if (r.running.swap(false, .acq_rel)) {
++            r.idle_gate.wake(); // a parked proxy must wake before join
++            if (r.proxy) |t| t.join();
++        }
+         r.proxy = null;
+     }
+ 
++    /// Only the CPU control protocol calls these at globally quiescent boundaries.
++    pub fn park(r: *Ring) void { r.idle_gate.park(); }
++    pub fn wake(r: *Ring) void { r.idle_gate.wake(); }
++
+     /// Every wait on this rank gives up from now on (a watchdog lost a peer); `failure` says why.
+     pub fn abort(r: *Ring, why: []const u8) void {
+         r.fail(why);
+@@ -517,6 +526,11 @@ pub const Ring = struct {
+         var posted: u64 = 0;
+         var wc: [64]vabi.Wc = undefined;
+         while (r.running.load(.monotonic)) {
++            r.idle_gate.wait() catch {
++                r.fail("RDMA idle futex wait failed");
++                return;
++            };
++            if (!r.running.load(.acquire)) break;
+             const ring = @atomicLoad(u64, r.doorbell(), .acquire);
+             // a relaying rank's own sequence q goes out once its relays of every sequence up to q - (slots - 1) are
+             // done: an owner sends q + 1 (into the slot of q + 1 - slots) only after collecting this rank's q
