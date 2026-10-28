@@ -237,8 +237,14 @@ Written for this recipe by Mia's AI Lab:
 
 - **`model/chat_template.jinja`** was written by Mia's AI Lab ([Mia-AiLab](https://huggingface.co/Mia-AiLab)) for
   [`Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-2.9bpw`](https://huggingface.co/Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-2.9bpw):
-  a Jinja port of the checkpoint's own `encoding/encoding.py` (DeepSeek, MIT). The file here is that repository's,
-  unchanged.
+  a Jinja port of the checkpoint's own `encoding/encoding.py` (DeepSeek, MIT). The file here is that repository's
+  with one change, by Manrique ([hashd1ve](https://github.com/hashd1ve)) (the two-Spark recipe's issue
+  [#1](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/issues/1), `fd2cdb2` there): each piece of
+  the prompt is written out as it is made (`{{- "" + X -}}`) instead of being added to one growing string
+  (`{% set ns.out = ns.out + X %}`), which the engine copied on every append. hashd1ve wrote the change; Manuel
+  ([manuel1618](https://github.com/manuel1618)) carried it over to this recipe in
+  [PR #18](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/18) and re-checked that the
+  rendered prompt is unchanged.
 
 ## Scripts
 

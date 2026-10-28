@@ -451,6 +451,12 @@ part of this repository.
   ([deepseek-v4.1-tensorfold-tp4-4xgb10@`6033ea4`](https://github.com/bertholomus/deepseek-v4.1-tensorfold-tp4-4xgb10/commit/6033ea48a27004b2715db82190e2a61f33411d92))
   and the served settings this recipe starts with.
 - **[Hector](https://github.com/hecisaza)**: patch `0008` (pair-sum gathers, `TF_DS_PAIR_SUM`) and the prefill measurements behind it.
+- **Manrique ([hashd1ve](https://github.com/hashd1ve))**: the change to `model/chat_template.jinja` that writes each
+  piece of the prompt out as it is made instead of adding it to one growing string, which ends rank 0's memory growth
+  with long conversations (the two-Spark recipe's
+  [issue #1](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/issues/1)); carried over here by Manuel
+  ([manuel1618](https://github.com/manuel1618)) in
+  [PR #18](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/18).
 - **[GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold)**
   contributors, whose code the scripts keep: webzone (both PCIe links of a QSFP port as rails,
   [`d5afeb0`](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/commit/d5afeb0)),
