@@ -318,6 +318,19 @@ class StopHealth(ScriptTest):
                 self.assertEqual(code, 0, out)
                 self.assertIn("could not read the open requests from /health", out)
 
+    def test_error_null_is_no_error(self):
+        # JSON null is no error: the count is read as usual
+        code, out = self.stop_with('{"error": null, "live": {"connections": 2, "waiting": 0}}')
+        self.assertEqual(code, 0, out)
+        self.assertIn("2 request(s) open (running or waiting) will be cut off", out)
+
+    def test_other_success_status_is_unknown(self):
+        # the native server answers /health with 200; any other status, 2xx too, is not its answer
+        (self.sim / "health_status").write_text("204")
+        code, out = self.stop_with('{"live": {"connections": 0, "waiting": 0}}')
+        self.assertEqual(code, 0, out)
+        self.assertIn("could not read the open requests from /health", out)
+
     def test_stop_health_check_holds_with_python_optimizing(self):
         # the checks are no asserts: PYTHONOPTIMIZE would drop those
         for h in ["head", "w1", "w2", "w3"]:
@@ -400,6 +413,20 @@ node_order() { echo 0,1,2,3; }
                 self.assertNotIn("is now LIVE", out)
                 for h in ["head", "w1", "w2", "w3"]:
                     self.containers(h)
+
+    def test_smoke_test_error_null_passes_other_2xx_fails(self):
+        ok = '{"error": null, "choices": [{"message": {"role": "assistant", "content": "OK"}}], "usage": {"completion_tokens": 1}}'
+        (self.sim / "smoke").write_text(ok)
+        code, out = self.run_script(["start.sh"], {"PREPARE": "0"})
+        self.assertEqual(code, 0, out)
+        self.assertIn("is now LIVE", out)
+        for h in ["head", "w1", "w2", "w3"]:
+            self.containers(h)
+        (self.sim / "smoke_status").write_text("201")
+        code, out = self.run_script(["start.sh"], {"PREPARE": "0"})
+        self.assertNotEqual(code, 0, out)
+        self.assertIn("the smoke test request failed", out)
+        self.assertNotIn("is now LIVE", out)
 
     def test_smoke_test_passes_without_a_role_and_with_python_optimizing(self):
         # a reply whose message has no "role" is the assistant's; the checks are no asserts (PYTHONOPTIMIZE drops those)
