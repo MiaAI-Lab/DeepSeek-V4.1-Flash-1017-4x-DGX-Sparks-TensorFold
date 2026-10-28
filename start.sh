@@ -67,6 +67,7 @@ need_workers
 (( DRY )) && log "DRY_RUN=1: printing the docker commands; nothing is stopped, started or prepared"
 
 API_HOST="$HOST"; [[ "$HOST" == 0.0.0.0 || "$HOST" == "::" ]] && API_HOST=127.0.0.1
+[[ "$API_HOST" != *:* ]] || API_HOST="[$API_HOST]"   # an IPv6 address in a URL needs brackets
 URL="http://$API_HOST:$PORT"
 running_here()   { [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null)" == true ]]; }
 running_worker() { [[ "$(worker "$1" docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null)" == true ]]; }
@@ -206,6 +207,7 @@ else
 fi
 IP=$(hostname -I 2>/dev/null | awk '{print $1}')
 [[ "$HOST" == 0.0.0.0 || "$HOST" == "::" ]] || IP="$HOST"
+[[ "$IP" != *:* ]] || IP="[$IP]"
 printf '\n%s  ✔ %s is now LIVE! on port %s%s\n\n' "$G" "$SERVED_NAME" "$PORT" "$R"
 cat <<EOF
     API      http://${IP:-<spark-address>}:$PORT/v1   (model: $SERVED_NAME)
