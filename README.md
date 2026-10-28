@@ -284,6 +284,18 @@ its own; the partners' exchanges run over two-rank NCCL communicators, one a cab
 files `scripts/nodes.sh` writes), and the all-gathers go round the ring. Rank 0 (spark1) also serves the API, runs the
 vision tower and the sampler.
 
+## Native streaming keepalives
+
+Patch `0028` backports JJ Eaton's pre-token keepalives as integrated by Ash Hart in upstream TensorFold.
+Silent streaming requests send a heartbeat every 15 seconds, including while queued or processing a long prompt.
+OpenAI Chat/Responses streams use SSE comments; Anthropic Messages streams use `ping` events. Set
+`TF_SSE_KEEPALIVE_S=0` to disable, or a positive number of seconds to change the interval; `start.sh` forwards it.
+An HTTP proxy may consume backend comments, so configure and verify its own downstream heartbeats as well.
+
+Patch `0029` backports Ash Hart's fix for the golden test server's unread stdout pipe, which otherwise stalls the suite.
+See [`CREDITS.md`](CREDITS.md) for the upstream commits. `tools/test_sse_keepalive.py` checks the actual HTTP routes,
+including tool requests, refusal handling, disconnect cancellation and the disabled setting, against a CPU fixture.
+
 ## Configuration
 
 Settings come from the environment, then `scripts/local.sh`, then `./.env`, then the defaults in

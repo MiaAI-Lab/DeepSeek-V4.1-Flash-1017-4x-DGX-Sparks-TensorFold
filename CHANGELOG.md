@@ -55,3 +55,10 @@
   video input, tool-call arguments as objects.
 - **v0.1.0 (unreleased)** -- first version: DeepSeek-V4.1-Flash-1017 on four DGX Sparks, TP4, on BertholomusAI's
   DeepSeek-V4.1-Flash family of TensorFold's native engine.
+
+## Native server update — 2026-10-28
+
+- `0028`: TensorFold native SSE keepalives, enabled every 15 seconds during silent streaming generations.
+  Chat/Responses use comments; Messages uses ping events. `TF_SSE_KEEPALIVE_S=0` disables them.
+- `0029`: drain the golden test server stdout so a full log pipe cannot stall the regression suite.
+  Both fixes are upstream backports; authorship and source commits are recorded in `CREDITS.md`.
