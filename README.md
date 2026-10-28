@@ -343,6 +343,34 @@ measurements and rationale: [`CHANGELOG.md`](CHANGELOG.md); authorship: [`CREDIT
 | `0025` | Mia's AI Lab | `TF_DS_IDX_SHARD` (on, this cluster) | Indexer scores and picks only its own owned quarter of rows |
 | `0026` | knapcio | -- (on) | RDMA queue pairs use the port's active MTU (capped at 4096) instead of a fixed 4096, so RDMA works on a switch whose Ethernet MTU is 1500 |
 | `0027` | this cluster | -- (on) | A kept prompt state is keyed by the request's images as well as its tokens: an image's positions hold only its placeholder's token, so a chat with a picture in its history used to keep nothing and re-prefill every turn |
+| `0030` | Mauvis Ledford | -- (on) | Skip vision encoding for image spans wholly covered by a verified cached prefix; a span crossing the cut is still encoded |
+| `0031` | Mauvis Ledford | -- (on) | Admit requests between prompt chunks, rotate partially filled prompts, and decode between chunks; coordinated update required on every TP rank |
+
+## Cached-image and late-request latency
+
+Patches `0030` and `0031` build on the image-keyed cache in `0027` ([PR #10](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/10)).
+The native CUDA server advances admitted prompts one existing 2,048-token chunk per turn. The four ranks select the
+same partially filled slot using a new control frame; install the same image on all ranks together. Other backends
+keep their whole-prefill interface. The standalone DeepSeek path retains `TF_DS_PREFILL_YIELD`; native HTTP admission
+uses bounded prefill automatically.
+
+The cache optimization skips only image spans completely inside a usable restored prefix. Image placeholders remain
+masked for Engram, and images crossing the cached cut still run through the vision tower. New images and a cold
+request still require vision work before the first text chunk.
+
+Run the same image files and settings before and after restarting with the candidate (the restart also clears prefix
+state, so the admission prompt is cold). The tool sends at most two requests at once and stores output token IDs and
+timing. It does not copy the input image payloads into the receipt:
+
+```sh
+python3 tools/validate_prefill_latency.py --image original.png --output before.json
+python3 tools/validate_prefill_latency.py --image original.png --output after.json --compare before.json
+```
+
+Use `--url` and `--model` to select the native endpoint. The default 35 image references reproduce the accumulated
+image-history case; use `--image-count` to change that count. The check compares solo/replay/overlap token IDs, verifies
+a late short request produces a token before the long prompt, and checks cached-image prefill improves. These are
+latency checks, not evidence of higher aggregate throughput. See [the validation receipt](docs/prefill-latency-20261028.md).
 
 ## Repository layout
 

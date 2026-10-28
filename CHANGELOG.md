@@ -1,5 +1,9 @@
 # Changelog
 
+- **2026-10-28** -- `0030` skips vision work covered by a restored image-keyed prefix; `0031` admits and advances
+  requests between unchanged prompt chunks. Partially filled streams keep separate progress and image rows on the
+  head, and all TP ranks select the same slot when resuming. No arithmetic or checkpoint settings change.
+
 - **2026-10-27** -- image-keyed prompt cache (`0027`): a kept prompt state is keyed by the request's images as well as its
   tokens, so a chat whose history holds a picture (a screenshot in a tool result, say) resumes its prefill instead of
   re-running it from 0 on every turn. Measured on 4x GB10 TP4 (16 streams, 2.8k tok/s prefill): one 150k-token prompt
