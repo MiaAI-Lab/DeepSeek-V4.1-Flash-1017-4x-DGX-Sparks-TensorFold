@@ -1,5 +1,9 @@
 # Changelog
 
+- **2026-10-26** -- `stop.sh` exits 1 when a rank may still run (a rank it could not stop, or a Spark whose containers
+  it could not list); `DRY_RUN=1` writes no NCCL graph files; the prepared marker also covers `HF_CACHE`, the NFS
+  settings and the chat template, and a state that cannot be computed never reads as ready. Offline regression tests
+  in `tests/test_scripts.py` (standard library only, no Spark).
 - **2026-10-26** -- `tools/validate.py`, `tools/needle_bench.py`: a check passes only on a real completion. An HTTP
   error, an `error` object, a reply that is not the assistant's, a malformed tool call or a short or empty `--compare`
   reference now fails instead of passing; bad arguments stop with a message. Offline regression tests in

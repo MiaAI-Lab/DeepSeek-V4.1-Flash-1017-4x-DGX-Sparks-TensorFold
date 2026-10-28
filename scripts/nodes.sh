@@ -479,6 +479,17 @@ ring_graphs() {
   for r in 0 $(worker_ids); do
     [[ -z "${WORKER_DOWN[$r]:-}" ]] || continue
     prev=$(( (r + TP - 1) % TP )); next=$(( (r + 1) % TP ))
+    if [[ "${DRY_RUN:-0}" == 1 ]]; then
+      # DRY_RUN=1 changes nothing: the paths the docker commands name, no files written
+      if (( r == 0 )); then path="$STATE_DIR/nccl-graph-rank0"
+      else
+        path=$(worker "$r" 'echo "$HOME/.local/state/dsv41-tensorfold/nccl-graph-rank'"$r"'"') ||
+          die "could not reach $(worker_host "$r") for its NCCL graphs' path"
+      fi
+      log "DRY_RUN: rank $r's NCCL graph files would be written to $path{,-link-prev,-link-next}.xml"
+      NODE_GRAPH[r]=$path
+      continue
+    fi
     if (( r == 0 )); then path="$STATE_DIR/nccl-graph-rank0"; mkdir -p "$STATE_DIR"
     else
       path=$(worker "$r" 'mkdir -p "$HOME/.local/state/dsv41-tensorfold" && echo "$HOME/.local/state/dsv41-tensorfold/nccl-graph-rank'"$r"'"') ||

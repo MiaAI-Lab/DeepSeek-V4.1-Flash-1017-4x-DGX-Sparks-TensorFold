@@ -204,12 +204,24 @@ model_in_container() {
 # The folder rank 0 serves (prepare.sh): the checkpoint's files linked, with the recipe's chat template.
 served_in_container() { echo "/hf/$DATA_SUB/model"; }
 
-# What scripts/prepare.sh last left ready (start.sh runs it again when this line changes).
+# What scripts/prepare.sh last left ready (start.sh runs it again when this line changes): with where the checkpoint is
+# (HF_CACHE), how the workers mount it (NFS_PATH, NFS_VOLUME, NFS_SERVER*) and the chat template it copies into the
+# served folder, each of which needs prepare.sh's steps again when it changes. Each field is shell-quoted (%q, in the C
+# locale so the line does not depend on it), so no two settings give the same line.
 PREPARED_MARKER="$STATE_DIR/prepared"
 prepared_state() {
-  local i line
-  line="model=$MODEL_ID@$(snapshot_rev) image=$(image_ident "$IMAGE") kit=$KIT_REF order=${ORDER} engram=$WORKER_ENGRAM_DIR ablit=$ABLIT"
-  [[ "$ENGRAM_PACKED" != 1 ]] || line+=" packed=$ENGRAM_PACKED_DIR/$(packed_nodes)"
-  for i in 1 2 3; do line+=" w$i=$(worker_host "$i")"; done
-  echo "$line"
+  local i tpl f
+  tpl=$(sha256sum "$_cfg_root/model/chat_template.jinja" | cut -c1-64) && [[ -n "$tpl" ]] ||
+    die "cannot hash model/chat_template.jinja (sha256sum)"
+  f=("model=$MODEL_ID@$(snapshot_rev)" "image=$(image_ident "$IMAGE")" "kit=$KIT_REF" "order=$ORDER" "engram=$WORKER_ENGRAM_DIR" "ablit=$ABLIT")
+  [[ "$ENGRAM_PACKED" != 1 ]] || f+=("packed=$ENGRAM_PACKED_DIR/$(packed_nodes)")
+  f+=("hf=$HF_CACHE" "nfs_path=$NFS_PATH" "nfs_volume=$NFS_VOLUME" "template=$tpl")
+  for i in 1 2 3; do f+=("w$i=$(worker_host "$i")" "nfs$i=$(wval NFS_SERVER "$i")"); done
+  (export LC_ALL=C; printf '%q ' "${f[@]}"; echo)   # (a subshell: the caller's locale is left as it was)
+}
+# prepare.sh's last step: computed first and swapped in whole, so a failure leaves the previous marker as it was
+write_prepared_marker() {
+  local state
+  state=$(prepared_state) || return 1
+  printf '%s\n' "$state" > "$PREPARED_MARKER.new" && mv -f "$PREPARED_MARKER.new" "$PREPARED_MARKER"
 }
