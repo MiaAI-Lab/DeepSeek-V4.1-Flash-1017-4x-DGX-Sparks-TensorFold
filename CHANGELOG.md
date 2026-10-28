@@ -1,5 +1,11 @@
 # Changelog
 
+- **2026-10-26** -- `0027` (uchkw): park the three RDMA proxy threads when no streams are live.
+  Synchronize CUDA on every rank, agree READY/COMMIT, then block in futex waits; wake before compute and before stop/join.
+  Idle followers block on the control link instead of spinning. A four-GB10 ring measured about 300% CPU per node
+  before and 0.21-0.32% after; three idle/wake chat cycles passed. Numerical kernels and weights are unchanged.
+  All ranks must run the updated image (new idle control frame).
+
 - **2026-10-27** -- `0027` (manuel1618): `/metrics` publishes `prompt_tokens_cached_total`, the prompt tokens of
   finished requests restored from kept prompt states, and repeats the split under vLLM's `prefix_cache_hits_total` /
   `prefix_cache_queries_total`. Before, `/metrics` had only `prompt_tokens_total`, which counts cached and computed

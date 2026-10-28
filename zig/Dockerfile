@@ -25,6 +25,8 @@ RUN git init -q /tensorfold && cd /tensorfold && git remote add origin "${TF_REP
 COPY zig/patches /opt/tf-patches
 RUN cd /tensorfold && \
     for p in /opt/tf-patches/*.patch; do echo "applying $p"; git apply --check "$p" && git apply "$p" || exit 1; done
+# CPU-only lost-wakeup and park/wake tests; no GPU or model weights needed.
+RUN timeout 120s /opt/zig/zig test /tensorfold/zig/src/families/dsv41/idle_gate.zig -O ReleaseSafe -lc -j1
 ARG SM=121
 RUN cd /tensorfold && /opt/zig/zig build -Dnvcc=/usr/local/cuda/bin/nvcc -Dsm=${SM} -Doptimize=ReleaseFast \
       --prefix /opt/tensorfold -j"$(nproc)" install native && \

@@ -1,0 +1,131 @@
+{
+  "recipe": "220547b8e45e9909ea1e0968a9038bc8680c502b",
+  "engine": "59402086381a42c74d53053443224eec2790b4c5",
+  "snapshot": "1bae0e1088993b9b82de08f59de5be5a34e42170",
+  "validation_tool": {
+    "repository": "MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold",
+    "commit": "220547b8e45e9909ea1e0968a9038bc8680c502b",
+    "path": "tools/validate.py",
+    "sha256": "9324d2716f248939ab15f0af73511592d17317f3b1ee68ac560532252af08588"
+  },
+  "image_ids": {
+    "control": "sha256:cd45f1004a567ea95dcfab0913904fce21facbd38fc213d92d11d04d37a15bd5",
+    "patched": "sha256:07afd700102e1a9ae6a97cedd4985a8589a88f9e14fc23a9792fd88628cdd475"
+  },
+  "verified_node_count": 4,
+  "runs": {
+    "control": {
+      "started_utc": "2026-10-26T17:30:56.964635+00:00",
+      "exit_code": 0,
+      "finished_utc": "2026-10-26T17:31:23.548500+00:00",
+      "checks": [
+        "PASS  text  'Paris' 0.2s",
+        "PASS  thinking  reasoning 51 chars, answer '391'",
+        "PASS  tool call  [{\"id\": \"call_a3b32ae1c5d1dc04ee585171\", \"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"arguments\": \"{\\\"city\\\"",
+        "PASS  tool result  'The weather in Tokyo is currently **clear** with a temperature of **21°C** (abou'",
+        "PASS  image  'Yellow circle'",
+        "PASS  video  'Based on the video frames:\\n\\n*   **At first (0.0s - 1.5s):** The background is **red**.\\n*   **Later ('",
+        "PASS  long prompt  21875 tokens, '8638', 7.7s",
+        "PASS  concurrent == solo  8 of 8 equal"
+      ]
+    },
+    "patched": {
+      "started_utc": "2026-10-26T17:36:52.682376+00:00",
+      "exit_code": 0,
+      "finished_utc": "2026-10-26T17:37:19.267981+00:00",
+      "checks": [
+        "PASS  text  'Paris' 0.2s",
+        "PASS  thinking  reasoning 51 chars, answer '391'",
+        "PASS  tool call  [{\"id\": \"call_bd1006f755c23913c67da26b\", \"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"arguments\": \"{\\\"city\\\"",
+        "PASS  tool result  'The weather in Tokyo is currently **clear** with a temperature of **21°C** (abou'",
+        "PASS  image  'Yellow circle'",
+        "PASS  video  'Based on the video frames:\\n\\n*   **At first (0.0s - 1.5s):** The background is **red**.\\n*   **Later ('",
+        "PASS  long prompt  21875 tokens, '8638', 7.7s",
+        "PASS  concurrent == solo  8 of 8 equal",
+        "PASS  equal to the saved replies  8 of 8 equal"
+      ]
+    }
+  },
+  "matched_greedy_responses": [
+    {
+      "prompt": "Write a haiku about the sea.",
+      "temperature": 0,
+      "thinking": false,
+      "max_tokens": 160,
+      "equal": true,
+      "control_sha256": "b5aa5b800ada09f7cd5302d428da6ba57c19eac9ee878b24ff5f9758390f7f3f",
+      "patched_sha256": "b5aa5b800ada09f7cd5302d428da6ba57c19eac9ee878b24ff5f9758390f7f3f",
+      "response_text": "Waves crash on the shore,\nSalt and foam in endless blue,\nThe sea breathes deeply."
+    },
+    {
+      "prompt": "List the first ten prime numbers.",
+      "temperature": 0,
+      "thinking": false,
+      "max_tokens": 160,
+      "equal": true,
+      "control_sha256": "68504aff1cd714b7611546d3dba92fde135d16b7a80eae5a5589dde1664128ce",
+      "patched_sha256": "68504aff1cd714b7611546d3dba92fde135d16b7a80eae5a5589dde1664128ce",
+      "response_text": "The first ten prime numbers are:\n\n**2, 3, 5, 7, 11, 13, 17, 19, 23, 29**"
+    },
+    {
+      "prompt": "Explain TCP in two sentences.",
+      "temperature": 0,
+      "thinking": false,
+      "max_tokens": 160,
+      "equal": true,
+      "control_sha256": "61d589ede3b4bc0bb0a0e7aca32f2b9a1d940ecaf4f4c045aefa4bd2eec5361e",
+      "patched_sha256": "61d589ede3b4bc0bb0a0e7aca32f2b9a1d940ecaf4f4c045aefa4bd2eec5361e",
+      "response_text": "TCP is a connection-oriented protocol that establishes a reliable, ordered channel between sender and receiver through a handshake and continuous acknowledgment of received data. It handles retransmission of lost packets, sequencing, and flow control so that applications receive data intact and in order, at the cost of some overhead compared to UDP."
+    },
+    {
+      "prompt": "Write a Python function that reverses a string.",
+      "temperature": 0,
+      "thinking": false,
+      "max_tokens": 160,
+      "equal": true,
+      "control_sha256": "474ecae6d6c2d52ab9427a062bb1018ad93bb6c32f724ffb064106d012c749db",
+      "patched_sha256": "474ecae6d6c2d52ab9427a062bb1018ad93bb6c32f724ffb064106d012c749db",
+      "response_text": "# Reversing a String in Python\n\nHere are several ways to reverse a string in Python, from most Pythonic to most educational:\n\n## Method 1: Slicing (Most Pythonic)\n\n```python\ndef reverse_string(s: str) -> str:\n    \"\"\"Reverse a string using slicing.\"\"\"\n    return s[::-1]\n```\n\n## Method 2: Using `reversed()` and `join()`\n\n```python\ndef reverse_string(s: str) -> str:\n    \"\"\"Reverse a string using reversed() and join().\"\"\"\n    return ''.join(reversed(s))\n```\n\n## Method 3: Manual Loop (Educational)\n\n```python\ndef reverse_string(s: str) -> str:\n    \"\"\"Reverse a string by iterating from the end.\"\"\"\n    result = []\n    for i"
+    },
+    {
+      "prompt": "Name five rivers in Europe.",
+      "temperature": 0,
+      "thinking": false,
+      "max_tokens": 160,
+      "equal": true,
+      "control_sha256": "fa246586a3709ae7314e4c36b53215ea9e7c688f192325b4c699606213328d86",
+      "patched_sha256": "fa246586a3709ae7314e4c36b53215ea9e7c688f192325b4c699606213328d86",
+      "response_text": "Here are five rivers in Europe:\n\n1. **Volga** – the longest river in Europe, flowing through Russia into the Caspian Sea.\n2. **Danube** – flows through ten countries from Germany to the Black Sea.\n3. **Rhine** – a major river flowing from the Swiss Alps through Germany and the Netherlands to the North Sea.\n4. **Loire** – the longest river in France, flowing into the Atlantic Ocean.\n5. **Elbe** – flows from the Czech Republic through Germany into the North Sea."
+    },
+    {
+      "prompt": "What causes the seasons on Earth? Two sentences.",
+      "temperature": 0,
+      "thinking": false,
+      "max_tokens": 160,
+      "equal": true,
+      "control_sha256": "2133ab3df5f693f200d5e2725e6f80c717b9c989fa0ba6df14922a6a6f8202ad",
+      "patched_sha256": "2133ab3df5f693f200d5e2725e6f80c717b9c989fa0ba6df14922a6a6f8202ad",
+      "response_text": "The seasons are caused by the tilt of Earth's axis (about 23.5 degrees) as it orbits the Sun, which changes the angle and duration of sunlight different hemispheres receive throughout the year. This axial tilt—not Earth's distance from the Sun—is why the Northern and Southern Hemispheres experience opposite seasons at the same time."
+    },
+    {
+      "prompt": "Translate 'good morning' into French, Spanish and German.",
+      "temperature": 0,
+      "thinking": false,
+      "max_tokens": 160,
+      "equal": true,
+      "control_sha256": "806edb0a15c228e62111aa8770121ef6e7f404a69d0e94c816c201dd09919ead",
+      "patched_sha256": "806edb0a15c228e62111aa8770121ef6e7f404a69d0e94c816c201dd09919ead",
+      "response_text": "Here are the translations of \"good morning\":\n\n- **French:** Bonjour\n- **Spanish:** Buenos días\n- **German:** Guten Morgen"
+    },
+    {
+      "prompt": "Give three tips for writing clear documentation.",
+      "temperature": 0,
+      "thinking": false,
+      "max_tokens": 160,
+      "equal": true,
+      "control_sha256": "b470135cca53ed2e906e199c0377f7e2c66b6805a8df53ff2823e77c60fcdb9b",
+      "patched_sha256": "b470135cca53ed2e906e199c0377f7e2c66b6805a8df53ff2823e77c60fcdb9b",
+      "response_text": "Here are three tips for writing clear documentation:\n\n1. **Know your audience and write for them.** Before you start, define who will read the documentation and what they already know. A guide for end users should avoid jargon and focus on tasks, while API docs for developers can assume technical background. Matching tone, depth, and terminology to the reader prevents both confusion and condescension.\n\n2. **Lead with the task, not the theory.** Structure content around what the reader wants to accomplish—use clear headings, numbered steps, and put the most important information first. Readers scan for answers, so front-load key instructions and keep background explanation secondary (or link to it separately).\n\n3. **Use plain language, consistent terms, and concrete examples.** Write short sentences in active voice, define terms on"
+    }
+  ]
+}
