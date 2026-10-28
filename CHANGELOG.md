@@ -1,13 +1,13 @@
 # Changelog
 
-- **2026-10-28** -- seven pull requests merged (#2, #4, #5, #8, #10, #13, #15), tested together on this cluster.
-  Three of them had named their patch `0027`: #10's keeps the number, #8's is `0033` here and #2's `0034`. Against the
-  image before them (`0001`-`0025`), on four GB10s with this cluster's switches: `tools/validate.py` passed and its 8
-  greedy replies were equal; a 131k-token prompt read cold in 34.7 s as before; a follow-up resumed from the previous
-  turn's state gave the same tokens as the same prompt read cold (8 of 8); a 35-image prompt resent read in 1.0 s instead
-  of 20.1 s, its tokens equal; a 12-screenshot history resumed on every turn, and a changed or swapped picture resumed
-  none of what followed it; a 9-token request arriving 1 s into a cold 50,939-token prompt had its first token in 0.3 s;
-  idle CPU fell from ~310 % to 0.15-0.35 % a rank.
+- **2026-10-28** -- seven pull requests merged (#2, #4, #5, #8, #10, #13, #15), tested together on this cluster. Three
+  of them had named their patch `0027`: #10's keeps the number, #8's is `0033` here and #2's `0034`. Against the image
+  before them (`0001`-`0025`), on four GB10s with this cluster's switches: `tools/validate.py` passed and its 8 greedy
+  replies were equal; a 131k-token prompt read cold in 34.7 s as before; a follow-up resumed from the previous turn's
+  state gave the same tokens as the same prompt read cold (8 of 8); a 35-image prompt resent read in 1.0 s instead of
+  20.1 s, its tokens equal; a 12-screenshot history resumed on every turn, and a changed or swapped picture resumed none
+  of what followed it; a 9-token request arriving 1 s into a cold 50,939-token prompt had its first token in 0.3 s; idle
+  CPU fell from ~310 % to 0.15-0.35 % a rank.
 - **2026-10-28** -- `0032` (Mia's AI Lab): `0031`'s bounded admission only with `TF_DS_PREFILL_YIELD=1` (on, this
   cluster). Without the switch a prompt is read whole, as before `0031`, and its Engram read-ahead keeps running
   between its chunks.
@@ -37,14 +37,14 @@
   stop/join. Idle followers block on the control link instead of spinning. A four-GB10 ring measured about 300% CPU per
   node before and 0.21-0.32% after; three idle/wake chat cycles passed. Numerical kernels and weights are unchanged.
   All ranks must run the updated image (new idle control frame). Ported onto `0031` (its frame value is 11).
-- **2026-10-26** -- `stop.sh` exits 1 when a rank may still run (a rank it could not stop, or a Spark whose containers
-  it could not list); `DRY_RUN=1` writes no NCCL graph files; the prepared marker also covers `HF_CACHE`, the NFS
-  settings and the chat template, and a state that cannot be computed never reads as ready. Offline regression tests
-  in `tests/test_scripts.py` (standard library only, no Spark).
-- **2026-10-26** -- `tools/validate.py`, `tools/needle_bench.py`: a check passes only on a real completion. An HTTP
-  error, an `error` object, a reply that is not the assistant's, a malformed tool call or a short or empty `--compare`
-  reference now fails instead of passing; bad arguments stop with a message. Offline regression tests in
-  `tests/test_validation_tools.py` (standard library only, no GPU).
+- **2026-10-26** -- (SvangenStudios) `stop.sh` exits 1 when a rank may still run (a rank it could not stop, or a Spark
+  whose containers it could not list); `DRY_RUN=1` writes no NCCL graph files; the prepared marker also covers
+  `HF_CACHE`, the NFS settings and the chat template, and a state that cannot be computed never reads as ready. Offline
+  regression tests in `tests/test_scripts.py` (standard library only, no Spark).
+- **2026-10-26** -- (SvangenStudios) `tools/validate.py`, `tools/needle_bench.py`: a check passes only on a real
+  completion. An HTTP error, an `error` object, a reply that is not the assistant's, a malformed tool call or a short or
+  empty `--compare` reference now fails instead of passing; bad arguments stop with a message. Offline regression tests
+  in `tests/test_validation_tools.py` (standard library only, no GPU).
 - **2026-10-26** -- `0026` (knapcio): the RDMA rings' queue pairs take the port's active MTU (`ibv_query_port`,
   capped at 4096) as their path MTU instead of a fixed 4096. On a switched fabric whose Ethernet MTU is 1500 the RoCE
   active MTU is 1024, and with the fixed 4096 every request failed (`RDMA=1`); with the port's MTU it serves. On a

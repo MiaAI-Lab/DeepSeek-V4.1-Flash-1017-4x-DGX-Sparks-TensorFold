@@ -45,8 +45,9 @@ DGX Sparks. Almost everything that makes it work was built by others. Its own wo
 ## This recipe's patches (`zig/patches`)
 
 **Every patch is Mia's AI Lab's own work, except `0008`, which is Hector's, `0026`, which is knapcio's, `0027`, which is
-Thomas Kempka's, `0028` and `0029`, upstream TensorFold fixes backported by Mauvis Ledford, `0030` and `0031`, which
-are Mauvis Ledford's, `0033`, a backport by manuel1618, and `0034`, which is uchkw's (Codex-assisted).** At a glance:
+Thomas Kempka's, `0028` and `0029`, upstream TensorFold fixes backported by Mauvis Ledford, `0030` and `0031`, which are
+Mauvis Ledford's, `0033`, a backport by Manuel (manuel1618), and `0034`, which is Hironori Uchikawa's (uchkw,
+Codex-assisted).** At a glance:
 
 | Patches | Author | What |
 | --- | --- | --- |
@@ -60,8 +61,8 @@ are Mauvis Ledford's, `0033`, a backport by manuel1618, and `0034`, which is uch
 | `0028`-`0029` | backported by [Mauvis Ledford](https://github.com/krunkosaurus) | upstream TensorFold's pre-token SSE keepalives (JJ Eaton, Ash Hart) and its golden harness's stdout drain (BobClawblaw) |
 | `0030`-`0031` | [Mauvis Ledford](https://github.com/krunkosaurus) | vision work skipped for restored images; requests admitted between a prompt's prefill chunks |
 | `0032` | Mia's AI Lab | `0031` behind `TF_DS_PREFILL_YIELD` |
-| `0033` | manuel1618 | `/metrics`' cached prompt-token counter, backported |
-| `0034` | [uchkw](https://github.com/uchkw) (Codex-assisted) | globally quiesce and futex-park idle RDMA proxies; wake before compute |
+| `0033` | Manuel ([manuel1618](https://github.com/manuel1618)) | `/metrics`' cached prompt-token counter, backported |
+| `0034` | Hironori Uchikawa ([uchkw](https://github.com/uchkw)) (Codex-assisted) | globally quiesce and futex-park idle RDMA proxies; wake before compute |
 
 The per-patch notes below also credit everyone who helped find or shape a specific fix along the way -- Hector's
 reviewer, Codex and Grok's live-bug diagnosis and design reviews, an outside reviewer's observation -- without
@@ -199,8 +200,10 @@ Contributed by Mauvis Ledford ([krunkosaurus](https://github.com/krunkosaurus)),
   rounds between its chunks, and rotates partially filled prompts; a new control frame selects the same slot on every
   rank). `0032`, Mia's AI Lab's, puts `0031` behind `TF_DS_PREFILL_YIELD=1`.
 - The backports `0028` and `0029`, below under "Native server backports".
+- `tools/validate_prefill_latency.py` and its receipt `docs/prefill-latency-20261028.md` (PR #15), and
+  `tools/test_sse_keepalive.py` (PR #13).
 
-Backported by manuel1618 ([manuel1618](https://github.com/manuel1618)), [PR #8](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/8):
+Backported by Manuel ([manuel1618](https://github.com/manuel1618)), [PR #8](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/8):
 
 - `0033` (cached prompt tokens on `/metrics`): juliankang4's BertholomusAI/TensorFold `ce0d9053` (on
   `deepseek-v41-zig-tp4`), which eleata ports to the two-node branch in
@@ -208,12 +211,15 @@ Backported by manuel1618 ([manuel1618](https://github.com/manuel1618)), [PR #8](
   DeepSeek-V4.1 engine this recipe serves; `0033` adds that line (`native/cuda.zig`, `.prompt_cache = h.cache != null`,
   as #44 does for two nodes) and carries the rest to this recipe's engine pin.
 
-Contributed by uchkw ([uchkw](https://github.com/uchkw)), Codex-assisted, [PR #2](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/2):
+Contributed by Hironori Uchikawa ([uchkw](https://github.com/uchkw)), Codex-assisted, [PR #2](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/2):
 
 - `0034` (idle RDMA parking): once no stream is live, every rank synchronizes its GPU and answers a READY/COMMIT
   handshake before any RDMA proxy parks in a futex wait; the next compute frame wakes them, and idle followers block
-  on the control link instead of spinning. Its design, handshake and tests are uchkw's; Mia's AI Lab ported it onto
-  `0031` (its frame takes value 11, after `0031`'s, and the release path keeps `0031`'s partial-fill cleanup).
+  on the control link instead of spinning. Its design, handshake and tests are uchkw's, as are the image build's
+  CPU-only gate tests (`zig/Dockerfile`) and the validation records `docs/idle-cpu-validation.md`,
+  `docs/idle-cpu-ab-20261026.json`, `docs/combined-mtu-validation.md` and `docs/mtu-output-validation-20261026.json`;
+  Mia's AI Lab ported it onto `0031` (its frame takes value 11, after `0031`'s, and the release path keeps `0031`'s
+  partial-fill cleanup).
 
 Written for this recipe by Mia's AI Lab:
 
@@ -239,6 +245,14 @@ Written for this recipe by Mia's AI Lab:
     `scripts/nodes.sh` ([`5e1bf27`](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/commit/5e1bf27));
   - **john**: each rank given its link's address of the head as its rendezvous (`LINK_HEAD_ADDR`), kept in
     `start.sh` ([`58eaed0`](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/commit/58eaed0)).
+- Contributed by **[SvangenStudios](https://github.com/SvangenStudios)**:
+  - [PR #4](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/4): `stop.sh` exits 1
+    when a rank may still run, `DRY_RUN=1` writes no NCCL graph files, and the prepared marker covers `HF_CACHE`, the
+    NFS settings and the chat template (`stop.sh`, `start.sh`, `scripts/config.sh`, `scripts/nodes.sh`,
+    `scripts/prepare.sh`), with the offline tests `tests/test_scripts.py`;
+  - [PR #5](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/5):
+    `tools/validate.py` and `tools/needle_bench.py` fail on bad references, error replies, malformed tool calls and bad
+    calibrations instead of passing, with the offline tests `tests/test_validation_tools.py`.
 
 ## Tools and platform
 
