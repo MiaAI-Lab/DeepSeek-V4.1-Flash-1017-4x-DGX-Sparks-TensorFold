@@ -1,5 +1,12 @@
 # Changelog
 
+- **2026-10-28** -- `model/chat_template.jinja` writes each piece out as it is made instead of appending to one
+  string with `{% set ns.out = ns.out + ... %}` (hashd1ve's fix from the two-Spark recipe, its issue #1 and `fd2cdb2`,
+  carried over byte for byte). The engine's Jinja copies the whole string on every `+` and keeps each copy until the
+  render ends, and every request renders twice, so rank 0's host memory grew with messages x prompt length: in the
+  engine's own template module one render of a 1,500-turn conversation (1.6 MB of prompt) peaked at 24.8 GB, now
+  0.4 GB. Prompts are unchanged: 14,688 conversations render byte-identically before and after, in the engine's
+  template module and in jinja2.
 - **2026-10-28** -- seven pull requests merged (#2, #4, #5, #8, #10, #13, #15), tested together on this cluster. Three
   of them had named their patch `0027`: #10's keeps the number, #8's is `0033` here and #2's `0034`. Against the image
   before them (`0001`-`0025`), on four GB10s with this cluster's switches: `tools/validate.py` passed and its 8 greedy
