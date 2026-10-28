@@ -1,5 +1,12 @@
 # Changelog
 
+- **2026-10-27** -- image-keyed prompt cache (`0027`): a kept prompt state is keyed by the request's images as well as its
+  tokens, so a chat whose history holds a picture (a screenshot in a tool result, say) resumes its prefill instead of
+  re-running it from 0 on every turn. Measured on 4x GB10 TP4 (16 streams, 2.8k tok/s prefill): one 150k-token prompt
+  replayed in 0.64 s (82x) without an image and 53.6 s (1.0x) with one before this patch; both replay now. Text-only
+  requests are unchanged (the key is 0 for every prefix, so the tokens alone decide), a state kept for a picture is
+  never learned to disk, and it is not resumed by a prompt whose prefix holds no image.
+
 - **2026-10-26** -- `stop.sh` exits 1 when a rank may still run (a rank it could not stop, or a Spark whose containers
   it could not list); `DRY_RUN=1` writes no NCCL graph files; the prepared marker also covers `HF_CACHE`, the NFS
   settings and the chat template, and a state that cannot be computed never reads as ready. Offline regression tests

@@ -1,0 +1,305 @@
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index 6c8572e..bbd5af6 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -77,13 +77,28 @@ pub const LaneHost = struct {
+         entry: ?*pc.Entry = null, // the kept state the backend restores, until its prompt pass reports
+         marks: []const u32 = &.{}, // where the pass keeps states (gpa-owned)
+         kept0: u64 = 0, // the store's kept count when the job looked it up
++        images: pc.Images = .none, // the images key of the prompt's prefixes (0 for a prompt without images)
+ 
+         /// The backend's prompt pass stands at a mark: the cache keeps the stream's state there.
+         fn kept(ptr: *anyopaque, s: *lanes.Stream, at: u32) void {
+             const job: *Job = @ptrCast(@alignCast(ptr));
+             job.reported(); // before a keep can evict the entry the pass restored
+-            if (job.request.images.len > 0) return; // a kept state is keyed by tokens: an image's are its placeholder's
+-            if (job.host.cache) |store| _ = store.keep(job.request.prompt, at, s, job.request.chunks);
++            if (job.host.cache) |store| _ = store.keepKeyed(job.request.prompt, at, s, job.request.chunks, job.images);
++        }
++
++        /// The images key of the request's `[0, at)`: its pictures' spans and bytes, hashed. A kept state holds its
++        /// image spans' placeholders as tokens, so the key is what tells one picture from another (0: none).
++        fn imageKey(ctx: ?*const anyopaque, at: u32) u64 {
++            const r: *const Request = @ptrCast(@alignCast(ctx orelse return 0));
++            var h = std.hash.Wyhash.init(0x696d61676573); // "images"
++            var any = false;
++            for (r.images) |img| {
++                if (img.at >= at) continue; // the image starts past the kept prefix
++                any = true;
++                var fields = [3]u64{ img.at, img.tokens, std.hash.Wyhash.hash(0, img.bytes) };
++                h.update(std.mem.asBytes(&fields));
++            }
++            return if (any) h.final() | 1 else 0; // odd: never 0, which means no image in the prefix
+         }
+ 
+         /// Report a restored prefix or its failed copy; an untouched prefix remains kept.
+@@ -391,8 +406,9 @@ pub const LaneHost = struct {
+         h.unlock();
+         const r = job.request;
+         var reuse: lanes.stream.Reuse = .{};
++        job.images = .{ .ctx = @ptrCast(r), .hash = Job.imageKey };
+         // the entry stays alive until the backend restores it: nothing keeps between here and this stream's own pass
+-        if (r.images.len == 0) if (h.cache) |store| if (store.lookup(h.gpa, r.prompt, r.history_len, r.shared_prefixes, r.chunks)) |l| {
++        if (h.cache) |store| if (store.lookupKeyed(h.gpa, r.prompt, r.history_len, r.shared_prefixes, r.chunks, job.images)) |l| {
+             job.entry = l.entry;
+             job.kept0 = store.counts.kept;
+             job.marks = l.marks;
+diff --git a/zig/src/core/prompt_cache.zig b/zig/src/core/prompt_cache.zig
+index cb9ac8f..7ba65cc 100644
+--- a/zig/src/core/prompt_cache.zig
++++ b/zig/src/core/prompt_cache.zig
+@@ -51,6 +51,7 @@ pub const Rules = struct {
+ pub const Entry = struct {
+     tokens: []u32, // the state's tokens and `lookahead` more
+     at: u32,
++    images: u64 = 0, // the images key of the tokens before `at` (0: none, the tokens alone decide)
+     saved: Saved,
+     bytes: u64,
+     born: u32, // the length of the prompt that kept it: a later turn's is longer
+@@ -59,6 +60,25 @@ pub const Entry = struct {
+     shared: bool = false, // kept at a shared system block's cut: other conversations resume it, so its own never supersedes it
+ };
+ 
++/// What a kept state depends on beyond its tokens: the images inside its prefix. An image's positions hold only its
++/// placeholder's token, so two prompts with the same tokens but different pictures must not share a state.
++pub const Images = struct {
++    ctx: ?*const anyopaque = null,
++    /// The key of the images in a prompt's `[0, at)`: 0 when it holds none (the tokens alone decide, as before).
++    hash: *const fn (ctx: ?*const anyopaque, at: u32) u64 = noImages,
++    /// No images: every prefix keys to 0, so the tokens alone decide.
++    pub const none: @This() = .{};
++
++    /// The key of the images in a prompt's `[0, at)`.
++    pub fn key(im: Images, at: u32) u64 {
++        return im.hash(im.ctx, at);
++    }
++
++    fn noImages(_: ?*const anyopaque, _: u32) u64 {
++        return 0;
++    }
++};
++
+ pub const Counts = struct { hits: u64 = 0, misses: u64 = 0, kept: u64 = 0, evicted: u64 = 0, refused: u64 = 0, failed: u64 = 0 };
+ 
+ /// Where a prompt pass starts and where it stops to keep its state (marks sorted, in `a`).
+@@ -122,10 +142,16 @@ pub const Store = struct {
+ 
+     /// The longest kept state `prompt` resumes exactly: its tokens a prefix of the prompt, at least one row left.
+     pub fn find(s: *Store, prompt: []const u32, starts: []const u32) ?*Entry {
++        return s.findKeyed(prompt, starts, .none);
++    }
++
++    /// `find` for a prompt with images: a kept state also matches only if it holds the same images in its prefix.
++    pub fn findKeyed(s: *Store, prompt: []const u32, starts: []const u32, images: Images) ?*Entry {
+         var best: ?*Entry = null;
+         for (s.entries.items) |e| {
+             if (e.tokens.len > prompt.len or e.at >= prompt.len or !s.usable(e.at, starts)) continue;
+             if (best != null and e.at <= best.?.at) continue;
++            if (e.images != images.key(e.at)) continue;
+             const n = e.tokens.len;
+             if (prompt[n - 1] != e.tokens[n - 1] or !std.mem.eql(u32, prompt[0..n], e.tokens)) continue;
+             best = e;
+@@ -149,7 +175,12 @@ pub const Store = struct {
+ 
+     /// begin without the restore, for backends that restore inside their own prompt pass and then call `resumed`.
+     pub fn lookup(s: *Store, a: Allocator, prompt: []const u32, history_len: u32, shared: []const u32, starts: []const u32) !Lookup {
+-        const e = s.recall(prompt, starts, s.find(prompt, starts));
++        return s.lookupKeyed(a, prompt, history_len, shared, starts, .none);
++    }
++
++    /// `lookup` for a prompt with images: the states it resumes and keeps are keyed by its images as well.
++    pub fn lookupKeyed(s: *Store, a: Allocator, prompt: []const u32, history_len: u32, shared: []const u32, starts: []const u32, images: Images) !Lookup {
++        const e = s.recall(prompt, starts, s.findKeyed(prompt, starts, images), images);
+         if (e == null) s.counts.misses += 1;
+         const marks_ = try s.fitting(a, try s.marks(a, prompt, if (e) |x| x.at else 0, history_len, shared, starts, if (e) |x| x.last else &.{}));
+         for (shared) |w| { // the shared cuts this pass keeps: their states serve other conversations too
+@@ -249,11 +280,17 @@ pub const Store = struct {
+ 
+     /// The prompt pass stands at `at`: keep its state for `prompt`, evicting to fit; refused (counted) past the budget.
+     pub fn keep(s: *Store, prompt: []const u32, at: u32, owner: ?*anyopaque, starts: []const u32) bool {
++        return s.keepKeyed(prompt, at, owner, starts, .none);
++    }
++
++    /// `keep` for a prompt with images: the state is keyed by its images too, and a state with images is never learned.
++    pub fn keepKeyed(s: *Store, prompt: []const u32, at: u32, owner: ?*anyopaque, starts: []const u32, images: Images) bool {
+         const n = @as(usize, at) + s.rules.lookahead;
+         if (at == 0 or n > prompt.len) return false;
+         s.clock += 1;
++        const key = images.key(at);
+         const shared = std.mem.indexOfScalar(u64, s.shared_keys.items, sharedKey(prompt[0..n])) != null;
+-        for (s.entries.items) |e| if (e.at == at and std.mem.eql(u32, e.tokens, prompt[0..n])) {
++        for (s.entries.items) |e| if (e.at == at and e.images == key and std.mem.eql(u32, e.tokens, prompt[0..n])) {
+             e.used = s.clock; // the same state again: no copy
+             e.shared = e.shared or shared;
+             return true;
+@@ -293,14 +330,14 @@ pub const Store = struct {
+             return s.fail(at, err);
+         };
+         const charged = if (s.family.vtable.charged) |f| f(s.family.ptr, saved) else bytes;
+-        e.* = .{ .tokens = tokens, .at = at, .saved = saved, .bytes = charged, .born = @intCast(prompt.len), .used = s.clock, .last = last, .shared = shared };
++        e.* = .{ .tokens = tokens, .at = at, .images = key, .saved = saved, .bytes = charged, .born = @intCast(prompt.len), .used = s.clock, .last = last, .shared = shared };
+         s.entries.append(s.gpa, e) catch {
+             s.free(e);
+             return s.fail(at, error.OutOfMemory);
+         };
+         s.held += charged;
+         s.counts.kept += 1;
+-        if (shared) s.learn(e, starts);
++        if (shared and key == 0) s.learn(e, starts); // a learned state is found by its tokens alone: image-free cuts only
+         if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| s.held); // spare storage only inside what the budget leaves
+         return true;
+     }
+@@ -324,10 +361,11 @@ pub const Store = struct {
+     }
+ 
+     /// A learned state on disk longer than `have`, read back as a shared entry; else `have` (none, or reading failed).
+-    fn recall(s: *Store, prompt: []const u32, starts: []const u32, have: ?*Entry) ?*Entry {
++    fn recall(s: *Store, prompt: []const u32, starts: []const u32, have: ?*Entry, images: Images) ?*Entry {
+         const im = s.imprint orelse return have;
+         const read = s.family.vtable.read orelse return have;
+         const m = im.best(prompt, starts, s.rules.planned, if (have) |x| x.at else 0) orelse return have;
++        if (images.key(m.at) != 0) return have; // a learned state was kept for a prefix without images
+         const bytes = s.family.vtable.bytes(s.family.ptr, m.at);
+         while (bytes <= s.budget and s.held + s.spare() + bytes > s.budget) {
+             s.remove(s.victimBut(have, prompt) orelse return have);
+@@ -335,7 +373,7 @@ pub const Store = struct {
+         }
+         if (bytes > s.budget) return have;
+         const e = s.gpa.create(Entry) catch return have;
+-        e.* = .{ .tokens = &.{}, .at = m.at, .saved = undefined, .bytes = bytes, .born = @intCast(prompt.len), .used = s.clock, .last = &.{}, .shared = true };
++        e.* = .{ .tokens = &.{}, .at = m.at, .images = 0, .saved = undefined, .bytes = bytes, .born = @intCast(prompt.len), .used = s.clock, .last = &.{}, .shared = true };
+         e.tokens = s.gpa.dupe(u32, m.tokens) catch return s.drop(e, have, false);
+         e.last = s.gpa.dupe(u32, prompt) catch return s.drop(e, have, false);
+         const key = m.key;
+diff --git a/zig/src/core/prompt_cache_test.zig b/zig/src/core/prompt_cache_test.zig
+index 9dabc21..dd3561b 100644
+--- a/zig/src/core/prompt_cache_test.zig
++++ b/zig/src/core/prompt_cache_test.zig
+@@ -7,6 +7,7 @@ const Snapshots = pc.Snapshots;
+ const Saved = pc.Saved;
+ const Store = pc.Store;
+ const Plan = pc.Plan;
++const Images = pc.Images;
+ const Allocator = std.mem.Allocator;
+ 
+ /// Rank 1's bytes: it applies a request's drops before that request's keeps; drops made during a pass wait for the next request.
+@@ -134,17 +135,22 @@ const Fake = struct {
+ 
+     /// A prompt pass from `plan.from`, keeping at each mark; returns the sum a fresh pass would give.
+     fn pass(f: *Fake, s: *Store, prompt: []const u32, plan: Plan) u64 {
+-        if (plan.from == 0) f.* = .{ .gpa = f.gpa, .fail_save = f.fail_save, .fail_restore = f.fail_restore, .live = f.live, .spare_bytes = f.spare_bytes, .peer = f.peer };
++        return f.passKeyed(s, prompt, plan.from, plan.marks, .none);
++    }
++
++    /// `pass` for a prompt with images: the states it keeps are keyed by them too.
++    fn passKeyed(f: *Fake, s: *Store, prompt: []const u32, from: u32, marks: []const u32, images: Images) u64 {
++        if (from == 0) f.* = .{ .gpa = f.gpa, .fail_save = f.fail_save, .fail_restore = f.fail_restore, .live = f.live, .spare_bytes = f.spare_bytes, .peer = f.peer };
+         if (f.peer) |p| p.in_pass = true;
+         defer if (f.peer) |p| {
+             p.in_pass = false;
+         };
+         var mi: usize = 0;
+-        for (prompt[plan.from..]) |t| {
++        for (prompt[from..]) |t| {
+             f.sum = f.sum *% 31 +% t;
+             f.at += 1;
+-            if (mi < plan.marks.len and plan.marks[mi] == f.at) {
+-                _ = s.keep(prompt, f.at, null, &.{});
++            if (mi < marks.len and marks[mi] == f.at) {
++                _ = s.keepKeyed(prompt, f.at, null, &.{}, images);
+                 mi += 1;
+             }
+         }
+@@ -152,6 +158,26 @@ const Fake = struct {
+     }
+ };
+ 
++/// Where a lookup's pass starts: the resumed state's mark, else 0.
++fn startsAt(l: pc.Lookup) u32 {
++    return if (l.entry) |e| e.at else 0;
++}
++
++/// A prompt's one image: its span starts at `at`, and its bytes are told apart by `tag`.
++const OneImage = struct {
++    at: u32,
++    tag: u64,
++
++    fn images(o: *const OneImage) Images {
++        return .{ .ctx = @ptrCast(o), .hash = key };
++    }
++
++    fn key(ctx: ?*const anyopaque, at: u32) u64 {
++        const o: *const OneImage = @ptrCast(@alignCast(ctx orelse return 0));
++        return if (o.at < at) o.tag | 1 else 0; // a state's prefix holds the images that start before its mark
++    }
++};
++
+ fn fresh(prompt: []const u32) u64 {
+     var sum: u64 = 0;
+     for (prompt) |t| sum = sum *% 31 +% t;
+@@ -475,3 +501,41 @@ test "past the learned-state cap the least recently used state is forgotten, and
+     try std.testing.expectEqual(fresh(&p3), g.pass(&t, &p3, plan));
+     try std.testing.expect(im.has(imprint.Imprint.keyOf(&two))); // learned again by that pass
+ }
++
++test "a kept state keys the prompt's images: another picture at the same tokens resumes nothing" {
++    const gpa = std.testing.allocator;
++    var arena: std.heap.ArenaAllocator = .init(gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var f: Fake = .{ .gpa = gpa };
++    var s = Store.init(gpa, f.snapshots(), .{ .min_prompt = 0 }, 1 << 20);
++    defer s.deinit();
++    // an image's positions hold its placeholder token, so two different pictures give one prompt's tokens
++    const prompt = [_]u32{ 7, 7, 7, 7, 7, 7, 7, 7 };
++    const first: OneImage = .{ .at = 2, .tag = 0x1111 };
++    const other: OneImage = .{ .at = 2, .tag = 0x2222 };
++    const later: OneImage = .{ .at = 5, .tag = 0x3333 }; // starts at the mark: outside the state's prefix
++    const plan = try s.lookupKeyed(a, &prompt, 5, &.{}, &.{}, first.images());
++    try std.testing.expectEqual(@as(?*pc.Entry, null), plan.entry);
++    try std.testing.expectEqual(fresh(&prompt), f.passKeyed(&s, &prompt, startsAt(plan), plan.marks, first.images()));
++    // the same picture resumes at the history mark, and the pass past it equals a fresh one
++    const again = try s.lookupKeyed(a, &prompt, 5, &.{}, &.{}, first.images());
++    try std.testing.expectEqual(@as(u32, 5), again.entry.?.at);
++    try Fake.restoreFn(&f, null, again.entry.?.saved); // the backend restores before its first chunk
++    s.resumed(again.entry.?, &prompt, true);
++    try std.testing.expectEqual(fresh(&prompt), f.passKeyed(&s, &prompt, startsAt(again), again.marks, first.images()));
++    // another picture at that span resumes nothing, and keeps its state beside the first
++    const diff = try s.lookupKeyed(a, &prompt, 5, &.{}, &.{}, other.images());
++    try std.testing.expectEqual(@as(?*pc.Entry, null), diff.entry);
++    try std.testing.expectEqual(fresh(&prompt), f.passKeyed(&s, &prompt, startsAt(diff), diff.marks, other.images()));
++    try std.testing.expectEqual(@as(usize, 2), s.entries.items.len);
++    // an image that starts at the mark is outside the prefix: its key is 0, so no picture's state resumes...
++    try std.testing.expectEqual(@as(?*pc.Entry, null), (try s.lookupKeyed(a, &prompt, 5, &.{}, &.{}, later.images())).entry);
++    // ...and a prompt without images keeps, and then resumes, its own state beside both pictures'
++    const plain = try s.lookup(a, &prompt, 5, &.{}, &.{});
++    try std.testing.expectEqual(@as(?*pc.Entry, null), plain.entry);
++    try std.testing.expectEqual(fresh(&prompt), f.passKeyed(&s, &prompt, startsAt(plain), plain.marks, .none));
++    try std.testing.expectEqual(@as(u32, 5), (try s.lookup(a, &prompt, 5, &.{}, &.{})).entry.?.at);
++    try std.testing.expectEqual(@as(u32, 5), (try s.lookupKeyed(a, &prompt, 5, &.{}, &.{}, later.images())).entry.?.at);
++    try std.testing.expectEqual(@as(u32, 5), (try s.lookupKeyed(a, &prompt, 5, &.{}, &.{}, other.images())).entry.?.at);
++}
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index fb93cf0..6c5b514 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -493,8 +493,8 @@ pub const Lanes = struct {
+         var moved = false;
+         if (s.reuse.saved) |p| {
+             const sn: *Snap = @ptrCast(@alignCast(p));
+-            // (a kept state knows no images: a prompt with them runs whole and keeps nothing)
+-            if (s.images.len == 0 and self.usable(sn, len)) {
++            // (the host's cache keys a state by its images too: a resumed prefix holds the same pictures)
++            if (self.usable(sn, len)) {
+                 kept = sn;
+                 // in place unless the extent runs past the pool, a live stream holds it, or another kept state has
+                 // rows past the kept ones (resuming there would stale it: the rows go to a free extent instead, as
+@@ -613,7 +613,7 @@ pub const Lanes = struct {
+             }
+             head = try m.fillChunk(seq.items[0 .. start + n], start, n, replay);
+             start += n;
+-            if (s.images.len == 0) if (s.reuse.hook) |k| if (start < len and start <= replay and (start == last_end or markEnds(s.reuse.marks, start))) k.at(k.ptr, s, @intCast(start));
++            if (s.reuse.hook) |k| if (start < len and start <= replay and (start == last_end or markEnds(s.reuse.marks, start))) k.at(k.ptr, s, @intCast(start));
+             // Track D (TF_DS_PREFILL_YIELD=1): a round of the other live streams before the next chunk. The prompt's
+             // chunks and their boundaries are the same (its state between chunks is its extent's rows and its slot's,
+             // which a round of other slots leaves alone); the Engram read-ahead is joined first (as a follower joins it

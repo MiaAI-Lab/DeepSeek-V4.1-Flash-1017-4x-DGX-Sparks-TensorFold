@@ -342,6 +342,7 @@ measurements and rationale: [`CHANGELOG.md`](CHANGELOG.md); authorship: [`CREDIT
 | `0024` | Mia's AI Lab | `TF_DS_DRAFT_ROW_MS` | Draft rows priced at a measured constant instead of the round table (mixed; kept for later) |
 | `0025` | Mia's AI Lab | `TF_DS_IDX_SHARD` (on, this cluster) | Indexer scores and picks only its own owned quarter of rows |
 | `0026` | knapcio | -- (on) | RDMA queue pairs use the port's active MTU (capped at 4096) instead of a fixed 4096, so RDMA works on a switch whose Ethernet MTU is 1500 |
+| `0027` | this cluster | -- (on) | A kept prompt state is keyed by the request's images as well as its tokens: an image's positions hold only its placeholder's token, so a chat with a picture in its history used to keep nothing and re-prefill every turn |
 
 ## Repository layout
 
