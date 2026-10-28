@@ -52,9 +52,11 @@ rank's rendezvous address). Full list: [Credits](#credits) and [`CREDITS.md`](CR
 - One command on spark1: `./start.sh` (a switch) or `./start-switchless.sh` (a ring) sets up all four Sparks and
   starts the four ranks; `./stop.sh` stops them
 
-**This recipe's own patches** ([`zig/patches`](zig/patches)) **are Mia's AI Lab's work, except `0008`, `0026` and `0027`**
-(Hector, knapcio and uchkw, respectively) -- see [What the patches change](#what-the-patches-change) and [Credits](#credits) for who found or
-shaped each specific fix along the way.
+**This recipe's own patches** ([`zig/patches`](zig/patches)) **are Mia's AI Lab's work, except `0008` (Hector), `0026`
+(knapcio), `0027` (Thomas Kempka), `0028` and `0029` (upstream TensorFold fixes backported by Mauvis Ledford), `0030`
+and `0031` (Mauvis Ledford), `0033` (a backport by Manuel, manuel1618) and `0034` (Hironori Uchikawa, uchkw)** -- see
+[What the patches change](#what-the-patches-change) and [Credits](#credits) for who found or shaped each specific fix
+along the way.
 
 ## Contents
 
