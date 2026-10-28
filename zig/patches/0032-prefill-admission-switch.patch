@@ -1,0 +1,102 @@
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index f952d97c..8c32b789 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -385,7 +385,7 @@ pub const LaneHost = struct {
+             return false;
+         }
+         if (h.full_wait) |n| {
+-            const active = h.admitted.items.len;
++            const active = if (h.core.fills()) h.admitted.items.len else h.core.activeCount();
+             if (active > 0 and active >= n and std.Io.Clock.awake.now(h.io).toNanoseconds() < h.full_retry) {
+                 h.unlock();
+                 return false;
+@@ -619,7 +619,7 @@ pub const LaneHost = struct {
+             h.finish(job, .failed, "out of memory");
+             return true;
+         };
+-        h.full_wait = h.admitted.items.len;
++        h.full_wait = if (h.core.fills()) h.admitted.items.len else h.core.activeCount();
+         h.full_retry = std.Io.Clock.awake.now(h.io).toNanoseconds() + full_retry_ns;
+         h.unlock();
+         return false;
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index 6b7a5c9d..ad742c17 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -367,21 +367,29 @@ pub const Lanes = struct {
+         self.wire.deinit(self.gpa);
+     }
+ 
++    /// TF_DS_PREFILL_YIELD=1: the served host advances a prompt a chunk at a time (prefillStep), admitting the queued
++    /// requests and running the live streams' rounds between its chunks. Else the whole prompt in one call, as served.
+     pub fn backend(self: *Lanes) be.Backend {
+-        return .{ .ptr = self, .vtable = &.{
+-            .prefill = prefillFn,
+-            .prefill_step = prefillStep,
+-            .first = firstFn,
+-            .queue = queueFn,
+-            .read = readFn,
+-            .verify = verifyFn,
+-            .keep = keepFn,
+-            .draft = draftFn,
+-            .probabilities = probabilitiesFn,
+-            .release = releaseFn,
+-        } };
++        return .{ .ptr = self, .vtable = if (yieldOn()) &vt_stepping else &vt_whole };
+     }
+ 
++    const vt_whole: be.Backend.VTable = .{
++        .prefill = prefillFn,
++        .first = firstFn,
++        .queue = queueFn,
++        .read = readFn,
++        .verify = verifyFn,
++        .keep = keepFn,
++        .draft = draftFn,
++        .probabilities = probabilitiesFn,
++        .release = releaseFn,
++    };
++    const vt_stepping: be.Backend.VTable = blk: {
++        var v = vt_whole;
++        v.prefill_step = prefillStep;
++        break :blk v;
++    };
++
+     /// The facts the round loop reads: windows of the pending row and up to the drafter's block, several streams'
+     /// windows in one forward of at most 16 rows (four streams), the drafter's chances, the served lane's round ms.
+     pub fn facts(self: *const Lanes) lanes.Model {
+@@ -414,8 +422,9 @@ pub const Lanes = struct {
+         return std.mem.eql(u8, std.mem.span(v), "1");
+     }
+ 
+-    /// TF_DS_PREFILL_YIELD=1: Track D, a decode round of the live streams between a prompt's chunks. Unset or any other
+-    /// value: the whole prompt first, as served.
++    /// TF_DS_PREFILL_YIELD=1: Track D, a decode round of the live streams between a prompt's chunks, and in the served
++    /// host the queued requests admitted between them too (0031's bounded prefill). Unset or any other value: the whole
++    /// prompt first, as served.
+     fn yieldOn() bool {
+         const v = std.c.getenv("TF_DS_PREFILL_YIELD") orelse return false;
+         return std.mem.eql(u8, std.mem.span(v), "1");
+@@ -479,7 +488,8 @@ pub const Lanes = struct {
+ 
+     // -- the vtable ---------------------------------------------------------------------------------------------
+ 
+-    /// The standalone path still completes a prompt; the served host advances prefillStep one chunk at a time.
++    /// The whole prompt (TF_DS_PREFILL_YIELD unset, and the standalone path); the served host with it set advances
++    /// prefillStep one chunk at a time instead.
+     fn prefillFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!void {
+         while (!try prefillStep(ptr, s)) {
+             if (s.between) |b| if (yieldOn() and b.ready(b.ptr)) try b.run(b.ptr);
+@@ -684,8 +694,9 @@ pub const Lanes = struct {
+         if (s.reuse.hook) |k| if (f.start < len and f.start <= f.replay and
+             (f.start == f.last_end or markEnds(s.reuse.marks, f.start))) k.at(k.ptr, s, @intCast(f.start));
+         if (f.start < len) {
+-            // Leave read-ahead running for a prompt alone; a slot switch joins it in startFill/selectFill.
+-            if (s.between) |b| if (b.ready(b.ptr)) {
++            // Leave read-ahead running for a prompt alone; a slot switch joins it in startFill/selectFill. Without
++            // TF_DS_PREFILL_YIELD no round runs between the chunks, so the read-ahead runs on, as served
++            if (yieldOn()) if (s.between) |b| if (b.ready(b.ptr)) {
+                 m.joinAhead();
+                 m.fill_seq = &.{};
+             };
