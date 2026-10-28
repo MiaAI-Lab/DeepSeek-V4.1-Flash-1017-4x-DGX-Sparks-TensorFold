@@ -319,6 +319,41 @@ node_order() { echo 0,1,2,3; }
         self.assertEqual(sorted(self.launched()), ["head", "w1", "w2", "w3"], out)
         self.assertIn("is now LIVE", out)
 
+    def test_a_worker_reads_its_weight_file_from_its_disk_when_its_copy_matches(self):
+        for h in ["head", "w1", "w2", "w3"]:
+            self.containers(h, NAME)
+        code, out = self.bash('echo "@$DATA_DIR|$WORKER_RANK_DIR"')
+        data_dir, rank_dir = out.split("@")[-1].strip().split("|")
+        cache = Path(data_dir) / "rank-cache"
+        cache.mkdir(parents=True)
+        for n in range(4):
+            (cache / f"rank{n}of4-abc.bin").write_bytes(b"x" * (10 + n))
+        w2 = Path(rank_dir.replace("$HOME", str(self.sim / "home" / "w2")))
+        w2.mkdir(parents=True)
+        (w2 / "rank2of4-abc.bin").write_bytes(b"x" * 12)  # the size of this Spark's node-2 file
+        w3 = Path(rank_dir.replace("$HOME", str(self.sim / "home" / "w3")))
+        w3.mkdir(parents=True)
+        (w3 / "rank3of4-abc.bin").write_bytes(b"x" * 5)  # a partial copy: not used
+
+        def runs():
+            log = (self.sim / "docker.log").read_text()
+            (self.sim / "docker.log").unlink()
+            return {l.split()[0]: l for l in log.splitlines() if " docker run -d " in l}
+
+        code, out = self.run_script(["start.sh", "restart"], {"PREPARE": "0"})
+        self.assertEqual(code, 0, out)
+        r = runs()
+        self.assertIn(":/rank-local:ro", r["w2"], out)
+        self.assertIn(" /rank-local 2 4 ", r["w2"], out)
+        for h in ("w1", "w3"):
+            self.assertNotIn("/rank-local", r[h], out)
+        self.assertIn("rank 1 reads its weight file over NFS", out)
+        self.assertIn("rank 3 reads its weight file over NFS", out)
+        code, out = self.run_script(["start.sh", "restart"], {"PREPARE": "0", "RANK_LOCAL": "0"})
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("/rank-local", "".join(runs().values()), out)
+        self.assertNotIn("reads its weight file over NFS", out)
+
     def test_restart_stops_when_a_rank_cannot_be_stopped(self):
         for h in ["head", "w1", "w2", "w3"]:
             self.containers(h, NAME)

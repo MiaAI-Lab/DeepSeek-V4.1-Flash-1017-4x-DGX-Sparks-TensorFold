@@ -280,6 +280,11 @@ ring, mounts through spark2's routed address). With an export whose root (`fsid=
 `NFS_PATH=/huggingface` (the default). `scripts/prepare.sh` makes a docker volume `dsv41-hf` on each worker, mounts it
 and checks that every file a rank reads is there, at the right size.
 
+Each worker's weight file (~77-81 GB) is the exception: `scripts/prepare.sh` copies the one a worker reads to its own
+disk once (`WORKER_RANK_DIR`, under `~/.cache/dsv41-tensorfold`), and `start.sh` mounts that copy when its name and
+size match spark1's, so a start reads no weights over NFS. A worker without a matching copy (short of disk, say)
+reads over NFS as before, with a warning. `RANK_LOCAL=0` turns the copies off.
+
 ## Engram's packed rows (opt-in)
 
 Each decode round and prompt chunk reads Engram rows from two tables of ~384 million rows each (~203 GB). By default
@@ -344,6 +349,7 @@ Settings come from the environment, then `scripts/local.sh`, then `./.env`, then
 | `GRAPHS` / `SIDE` / `PREFETCH` | 1 / 1 / 1 | CUDA graphs, the side stream, the paced L2 prefetch |
 | `ENGRAM_PACKED` / `ENGRAM_OWNED` | 0 / 1 | Engram's rows from packed shards; each Spark its quarter of them ([above](#engrams-packed-rows-opt-in)) |
 | `ENGRAM_CACHE_MIB` / `ENGRAM_INSTREAM` | 2048 / 0 | with packing: the row cache a Spark; the round's wait as a stream host step |
+| `RANK_LOCAL` / `WORKER_RANK_DIR` | 1 / `~/.cache/dsv41-tensorfold/rank-cache-...` | each worker's weight file from its own disk ([NFS](#nfs)) |
 | `ROUND_MS` | measured table | a decode round's ms by its rows, the price the lane uses to choose drafts ([Performance](#performance)) |
 | `DRAFT_MS` | 25 | the one-stream draft chooser's per-round constant (`TF_DS_DRAFT_MS`) |
 | `SERVED_K` | solo | `solo`, `all` or `off`: where the per-stream draft chooser trims a round (`TF_DS_SAMPLE_CAND`, `TF_DS_PREPASS`, `TF_DS_EXPERT_EXIT`, `TF_DS_PREFILL_YIELD`, `TF_DS_DRAFT_ROW_MS` below are engine switches) |
