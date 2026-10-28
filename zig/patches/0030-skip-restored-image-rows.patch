@@ -1,0 +1,13 @@
+Subject: Skip vision work for images fully covered by a keyed restored prefix
+
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -538,6 +538,8 @@
+                     if (q.* != @as(i64, image_id)) return error.BadImageSpan;
+                     q.* = -1;
+                 }
++                // The keyed snapshot already contains these image rows; only a span crossing its cut needs encoding.
++                if (kept) |sn| if (@as(usize, img.at) + img.tokens <= sn.at) continue;
+                 if (img.rows) {
+                     if (img.bytes.len != img.tokens * row_bytes) return error.BadImageRows;
+                     try rows.appendSlice(gpa, img.bytes);
