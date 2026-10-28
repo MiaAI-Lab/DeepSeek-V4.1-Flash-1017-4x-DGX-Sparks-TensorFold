@@ -1,5 +1,18 @@
 # Changelog
 
+- **2026-10-28** -- `0036`, structured output and required tool calls
+  ([#6](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/issues/6)): upstream TensorFold's
+  structured output (BobClawblaw's lane-core grammar and libtfgrammar, Ash Hart's required tool calls and grammar-aware
+  drafting) and BertholomusAI's DeepSeek-V4.1 hooks and DSML tool-call grammar (bertholomus), ported onto this pin; the
+  image builds libtfgrammar from xgrammar v0.2.8. `response_format` (`json_schema`, `json_object`), the `guided_*`
+  fields and `tool_choice` "required" or a named function used to return HTTP 400; now every token is drawn among the
+  tokens the grammar allows. Tested on this cluster: 15 of 15 checks (a JSON schema greedy, sampled and with thinking,
+  `json_object`, `guided_regex`, `guided_choice`, a streamed schema, `tool_choice` required with and without thinking, a
+  named function, `auto` as before, a malformed regex refused with xgrammar's reason, a plain reply beside a structured
+  one equal to its solo run); eight requests at once, half structured, all valid; `tools/validate.py` passed with its 8
+  greedy replies equal to the saved ones; decode speed unchanged (61 tok/s on one stream). One structured stream alone
+  runs about as fast as the same reply unconstrained (25 cities as a JSON schema: 108 tok/s greedy and 121 sampled,
+  against 104 and 109).
 - **2026-10-28** -- `model/chat_template.jinja` writes each piece out as it is made instead of appending to one string
   with `{% set ns.out = ns.out + ... %}` (hashd1ve's fix from the two-Spark recipe, its issue #1 and `fd2cdb2`, carried
   over byte for byte by manuel1618 in #18, for #17). The engine's Jinja copies the whole string on every `+` and keeps

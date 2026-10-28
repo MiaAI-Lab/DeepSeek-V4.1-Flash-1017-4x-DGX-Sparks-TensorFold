@@ -46,8 +46,9 @@ DGX Sparks. Almost everything that makes it work was built by others. Its own wo
 
 **Every patch is Mia's AI Lab's own work, except `0008`, which is Hector's, `0026`, which is knapcio's, `0027`, which is
 Thomas Kempka's, `0028` and `0029`, upstream TensorFold fixes backported by Mauvis Ledford, `0030` and `0031`, which are
-Mauvis Ledford's, `0033`, a backport by Manuel (manuel1618), and `0034`, which is Hironori Uchikawa's (uchkw,
-Codex-assisted).** At a glance:
+Mauvis Ledford's, `0033`, a backport by Manuel (manuel1618), `0034`, which is Hironori Uchikawa's (uchkw,
+Codex-assisted), and `0036`, a port of upstream TensorFold's structured output (BobClawblaw, Ash Hart) and of
+BertholomusAI's DeepSeek-V4.1 part of it (bertholomus).** At a glance:
 
 | Patches | Author | What |
 | --- | --- | --- |
@@ -64,6 +65,7 @@ Codex-assisted).** At a glance:
 | `0033` | Manuel ([manuel1618](https://github.com/manuel1618)) | `/metrics`' cached prompt-token counter, backported |
 | `0034` | Hironori Uchikawa ([uchkw](https://github.com/uchkw)) (Codex-assisted) | globally quiesce and futex-park idle RDMA proxies; wake before compute |
 | `0035` | Mia's AI Lab | rank 0's rendezvous ports open before its weights load, so a worker that loads first waits |
+| `0036` | BobClawblaw, [Ash Hart](https://github.com/ashhart), [bertholomus](https://github.com/bertholomus); ported by Mia's AI Lab | structured output and required tool calls (below) |
 
 The per-patch notes below also credit everyone who helped find or shape a specific fix along the way -- Hector's
 reviewer, Codex and Grok's live-bug diagnosis and design reviews, an outside reviewer's observation -- without
@@ -233,6 +235,28 @@ Written for this recipe by Mia's AI Lab:
   [shanedertrain](https://github.com/shanedertrain): rank 0's ports open one at a time, each after the worker before
   it is in, and a worker that loads faster than those ahead of it gives up 300 s after its own load.
 
+Structured output, ported from TensorFold ([ashhart/TensorFold](https://github.com/ashhart/TensorFold)) and
+BertholomusAI's fork ([bertholomus/TensorFold](https://github.com/bertholomus/TensorFold), branch
+`deepseek-v41-zig-tp4`) in [#6](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/issues/6):
+
+- `0036` is these commits, applied in order onto this recipe's pin and `0001`-`0035`, each kept under its author:
+  - **BobClawblaw ([BobClawblaw](https://github.com/BobClawblaw))**: [`6bccf644`](https://github.com/ashhart/TensorFold/commit/6bccf644), structured output in the
+    lane core (each stream's grammar, one bitmask a verify row) and libtfgrammar, the C ABI over xgrammar, from
+    [TensorFold #596](https://github.com/ashhart/TensorFold/pull/596).
+  - **Ash Hart ([ashhart](https://github.com/ashhart))**: [`bd116970`](https://github.com/ashhart/TensorFold/commit/bd116970) (`tool_choice` "required" and a
+    named function as a grammar), [`4145b25d`](https://github.com/ashhart/TensorFold/commit/4145b25d), [`bcc7457a`](https://github.com/ashhart/TensorFold/commit/bcc7457a) (grammar-aware drafting),
+    [`4d4ee324`](https://github.com/ashhart/TensorFold/commit/4d4ee324) (a grammar stream's held drafts as host tokens), [`fd16680e`](https://github.com/ashhart/TensorFold/commit/fd16680e) and
+    [`08652e67`](https://github.com/ashhart/TensorFold/commit/08652e67) (the libtfgrammar build), [`6c151c40`](https://github.com/ashhart/TensorFold/commit/6c151c40), and the CUDA host part of
+    [`9c1d35e9`](https://github.com/ashhart/TensorFold/commit/9c1d35e9) (the host forwards the grammar hooks and offers structured output).
+  - **bertholomus ([bertholomus](https://github.com/bertholomus))**: [`d4a4b4e6`](https://github.com/bertholomus/TensorFold/commit/d4a4b4e6) (the DeepSeek-V4.1
+    lane's masked first token, held drafts and masked rounds), [`0a7e0b41`](https://github.com/bertholomus/TensorFold/commit/0a7e0b41) (`TENSORFOLD_GRAMMAR_LIB`),
+    [`9f147937`](https://github.com/bertholomus/TensorFold/commit/9f147937) (`tool_choice` "required" writes DeepSeek's DSML calls block) and
+    [`3821abd0`](https://github.com/bertholomus/TensorFold/commit/3821abd0) (a forced DSML call's marker is always its token).
+- Mia's AI Lab ported them onto this pin: the conflicts with `0021`, `0031`, `0032` and `0034` resolved (a masked
+  round reads its whole logits row instead of `0021`'s candidates; the release path keeps `0034`'s idle parking),
+  the parts of other families and of the release tooling left out, and the image's build of libtfgrammar
+  (`zig/Dockerfile`).
+
 ## Chat template
 
 - **`model/chat_template.jinja`** was written by Mia's AI Lab ([Mia-AiLab](https://huggingface.co/Mia-AiLab)) for
@@ -276,6 +300,11 @@ Written for this recipe by Mia's AI Lab:
 - [PyAV](https://github.com/PyAV-Org/PyAV) 18.1.0 by the PyAV contributors (BSD-3-Clause; its wheel's FFmpeg
   libraries are LGPL-3.0-or-later), installed into the image for video input.
 - [huggingface_hub](https://github.com/huggingface/huggingface_hub) (Apache-2.0), the `hf` download.
+- [xgrammar](https://github.com/mlc-ai/xgrammar) v0.2.8 by the XGrammar contributors (Apache-2.0; its `NOTICE`:
+  "XGrammar Copyright (c) 2024 by XGrammar Contributors"), with the [dlpack](https://github.com/dmlc/dlpack) headers
+  (Apache-2.0) and [picojson](https://github.com/kazuho/picojson) (BSD-2-Clause, Cybozu Labs and Kazuho Oku) it bundles:
+  compiled with TensorFold's `tf_grammar.cc` into the image's `libtfgrammar.so` for structured output. Their licenses
+  are in the image's `/opt/tensorfold/share/doc/tensorfold/LICENSES`, picojson's in its `THIRD_PARTY_NOTICES.md`.
 
 "DeepSeek" belongs to DeepSeek; "DGX Spark" and "GB10" belong to NVIDIA. This recipe is not affiliated with or endorsed
 by DeepSeek, NVIDIA, the TensorFold authors or BertholomusAI.

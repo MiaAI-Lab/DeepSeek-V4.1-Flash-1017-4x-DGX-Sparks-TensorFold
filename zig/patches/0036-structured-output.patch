@@ -1,0 +1,2635 @@
+diff --git a/THIRD_PARTY_NOTICES.md b/THIRD_PARTY_NOTICES.md
+index 9c101b9d..7b8e3cd1 100644
+--- a/THIRD_PARTY_NOTICES.md
++++ b/THIRD_PARTY_NOTICES.md
+@@ -123,6 +123,32 @@ TensorFold ships no model weights. The `z-lab/Qwen3.8-27B-DFlash2` model card st
+ The optional `incoai/GLM-5.3-Flash-DFlash2` model card states CC BY-NC-ND 4.0, for non-commercial use
+ without derivatives. Each checkpoint keeps its own license.
+ 
++## Structured output: libtfgrammar
++
++`lib/libtfgrammar` in the release archives is `zig/src/grammar/tf_grammar.cc` compiled with the C++ sources of
++[xgrammar](https://github.com/mlc-ai/xgrammar) v0.2.8, Apache License 2.0, Copyright (c) 2024 by XGrammar Contributors
++(its `NOTICE`: "XGrammar Copyright (c) 2024 by XGrammar Contributors"), and the headers it bundles:
++[dlpack](https://github.com/dmlc/dlpack), Apache License 2.0, and [picojson](https://github.com/kazuho/picojson),
++BSD 2-Clause License, Copyright 2009-2010 Cybozu Labs, Inc. and 2011-2014 Kazuho Oku. Nothing of theirs is in this
++repository; the build reads a checkout given with `-Dxgrammar=DIR`, and each archive carries xgrammar's and dlpack's
++license and xgrammar's notice in `LICENSES/`. picojson's license:
++
++Redistribution and use in source and binary forms, with or without modification, are permitted provided that the
++following conditions are met:
++
++1. Redistributions of source code must retain the above copyright notice, this list of conditions and the following
++   disclaimer.
++2. Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following
++   disclaimer in the documentation and/or other materials provided with the distribution.
++
++THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES,
++INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
++DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
++SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
++WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++
+ ## MIT License text
+ 
+ Permission is hereby granted, free of charge, to any person obtaining a copy
+diff --git a/build.zig b/build.zig
+index 4af884e3..78f7cc2f 100644
+--- a/build.zig
++++ b/build.zig
+@@ -2,6 +2,7 @@ const std = @import("std");
+ const builtin = @import("builtin");
+ const cuda_build = @import("zig/build/cuda.zig");
+ const dist_build = @import("zig/build/dist.zig");
++const grammar_build = @import("zig/build/grammar.zig");
+ 
+ comptime {
+     const required = std.mem.trim(u8, @embedFile(".zig-version"), "\r\n");
+@@ -133,8 +134,10 @@ pub fn build(b: *std.Build) void {
+         .linux => cuda_build.targets(b, target, optimize, draft_ids, build_options),
+         else => {},
+     }
+-    dist_build.targets(b, draft_ids, build_options, release_version);
++    const xgrammar = grammar_build.option(b);
++    dist_build.targets(b, draft_ids, build_options, release_version, xgrammar);
+     cuda_build.hostTests(b, draft_ids, test_step);
++    grammar_build.steps(b, target, xgrammar);
+ }
+ 
+ /// `zig build native -Dcpu=apple_m1`: tensorfold-native with the Metal engines for the Python package's bundle (a native M5 build traps on M1-M4).
+diff --git a/packaging/RUNTIME.md b/packaging/RUNTIME.md
+index cadabd60..59a78c56 100644
+--- a/packaging/RUNTIME.md
++++ b/packaging/RUNTIME.md
+@@ -5,7 +5,10 @@ The macOS binary targets the Apple M1 CPU instruction set and macOS 13 or later.
+ The Linux binaries target baseline x86_64 or aarch64 with glibc 2.28 or later. The NVIDIA driver supplies `libcuda.so.1`.
+ 
+ At this source revision, Nemotron's Metal kernels and draft vocabulary are embedded in the executable.
+-It does not load an adjacent Nemotron coop metallib. `lib/` is reserved for future adjacent runtime libraries.
++It does not load an adjacent Nemotron coop metallib. `lib/` holds `libtfgrammar` (`.dylib` on macOS, `.so` on Linux,
++built against the same OS floor as the binary), which structured output and required tool calls load at their first
++request; without it, those requests get HTTP 400 and everything else serves. It is xgrammar v0.2.8 (Apache-2.0) with
++dlpack (Apache-2.0) and picojson (BSD-2-Clause); their notices are in `LICENSES/` and `THIRD_PARTY_NOTICES.md`.
+ CUDA `.cu` fatbins are embedded at build time from the qualified directory supplied to the release build.
+ 
+ Inference also needs a model directory or an existing Hugging Face cache, including config, tokenizer, template
+diff --git a/tools/release/package.sh b/tools/release/package.sh
+index 8cceefc2..49633555 100644
+--- a/tools/release/package.sh
++++ b/tools/release/package.sh
+@@ -10,6 +10,16 @@ runtime=$6
+ license_dir=$7
+ third_party=$8
+ output=$9
++shift 9
++# then optionally a CUDA capture directory, and --overlay=DIR: files copied into the archive's tree (libtfgrammar)
++capture=
++overlay=
++for extra in "$@"; do
++    case "$extra" in
++        --overlay=*) overlay=${extra#--overlay=} ;;
++        *) capture=$extra ;;
++    esac
++done
+ name="tensorfold-$version-$platform"
+ mkdir -p "$output"
+ # Each invocation owns a fresh stage, including reruns of the same version/platform.
+@@ -24,8 +34,11 @@ cp -R "$license_dir/." "$stage/LICENSES/"
+ cp "$third_party" "$stage/THIRD_PARTY_NOTICES.md"
+ cp "$runtime" "$stage/RUNTIME.md"
+ printf '%s\n' "$version" > "$stage/VERSION"
+-if [ "$#" -eq 10 ]; then
+-    capture=${10}
++if [ -n "$overlay" ]; then
++    [ -z "$(find "$overlay" -type l -print)" ] || { echo 'overlay input must not contain symlinks' >&2; exit 1; }
++    cp -R "$overlay/." "$stage/"
++fi
++if [ -n "$capture" ]; then
+     [ -z "$(find "$capture" -type l -print)" ] || { echo 'CUDA capture input must not contain symlinks' >&2; exit 1; }
+     found=0
+     for sm_dir in "$capture"/sm[0-9]*; do
+diff --git a/tools/release/test_package.py b/tools/release/test_package.py
+index 7c587e2e..b2e2ec6a 100644
+--- a/tools/release/test_package.py
++++ b/tools/release/test_package.py
+@@ -32,10 +32,18 @@ def capture(dirname, sets):
+ full = capture("full", {"sm121": ["keep.cubin", "stale.cubin"], "sm120": ["older.cubin"]})
+ smaller = capture("smaller", {"sm121": ["keep.cubin"]})
+ 
+-def pack(tree=None):
++overlay = receipt / "overlay"
++(overlay / "lib").mkdir(parents=True)
++(overlay / "LICENSES").mkdir()
++(overlay / "lib/libtfgrammar.so").write_bytes(b"synthetic grammar library fixture\n")
++(overlay / "LICENSES/xgrammar-Apache-2.0.txt").write_text("synthetic license fixture\n")
++
++def pack(tree=None, extra=None):
+     args = ["sh", str(script), version, "linux-x86_64", str(binary), str(root / "LICENSE"),
+             str(root / "NOTICE"), str(root / "packaging/RUNTIME.md"), str(root / "LICENSES"),
+             str(root / "THIRD_PARTY_NOTICES.md"), str(output)]
++    if extra is not None:
++        args.append(f"--overlay={extra}")
+     if tree is not None:
+         args.append(str(tree))
+     subprocess.run(args, check=True)
+@@ -50,13 +58,16 @@ def pack(tree=None):
+         assert hashlib.sha256(files[path.removeprefix("./")]).hexdigest() == digest
+     return files
+ 
+-first = pack(full)
++first = pack(full, overlay)
++assert first["lib/libtfgrammar.so"] == b"synthetic grammar library fixture\n", "the overlay's library is missing"
++assert "LICENSES/xgrammar-Apache-2.0.txt" in first and "LICENSES/MIT.txt" in first
+ assert "share/tensorfold/cuda/sm121/cubins/stale.cubin" in first
+ second = pack(smaller)
+ assert "share/tensorfold/cuda/sm121/cubins/keep.cubin" in second
+ assert not any("stale.cubin" in p or "/sm120/" in p for p in second), "stale cubin survived a smaller capture set"
+ third = pack()
+ assert not any(p.startswith("share/") for p in third), "capture files survived removal of the AOT input"
++assert "lib/libtfgrammar.so" not in third, "overlay files survived removal of the overlay input"
+ for file in ["LICENSES/MIT.txt", "LICENSES/Apache-2.0.txt", "LICENSES/MiaAI-Lab-MIT.txt", "THIRD_PARTY_NOTICES.md"]:
+     assert third[file] == (root / file).read_bytes(), file
+ print(f"PASS same-version full -> smaller -> no capture, all hashes and notice files; receipt {receipt}")
+diff --git a/zig/build/dist.zig b/zig/build/dist.zig
+index 45b1170c..172c8be9 100644
+--- a/zig/build/dist.zig
++++ b/zig/build/dist.zig
+@@ -2,6 +2,7 @@
+ const std = @import("std");
+ const root = @import("../../build.zig");
+ const cuda = @import("cuda.zig");
++const grammar = @import("grammar.zig");
+ 
+ pub fn validVersion(v: []const u8) bool {
+     var it = std.mem.splitScalar(u8, v, '.');
+@@ -15,7 +16,7 @@ pub fn validVersion(v: []const u8) bool {
+     return count == 3;
+ }
+ 
+-pub fn targets(b: *std.Build, ids: *std.Build.Module, options: *std.Build.Step.Options, version: ?[]const u8) void {
++pub fn targets(b: *std.Build, ids: *std.Build.Module, options: *std.Build.Step.Options, version: ?[]const u8, xgrammar: ?[]const u8) void {
+     const package_tests = b.addSystemCommand(&.{"python3"});
+     package_tests.addFileArg(b.path("tools/release/test_package.py"));
+     package_tests.has_side_effects = true;
+@@ -43,6 +44,10 @@ pub fn targets(b: *std.Build, ids: *std.Build.Module, options: *std.Build.Step.O
+         step.dependOn(&b.addFail("dist-cuda-aot requires inference fatbins; it cannot be combined with dist-host-only").step);
+         return;
+     }
++    if (xgrammar == null and !host_only) {
++        step.dependOn(&b.addFail("dist requires -Dxgrammar=DIR (structured output's libtfgrammar): " ++ grammar.clone).step);
++        return;
++    }
+     const fatbin_check = if (fatbins) |dir| cuda.checkDistFatbins(b, dir) else null;
+     const sdk = sdk_override orelse if (b.graph.host.result.os.tag == .macos)
+         std.mem.trim(u8, b.run(&.{ "xcrun", "--sdk", "macosx", "--show-sdk-path" }), "\r\n")
+@@ -79,6 +84,10 @@ pub fn targets(b: *std.Build, ids: *std.Build.Module, options: *std.Build.Step.O
+         pack.addFileArg(b.path("THIRD_PARTY_NOTICES.md"));
+         const archives = pack.addOutputDirectoryArg("archives");
+         if (aot != null and p.query.os_tag == .linux and !host_only) pack.addDirectoryArg(b.graph.cwdRelativePath(aot.?));
++        if (xgrammar) |dir| pack.addPrefixedDirectoryArg("--overlay=", grammar.overlay(b, target, dir) orelse {
++            step.dependOn(&b.addFail(b.fmt("-Dxgrammar={s} is not an xgrammar " ++ grammar.pinned ++ " checkout: " ++ grammar.clone, .{dir})).step);
++            return;
++        });
+         step.dependOn(&b.addInstallDirectory(.{ .source_dir = archives, .install_dir = .prefix, .install_subdir = "dist" }).step);
+         if (b.graph.host.result.os.tag == p.query.os_tag and b.graph.host.result.cpu.arch == p.query.cpu_arch) {
+             const check = b.addSystemCommand(&.{"sh"});
+diff --git a/zig/build/grammar.zig b/zig/build/grammar.zig
+new file mode 100644
+index 00000000..242b8985
+--- /dev/null
++++ b/zig/build/grammar.zig
+@@ -0,0 +1,78 @@
++//! libtfgrammar, structured output's optional runtime library (tf_grammar.cc over xgrammar), built beside bin/.
++
++const std = @import("std");
++
++/// The xgrammar release the shim is written and checked against (its masks against the Python package's).
++pub const pinned = "v0.2.8";
++
++pub const clone = "git clone --branch " ++ pinned ++ " --recurse-submodules https://github.com/mlc-ai/xgrammar";
++
++/// The -Dxgrammar checkout, if given (`zig build grammar` and `zig build dist` both build from it).
++pub fn option(b: *std.Build) ?[]const u8 {
++    return b.option([]const u8, "xgrammar", "An xgrammar " ++ pinned ++ " checkout with its submodules (zig build grammar, dist)");
++}
++
++pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, dir: ?[]const u8) void {
++    const step = b.step("grammar", "libtfgrammar (structured output) from an xgrammar " ++ pinned ++ " checkout: -Dxgrammar=DIR");
++    const root = dir orelse {
++        step.dependOn(&b.addFail("zig build grammar needs -Dxgrammar=DIR: " ++ clone).step);
++        return;
++    };
++    const lib = library(b, target, root) orelse {
++        step.dependOn(&b.addFail(b.fmt("-Dxgrammar={s} is not an xgrammar " ++ pinned ++ " checkout: " ++ clone, .{root})).step);
++        return;
++    };
++    const into = if (target.result.os.tag == .macos) "native/lib" else "lib";
++    step.dependOn(&b.addInstallArtifact(lib, .{ .dest_dir = .{ .override = .{ .custom = into } } }).step);
++}
++
++/// libtfgrammar for `target` from the checkout at `dir`; null unless `dir` is a git checkout at the pinned tag.
++pub fn library(b: *std.Build, target: std.Build.ResolvedTarget, dir: []const u8) ?*std.Build.Step.Compile {
++    var code: u8 = 0;
++    const tag = b.runAllowFail(&.{ "git", "-C", dir, "describe", "--tags", "--exact-match" }, &code, .ignore) catch return null;
++    if (!std.mem.eql(u8, std.mem.trim(u8, tag, "\r\n"), pinned)) return null;
++    const root: std.Build.LazyPath = .{ .cwd_relative = dir };
++    const mod = b.createModule(.{ .target = target, .optimize = .ReleaseFast, .link_libcpp = true, .strip = true });
++    // xgrammar's checks keep __FILE__: the map keeps the checkout's absolute path out of the shipped library
++    const map = b.fmt("-ffile-prefix-map={s}=xgrammar", .{dir});
++    const flags = [_][]const u8{ "-std=c++17", "-DXGRAMMAR_ENABLE_CPPTRACE=0", "-fexceptions", "-Wno-everything", map };
++    mod.addIncludePath(root.path(b, "include"));
++    mod.addIncludePath(root.path(b, "3rdparty/picojson"));
++    mod.addIncludePath(root.path(b, "3rdparty/dlpack/include"));
++    mod.addCSourceFiles(.{ .root = root, .files = sources(b, dir), .flags = &flags });
++    mod.addCSourceFile(.{ .file = b.path("zig/src/grammar/tf_grammar.cc"), .flags = &flags });
++    return b.addLibrary(.{ .name = "tfgrammar", .linkage = .dynamic, .root_module = mod });
++}
++
++/// An archive's grammar files: lib/libtfgrammar for `target`, and xgrammar's license, notice and picojson's notice.
++pub fn overlay(b: *std.Build, target: std.Build.ResolvedTarget, dir: []const u8) ?std.Build.LazyPath {
++    const lib = library(b, target, dir) orelse return null;
++    const files = b.addWriteFiles();
++    const name = if (target.result.os.tag == .macos) "libtfgrammar.dylib" else "libtfgrammar.so";
++    _ = files.addCopyFile(lib.getEmittedBin(), b.fmt("lib/{s}", .{name}));
++    const root: std.Build.LazyPath = .{ .cwd_relative = dir };
++    _ = files.addCopyFile(root.path(b, "LICENSE"), "LICENSES/xgrammar-Apache-2.0.txt");
++    _ = files.addCopyFile(root.path(b, "NOTICE"), "LICENSES/xgrammar-NOTICE.txt");
++    _ = files.addCopyFile(root.path(b, "3rdparty/dlpack/LICENSE"), "LICENSES/dlpack-Apache-2.0.txt");
++    return files.getDirectory();
++}
++
++/// xgrammar's library sources as its CMakeLists globs them: every .cc under cpp but the Python bindings (cpp/tvm_ffi).
++fn sources(b: *std.Build, dir: []const u8) []const []const u8 {
++    var out: std.ArrayList([]const u8) = .empty;
++    const io = b.graph.io;
++    var cpp = std.Io.Dir.cwd().openDir(io, b.pathJoin(&.{ dir, "cpp" }), .{ .iterate = true }) catch return &.{};
++    defer cpp.close(io);
++    var walk = cpp.walk(b.allocator) catch @panic("OOM");
++    defer walk.deinit();
++    while (walk.next(io) catch null) |e| {
++        if (e.kind != .file or !std.mem.endsWith(u8, e.path, ".cc") or std.mem.startsWith(u8, e.path, "tvm_ffi")) continue;
++        out.append(b.allocator, b.pathJoin(&.{ "cpp", e.path })) catch @panic("OOM");
++    }
++    std.mem.sort([]const u8, out.items, {}, struct {
++        fn less(_: void, x: []const u8, y: []const u8) bool {
++            return std.mem.lessThan(u8, x, y);
++        }
++    }.less);
++    return out.items;
++}
+diff --git a/zig/src/core/engine_api.zig b/zig/src/core/engine_api.zig
+index c3b7c283..18da06a0 100644
+--- a/zig/src/core/engine_api.zig
++++ b/zig/src/core/engine_api.zig
+@@ -39,13 +39,20 @@ pub const CallGate = struct {
+ 
+ /// response_format and the guided_* fields: every token keeps the reply inside this grammar.
+ pub const Structure = struct {
+-    kind: enum { json, json_schema, regex, choice, grammar },
+-    /// The schema (JSON text), regex, choices (a JSON array) or EBNF; empty for any JSON object.
++    kind: enum { json, json_schema, regex, choice, grammar, structural_tag },
++    /// The schema (JSON text), regex, choices (a JSON array), EBNF or structural tag; empty for any JSON object.
+     text: []const u8 = "",
+     /// With thinking on, the grammar starts after this token.
+     after: ?u32 = null,
++    /// The server's compiler, which has compiled `text` once already (the engine's compile is then a cache hit).
++    compiler: ?*grammar.Compiler = null,
++    /// Tokens the reply never draws while the grammar holds it, unless a row allows nothing else (a forced DSML call:
++    /// the marker spelled in plain characters, so that every marker is its own token).
++    ban: []const u32 = &.{},
+ };
+ 
++pub const grammar = lanes.grammar;
++
+ /// A reply to decode. The request and every slice in it stay valid until its ``finished`` event.
+ pub const Request = struct {
+     prompt: []const u32,
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index 8c32b789..0c93615f 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -279,7 +279,7 @@ pub const LaneHost = struct {
+             .@"error" => .failed,
+             else => .stop,
+         };
+-        h.finish(job, reason, "");
++        h.finish(job, reason, job.stream.problem);
+         return true;
+     }
+ 
+@@ -290,6 +290,7 @@ pub const LaneHost = struct {
+         const stats: Stats = if (job.started) .{ .rounds = s.rounds, .drafted = s.drafted, .accepted = s.accepted, .min_rows = s.min_rows, .loop_period = s.loop_period, .prefill_seconds = if (job.prefilled) |done| @as(f64, @floatFromInt(@as(i64, @intCast(@max(0, done - job.began))))) / 1e9 else null } else .{};
+         emit(job, .{ .finished = .{ .reason = reason, .stats = stats, .message = message } });
+         if (job.started) {
++            if (s.grammar) |g| g.deinit(h.gpa);
+             s.deinit(h.gpa);
+             job.proposer.deinit();
+         }
+@@ -466,6 +467,10 @@ pub const LaneHost = struct {
+             .chunks = r.chunks,
+             .reuse = reuse,
+             .images = r.images,
++            .grammar = if (r.structure) |st| h.constraint(st) catch |e| {
++                job.proposer.deinit();
++                return h.drop(job, if (e == error.OutOfMemory) "out of memory" else "the reply's grammar could not start (xgrammar)");
++            } else null,
+         }) catch {
+             job.proposer.deinit();
+             _ = h.drop(job, "out of memory");
+@@ -520,6 +525,15 @@ pub const LaneHost = struct {
+         return false;
+     }
+ 
++    /// A reply's grammar from the server's compiler (Info.structures engines get requests that carry one).
++    fn constraint(h: *LaneHost, st: api.Structure) !*lanes.grammar.Constraint {
++        const c = st.compiler orelse return error.NoGrammarCompiler;
++        const k = try c.constraint(h.gpa, h.io, @fromBackingInt(@intCast(@backingInt(st.kind))), st.text, st.after);
++        errdefer k.deinit(h.gpa);
++        if (st.ban.len > 0) k.ban = try h.gpa.dupe(u32, st.ban);
++        return k;
++    }
++
+     fn prefilled(h: *LaneHost, job: *Job, began: i96) void {
+         const done = std.Io.Clock.awake.now(h.io).toNanoseconds();
+         h.lock();
+@@ -606,6 +620,7 @@ pub const LaneHost = struct {
+         job.entry = null; // nothing was restored: the store keeps the entry for the next lookup
+         h.gpa.free(job.marks);
+         job.marks = &.{};
++        if (job.stream.grammar) |g| g.deinit(h.gpa); // the next admission compiles its own
+         job.stream.deinit(h.gpa);
+         job.proposer.deinit();
+         job.started = false;
+diff --git a/zig/src/core/lanes/backend.zig b/zig/src/core/lanes/backend.zig
+index 046628e7..bd90b05e 100644
+--- a/zig/src/core/lanes/backend.zig
++++ b/zig/src/core/lanes/backend.zig
+@@ -16,6 +16,7 @@ pub const Window = struct {
+     parents: ?[]const i32, // each row's parent row (row 0: -1) for a tree; null for a chain
+     positions: []const u64, // the absolute position each row's draw is keyed at
+     early: bool = false, // also draft each row's first head draft behind the verify (speculate_early)
++    masks: []const u32 = &.{}, // structured output: each row's allowed-token bits (rows x words, lanes/grammar.zig); empty: none
+ 
+     pub fn rows(w: Window) usize {
+         return 1 + @as(usize, w.held) + w.tokens.len;
+@@ -71,6 +72,10 @@ pub const Backend = struct {
+         tree: ?*const fn (ptr: *anyopaque, s: *Stream, gpa: std.mem.Allocator) anyerror!?Held = null,
+         /// The head's best tokens and probabilities at each level it drafted for the stream (waits for the drafts).
+         alternatives: ?*const fn (ptr: *anyopaque, s: *Stream, out: []Alternative) anyerror!usize = null,
++        /// `first` with the first token drawn among `mask`'s allowed tokens (structured output).
++        first_masked: ?*const fn (ptr: *anyopaque, s: *Stream, position: u64, mask: []const u32) anyerror!u64 = null,
++        /// The stream's held drafts as host tokens in window order, waiting for the draft (a grammar walks them).
++        held: ?*const fn (ptr: *anyopaque, s: *Stream, out: []u32) anyerror!void = null,
+         /// The stream left the rounds: free its caches and held drafts.
+         release: *const fn (ptr: *anyopaque, s: *Stream) void,
+     };
+diff --git a/zig/src/core/lanes/engine.zig b/zig/src/core/lanes/engine.zig
+index 95439e5b..346e6cc0 100644
+--- a/zig/src/core/lanes/engine.zig
++++ b/zig/src/core/lanes/engine.zig
+@@ -116,7 +116,7 @@ pub const Engine = struct {
+         s.pending = null;
+         s.cache_len = s.prompt_len;
+         const position: u64 = s.prompt_len;
+-        const drawn = try e.backend.first(s, position);
++        const drawn = try e.drawFirst(s, position);
+         var feed: Feed = .{ .handle = drawn };
+         if (try e.forcedNext(s)) |t| feed = .{ .value = t };
+         var asked: ?u32 = null;
+@@ -127,7 +127,7 @@ pub const Engine = struct {
+             try e.backend.draft(&.{.{ .stream = s, .follow = &.{}, .first = feed, .rows = null, .start = s.prompt_len, .position = position + 1, .depth = d }});
+             s.dropHeld(e.gpa);
+             s.next = .{ .count = d };
+-        } else if (e.cfg.pipelined) {
++        } else if (e.cfg.pipelined and s.grammar == null) {
+             try e.queueNext(s, feed);
+         }
+         const value = try e.readFeed(feed);
+@@ -196,7 +196,8 @@ pub const Engine = struct {
+             try e.roundStreams(chosen);
+         } else {
+             for (live.items) |s| {
+-                const r = if ((e.cfg.family_mtp and s.drafts) or !e.cfg.pipelined) try e.familyRound(s, null) else try e.pipelinedRound(s);
++                // grammars take verify windows: a row's bits are made from the token before it
++                const r = if ((e.cfg.family_mtp and s.drafts) or !e.cfg.pipelined or s.grammar != null) try e.familyRound(s, null) else try e.pipelinedRound(s);
+                 s.min_rows = if (s.min_rows == 0) r.rows else @min(s.min_rows, r.rows);
+             }
+         }
+@@ -260,8 +261,9 @@ pub const Engine = struct {
+         const a = e.arena.allocator();
+         var plans = [_]Plan{try win.plan(e, s, copied)};
+         if (plans[0].kind == .head and e.cfg.node_probabilities) try win.allocate(e, &plans);
++        try win.constrain(e, &plans[0]);
+         const plan = plans[0];
+-        const early = e.cfg.family_mtp and s.drafts and plan.kind != .forced and e.cfg.speculate_early and plan.parents == null;
++        const early = e.cfg.family_mtp and s.drafts and plan.kind != .forced and e.cfg.speculate_early and plan.parents == null and s.grammar == null;
+         const windows = [_]be.Window{try win.build(e, plan, early)};
+         const rows = windows[0].rows();
+         var out = [_]be.Verified{.{ .sampled = try a.alloc(u32, rows), .drafts = try a.alloc(u32, rows - 1) }};
+@@ -312,6 +314,7 @@ pub const Engine = struct {
+         const plans = try a.alloc(Plan, entries.len);
+         for (entries, plans) |s, *p| p.* = try win.plan(e, s, null);
+         try win.allocate(e, plans);
++        for (plans) |*p| try win.constrain(e, p);
+         const windows = try a.alloc(be.Window, plans.len);
+         const out = try a.alloc(be.Verified, plans.len);
+         var total: u64 = 0;
+@@ -380,18 +383,23 @@ pub const Engine = struct {
+                 e.accepted += kept;
+                 s.drafted += rows - 1;
+                 s.accepted += kept;
++                // the proposal's own rows: the grammar's drafts after them are neither the proposer's nor the head's
++                const own_end = if (p.grammar_from > 0) p.grammar_from else rows;
++                var own_kept: usize = 0;
++                for (path[1..]) |r| own_kept += @intFromBool(r < own_end);
++                const own: usize = own_end - 1;
+                 if (p.kind == .copy) {
+-                    if (s.proposer) |pr| pr.observe(@intCast(rows - 1), @intCast(kept));
++                    if (s.proposer) |pr| pr.observe(@intCast(own), @intCast(own_kept));
+                     if (e.alone) {
+                         const width = s.copy_width orelse e.cfg.first_copy;
+-                        s.copy_width = if (kept == rows - 1) @min(e.cfg.max_copy, 2 * width + 1) else e.cfg.first_copy;
++                        s.copy_width = if (own_kept == own) @min(e.cfg.max_copy, 2 * width + 1) else e.cfg.first_copy;
+                     }
+                 } else if (p.kind == .head) {
+                     if (p.lanes) |l| if (s.odds != null) observeLanes(s, l, path);
+                     const ds = try accept.depths(a, parents);
+-                    const chain = if (p.branch_from > 0) ds[0..p.branch_from] else ds;
++                    const chain = if (p.branch_from > 0) ds[0..p.branch_from] else ds[0..own_end];
+                     var chain_kept: usize = 0;
+-                    for (path[1..]) |r| chain_kept += @intFromBool(p.branch_from == 0 or r < p.branch_from);
++                    for (path[1..]) |r| chain_kept += @intFromBool((p.branch_from == 0 or r < p.branch_from) and r < own_end);
+                     try e.rule.observeDepth(win.who(s), std.mem.max(u32, chain), @intCast(chain_kept));
+                 }
+                 var kept_branch: u64 = 0;
+@@ -581,6 +589,14 @@ pub const Engine = struct {
+         try trail.event(e, &.{ f("ev", str("land")), f("stream", str(s.id)), f("got", .{ .u32s = s.emitted()[s.emitted().len - landed ..] }) });
+     }
+ 
++    /// The first token's draw: among the grammar's allowed tokens when the stream has one that constrains it.
++    fn drawFirst(e: *Engine, s: *Stream, position: u64) !u64 {
++        const g = s.grammar orelse return e.backend.first(s, position);
++        const mask = try g.next(e.arena.allocator()) orelse return e.backend.first(s, position);
++        const masked = e.backend.vtable.first_masked orelse return error.StructuresUnsupported;
++        return masked(e.backend.ptr, s, position, mask);
++    }
++
+     /// Feed a token and queue the draw of the next at the new cache length.
+     fn queueNext(e: *Engine, s: *Stream, feed: Feed) !void {
+         s.cache_len += 1;
+diff --git a/zig/src/core/lanes/engine_test.zig b/zig/src/core/lanes/engine_test.zig
+index b8dc1351..10d3061b 100644
+--- a/zig/src/core/lanes/engine_test.zig
++++ b/zig/src/core/lanes/engine_test.zig
+@@ -6,6 +6,7 @@ const sm = @import("stream.zig");
+ const fake = @import("fake.zig");
+ const SuffixLookup = @import("proposer.zig").SuffixLookup;
+ const Sampling = @import("sampling.zig").Sampling;
++const grammar = @import("grammar.zig");
+ 
+ const gpa = std.testing.allocator;
+ 
+@@ -15,6 +16,73 @@ const Case = struct {
+     sampling: ?Sampling = null,
+     drafts: bool = true,
+     think_budget: u32 = 0,
++    classes: ?Classes = null, // structured output under this test grammar
++    eos: []const u32 = &.{96},
++};
++
++/// A test grammar: `length` tokens, the i-th of class i % 3 (any but 96 when `free`), then 96; it starts after `after`.
++const Classes = struct {
++    length: u32 = 12,
++    after: ?u32 = null,
++    free: bool = false,
++    spell: bool = false, // the i-th token is want(i) alone, so the grammar drafts the rest of its text itself
++    at: u32 = 0,
++    done: bool = false,
++
++    fn rules(c: *Classes) grammar.Rules {
++        return .{ .ptr = c, .vtable = &.{ .accept = acceptFn, .rollback = rollbackFn, .terminated = terminatedFn, .fill = fillFn, .drafts = draftsFn, .free = freeFn } };
++    }
++
++    fn cast(ptr: *anyopaque) *Classes {
++        return @ptrCast(@alignCast(ptr));
++    }
++
++    fn allows(c: *const Classes, t: u32) bool {
++        if (c.done) return false;
++        if (c.at == c.length) return t == 96;
++        if (c.spell) return t == want(c.at);
++        return t != 96 and (c.free or t % 3 == c.at % 3);
++    }
++
++    fn acceptFn(ptr: *anyopaque, t: u32) anyerror!bool {
++        const c = cast(ptr);
++        if (!c.allows(t)) return false;
++        if (c.at == c.length) c.done = true else c.at += 1;
++        return true;
++    }
++
++    fn rollbackFn(ptr: *anyopaque, n: usize) anyerror!void {
++        const c = cast(ptr);
++        for (0..n) |_| {
++            if (c.done) c.done = false else c.at -= 1;
++        }
++    }
++
++    fn terminatedFn(ptr: *anyopaque) bool {
++        return cast(ptr).done;
++    }
++
++    fn fillFn(ptr: *anyopaque, words: []u32) anyerror!void {
++        const c = cast(ptr);
++        @memset(words, 0);
++        for (0..fake.vocab) |t| if (c.allows(@intCast(t))) {
++            words[t / 32] |= @as(u32, 1) << @intCast(t % 32);
++        };
++    }
++
++    fn want(i: u32) u32 {
++        return (5 + 7 * i) % 89;
++    }
++
++    fn draftsFn(ptr: *anyopaque, out: []u32) anyerror!usize {
++        const c = cast(ptr);
++        if (!c.spell or c.done) return 0;
++        var n: usize = 0;
++        while (n < out.len and c.at + n < c.length) : (n += 1) out[n] = want(c.at + @as(u32, @intCast(n)));
++        return n;
++    }
++
++    fn freeFn(_: *anyopaque) void {}
+ };
+ 
+ fn model() !Config {
+@@ -36,9 +104,17 @@ fn run(cases: []const Case) ![][]u32 {
+     defer gpa.free(streams);
+     const proposers = try gpa.alloc(SuffixLookup, cases.len);
+     defer gpa.free(proposers);
+-    for (cases, streams, proposers) |c, *s, *p| {
++    const classes = try gpa.alloc(Classes, cases.len);
++    defer gpa.free(classes);
++    const constraints = try gpa.alloc(grammar.Constraint, cases.len);
++    defer gpa.free(constraints);
++    for (cases, streams, proposers, classes, constraints) |c, *s, *p, *g, *k| {
+         p.* = try SuffixLookup.init(gpa, .{ .min_match = 4 });
+-        s.* = try sm.Stream.init(gpa, .{ .id = "s", .prompt = c.prompt, .max_new = c.max_new, .eos = &.{96}, .sampling = c.sampling, .drafts = c.drafts, .proposer = p.proposer(), .think_budget = c.think_budget, .think_close = &.{ 90, 91, 92 }, .think_end = 91 });
++        if (c.classes) |given| {
++            g.* = given;
++            k.* = .init(g.rules(), (fake.vocab + 31) / 32, given.after);
++        }
++        s.* = try sm.Stream.init(gpa, .{ .id = "s", .prompt = c.prompt, .max_new = c.max_new, .eos = c.eos, .sampling = c.sampling, .drafts = c.drafts, .proposer = p.proposer(), .think_budget = c.think_budget, .think_close = &.{ 90, 91, 92 }, .think_end = 91 , .grammar = if (c.classes != null) k else null });
+     }
+     defer for (streams, proposers) |*s, *p| {
+         s.deinit(gpa);
+@@ -181,3 +257,114 @@ test "a cycle in the answer does not refire or reclose" {
+     for (plain[0].emitted) |token| close_count += @intFromBool(token == 90);
+     try std.testing.expectEqual(@as(usize, 1), close_count);
+ }
++
++/// Every emitted token from the grammar's start on is one the test grammar allows, and it ends at its stop token.
++fn expectInGrammar(emitted: []const u32, classes: Classes) !void {
++    var g = classes;
++    var active = g.after == null;
++    for (emitted) |t| {
++        if (!active) {
++            active = t == g.after.?;
++            continue;
++        }
++        try std.testing.expect(g.allows(t));
++        _ = try Classes.acceptFn(&g, t);
++    }
++    try std.testing.expect(g.done);
++}
++
++test "structured output: drafted rounds commit the one-token decode, every token inside the grammar" {
++    for ([_]?Sampling{ null, .{ .seed = 5, .temperature = 0.7, .top_k = 0, .top_p = 0.95 } }) |s| {
++        const drafted = try run(&.{.{ .prompt = &p1, .sampling = s, .classes = .{} }});
++        defer free(drafted);
++        const plain = try run(&.{.{ .prompt = &p1, .sampling = s, .drafts = false, .classes = .{} }});
++        defer free(plain);
++        try std.testing.expectEqualSlices(u32, plain[0], drafted[0]);
++        try expectInGrammar(drafted[0], .{});
++    }
++}
++
++test "structured output: shared rounds with grammar and plain streams commit what each commits alone" {
++    const sampled: Sampling = .{ .seed = 9, .temperature = 1.0, .top_k = 0, .top_p = 0.9 };
++    const cases = [_]Case{ .{ .prompt = &p1, .classes = .{ .length = 20 } }, .{ .prompt = &p2, .sampling = sampled, .max_new = 30 }, .{ .prompt = &p2, .sampling = sampled, .classes = .{ .length = 7 } } };
++    const together = try run(&cases);
++    defer free(together);
++    for (cases, together) |c, got| {
++        const alone = try run(&.{c});
++        defer free(alone);
++        try std.testing.expectEqualSlices(u32, alone[0], got);
++        if (c.classes) |g| try expectInGrammar(got, g);
++    }
++}
++
++test "structured output: with thinking the grammar starts after the think end, through a forced close" {
++    const c: Case = .{ .prompt = &p2, .think_budget = 9, .classes = .{ .after = 91 } };
++    const drafted = try run(&.{c});
++    defer free(drafted);
++    var plain_case = c;
++    plain_case.drafts = false;
++    const plain = try run(&.{plain_case});
++    defer free(plain);
++    try std.testing.expectEqualSlices(u32, plain[0], drafted[0]);
++    try std.testing.expectEqualSlices(u32, &.{ 90, 91 }, drafted[0][8..10]); // the close ends at the think end
++    try expectInGrammar(drafted[0], .{ .after = 91 });
++}
++
++test "structured output: the grammar's stop token ends a reply that ignores eos" {
++    const out = try run(&.{.{ .prompt = &p1, .eos = &.{}, .max_new = 200, .classes = .{ .length = 5 } }});
++    defer free(out);
++    try std.testing.expectEqual(@as(usize, 6), out[0].len);
++    try expectInGrammar(out[0], .{ .length = 5 });
++}
++
++test "structured output: held head drafts come back as host tokens, so a grammar stream drafts every round" {
++    for ([_]?Sampling{ null, .{ .seed = 3, .temperature = 0.9, .top_k = 0, .top_p = 0.9 } }) |sampling| {
++        var cfg = try model();
++        defer cfg.deinit(gpa);
++        var target: fake.Fake = .{ .gpa = gpa };
++        defer target.deinit();
++        var clock: fake.FixedClock = .{};
++        var engine = Engine.init(gpa, &cfg, target.backend(), clock.clock());
++        defer engine.deinit();
++        var p = try SuffixLookup.init(gpa, .{ .min_match = 1000 }); // no copies: every draft is the head's
++        defer p.deinit();
++        var g: Classes = .{ .length = 60, .free = true };
++        var k: grammar.Constraint = .init(g.rules(), (fake.vocab + 31) / 32, null);
++        var s = try sm.Stream.init(gpa, .{ .id = "s", .prompt = &p1, .max_new = 80, .eos = &.{96}, .sampling = sampling, .proposer = p.proposer(), .think_close = &.{ 90, 91, 92 }, .think_end = 91, .grammar = &k });
++        defer s.deinit(gpa);
++        try engine.addStream(&s);
++        while (engine.activeCount() > 0) try engine.step();
++        try expectInGrammar(s.emitted(), .{ .length = 60, .free = true });
++        // the fake head misses one draft in five: a grammar that takes them all keeps well over a token a round
++        try std.testing.expect(s.drafted >= 2 * s.rounds and 2 * s.emitted().len > 3 * s.rounds);
++    }
++}
++
++test "structured output: where the grammar spells its own text, its drafts fill the window and drafted == plain" {
++    for ([_]?Sampling{ null, .{ .seed = 11, .temperature = 0.8, .top_k = 0, .top_p = 0.9 } }) |sampling| {
++        const c: Case = .{ .prompt = &p1, .sampling = sampling, .max_new = 80, .classes = .{ .length = 50, .spell = true } };
++        var plain_case = c;
++        plain_case.drafts = false;
++        const plain = try run(&.{plain_case});
++        defer free(plain);
++        var cfg = try model();
++        defer cfg.deinit(gpa);
++        var target: fake.Fake = .{ .gpa = gpa };
++        defer target.deinit();
++        var clock: fake.FixedClock = .{};
++        var engine = Engine.init(gpa, &cfg, target.backend(), clock.clock());
++        defer engine.deinit();
++        var p = try SuffixLookup.init(gpa, .{ .min_match = 4 });
++        defer p.deinit();
++        var g: Classes = c.classes.?;
++        var k: grammar.Constraint = .init(g.rules(), (fake.vocab + 31) / 32, null);
++        var s = try sm.Stream.init(gpa, .{ .id = "s", .prompt = c.prompt, .max_new = c.max_new, .eos = &.{96}, .sampling = sampling, .proposer = p.proposer(), .think_close = &.{ 90, 91, 92 }, .think_end = 91, .grammar = &k });
++        defer s.deinit(gpa);
++        try engine.addStream(&s);
++        while (engine.activeCount() > 0) try engine.step();
++        try std.testing.expectEqualSlices(u32, plain[0], s.emitted());
++        try expectInGrammar(s.emitted(), c.classes.?);
++        // the head's guesses are wrong here; the grammar's own drafts land every round, a window's worth at a time
++        try std.testing.expect(s.emitted().len > 4 * s.rounds);
++    }
++}
+diff --git a/zig/src/core/lanes/fake.zig b/zig/src/core/lanes/fake.zig
+index e791360f..30f837fa 100644
+--- a/zig/src/core/lanes/fake.zig
++++ b/zig/src/core/lanes/fake.zig
+@@ -6,6 +6,7 @@ const Stream = @import("stream.zig").Stream;
+ const Sampling = @import("sampling.zig").Sampling;
+ const keyBits = @import("sampling.zig").keyBits;
+ const accept = @import("accept.zig");
++const grammar = @import("grammar.zig");
+ 
+ pub const vocab = 97;
+ 
+@@ -55,12 +56,12 @@ pub const Fake = struct {
+     }
+ 
+     pub fn backend(x: *Fake) be.Backend {
+-        return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release } };
++        return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .first = first, .first_masked = firstMasked, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .held = heldDrafts, .release = release } };
+     }
+ 
+     /// The same target, advancing four prompt tokens per host visit.
+     pub fn chunkedBackend(x: *Fake) be.Backend {
+-        return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .prefill_step = prefillStep, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release } };
++        return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .prefill_step = prefillStep, .first = first, .first_masked = firstMasked, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .held = heldDrafts, .release = release } };
+     }
+ 
+     fn prefillStep(ptr: *anyopaque, s: *Stream) anyerror!bool {
+@@ -182,6 +183,29 @@ pub const Fake = struct {
+         return x.draw(x.lane(s), s, position);
+     }
+ 
++    fn firstMasked(ptr: *anyopaque, s: *Stream, position: u64, mask: []const u32) anyerror!u64 {
++        const x = self(ptr);
++        const h = try x.draw(x.lane(s), s, position);
++        x.drawn.items[h] = try allowed(x.drawn.items[h], mask);
++        return h;
++    }
++
++    /// Structured output's draw: the first allowed token from the target's own (a function of the row and its bits).
++    fn allowed(token: u32, mask: []const u32) !u32 {
++        if (mask.len == 0) return token;
++        for (0..vocab) |i| {
++            const t: u32 = @intCast((token + i) % vocab);
++            if (grammar.allows(mask, t)) return t;
++        }
++        return error.NoAllowedToken;
++    }
++
++    fn heldDrafts(ptr: *anyopaque, s: *Stream, out: []u32) anyerror!void {
++        const h = self(ptr).lane(s).held.items;
++        if (out.len > h.len) return error.NotHeld;
++        @memcpy(out, h[0..out.len]);
++    }
++
+     fn queue(ptr: *anyopaque, s: *Stream, feed: be.Feed, position: u64) anyerror!u64 {
+         const x = self(ptr);
+         const l = x.lane(s);
+@@ -216,6 +240,10 @@ pub const Fake = struct {
+                 try l.history.appendSlice(x.gpa, path.items);
+                 if (w.positions[r] != l.history.items.len) return error.PositionMismatch;
+                 o.sampled[r] = x.targetNext(l.history.items, w.stream.sampling, w.positions[r]);
++                if (w.masks.len > 0) {
++                    const words = w.masks.len / l.rows.items.len;
++                    o.sampled[r] = try allowed(o.sampled[r], w.masks[r * words ..][0..words]);
++                }
+             }
+             l.history.shrinkRetainingCapacity(l.base);
+             try l.history.appendSlice(x.gpa, l.rows.items); // a chain keeps every row unless rolled back
+diff --git a/zig/src/core/lanes/grammar.zig b/zig/src/core/lanes/grammar.zig
+new file mode 100644
+index 00000000..43622f2d
+--- /dev/null
++++ b/zig/src/core/lanes/grammar.zig
+@@ -0,0 +1,609 @@
++//! Structured output: libtfgrammar (xgrammar, loaded at the first structured request) and a stream's grammar walk.
++
++const std = @import("std");
++const builtin = @import("builtin");
++const Allocator = std.mem.Allocator;
++
++const Fns = struct {
++    open: *const fn ([*]const u8, usize, c_int, [*]const i32, c_int, [*]u8, usize) callconv(.c) ?*anyopaque,
++    close: *const fn (*anyopaque) callconv(.c) void,
++    words: *const fn (*anyopaque) callconv(.c) c_int,
++    compile: *const fn (*anyopaque, c_int, [*]const u8, usize, [*]u8, usize) callconv(.c) ?*anyopaque,
++    free: *const fn (*anyopaque) callconv(.c) void,
++    matcher: *const fn (*anyopaque) callconv(.c) ?*anyopaque,
++    matcher_free: *const fn (*anyopaque) callconv(.c) void,
++    accept: *const fn (*anyopaque, i32) callconv(.c) c_int,
++    rollback: *const fn (*anyopaque, c_int) callconv(.c) c_int,
++    terminated: *const fn (*anyopaque) callconv(.c) c_int,
++    fill: *const fn (*anyopaque, [*]i32, c_int) callconv(.c) c_int,
++    drafts: *const fn (*anyopaque, [*]i32, c_int) callconv(.c) c_int,
++};
++
++var lib: ?Fns = null;
++var lib_failed = false;
++var lib_mutex: std.atomic.Mutex = .unlocked;
++
++/// The library: the file TENSORFOLD_GRAMMAR_LIB names, else the server's ../lib (an archive's lib, zig build
++/// grammar's), beside it, then the loader's path.
++fn load(io: std.Io, a: Allocator) ?Fns {
++    while (!lib_mutex.tryLock()) std.atomic.spinLoopHint();
++    defer lib_mutex.unlock();
++    if (lib) |l| return l;
++    if (lib_failed) return null;
++    lib_failed = true;
++    const exe = std.process.executableDirPathAlloc(io, a) catch "";
++    const names = [_][]const u8{
++        std.fs.path.join(a, &.{ exe, "..", "lib", library }) catch return null,
++        std.fs.path.join(a, &.{ exe, library }) catch return null,
++        library,
++    };
++    var named = [1][]const u8{""};
++    const tries: []const []const u8 = if (std.c.getenv(env)) |p| blk: {
++        named[0] = std.mem.span(p);
++        break :blk &named;
++    } else &names;
++    var dl = for (tries) |name| {
++        break std.DynLib.open(name) catch continue;
++    } else return null;
++    var f: Fns = undefined;
++    const info = @typeInfo(Fns).@"struct";
++    inline for (info.field_names, info.field_types) |name, T| {
++        @field(f, name) = dl.lookup(T, "tfg_" ++ name) orelse return null;
++    }
++    lib_failed = false;
++    lib = f;
++    return f;
++}
++
++/// The library's file name, for the refusal when it cannot be loaded.
++pub const library = if (builtin.os.tag == .macos) "libtfgrammar.dylib" else "libtfgrammar.so";
++
++/// The environment variable naming the libtfgrammar file to load (the only one tried when it is set).
++pub const env = "TENSORFOLD_GRAMMAR_LIB";
++
++/// libtfgrammar's kinds in order: structural_tag is xgrammar's JSON form (a tool call's markup around its arguments).
++pub const Kind = enum(u8) { json, json_schema, regex, choice, grammar, structural_tag };
++
++/// One tokenizer's grammar compiler; compiled grammars are cached by their text (xgrammar's cache).
++pub const Compiler = struct {
++    f: Fns,
++    h: *anyopaque,
++    words: usize,
++    mutex: std.Io.Mutex = .init,
++
++    /// `tokenizer_json`: tokenizer.json's text; `vocab`: the logits' width; `stops`: the model's eos ids.
++    pub fn open(io: std.Io, a: Allocator, tokenizer_json: []const u8, vocab: u32, stops: []const u32, err: *[512]u8) !Compiler {
++        const f = load(io, a) orelse return error.NoGrammarLibrary;
++        err[0] = 0;
++        const h = f.open(tokenizer_json.ptr, tokenizer_json.len, @intCast(vocab), @ptrCast(stops.ptr), @intCast(stops.len), err, err.len) orelse return error.GrammarSetup;
++        return .{ .f = f, .h = h, .words = @intCast(f.words(h)) };
++    }
++
++    pub fn close(c: *Compiler) void {
++        c.f.close(c.h);
++    }
++
++    /// The compiled grammar, or error.Grammar with xgrammar's words in `err` (requests compile on their own threads).
++    pub fn compile(c: *Compiler, io: std.Io, kind: Kind, text: []const u8, err: *[512]u8) !Compiled {
++        err[0] = 0;
++        c.mutex.lockUncancelable(io);
++        defer c.mutex.unlock(io);
++        const g = c.f.compile(c.h, @backingInt(kind), text.ptr, text.len, err, err.len) orelse return error.Grammar;
++        return .{ .f = c.f, .h = g };
++    }
++
++    /// A fresh reply's grammar over `text`, starting after `after` when thinking is on.
++    pub fn constraint(c: *Compiler, gpa: Allocator, io: std.Io, kind: Kind, text: []const u8, after: ?u32) !*Constraint {
++        var err: [512]u8 = undefined;
++        const g = try c.compile(io, kind, text, &err);
++        defer g.free();
++        const m = try g.matcher();
++        errdefer m.free();
++        const out = try gpa.create(Constraint);
++        out.* = .init(m.rules(), c.words, after);
++        return out;
++    }
++};
++
++pub const Compiled = struct {
++    f: Fns,
++    h: *anyopaque,
++
++    pub fn free(g: Compiled) void {
++        g.f.free(g.h);
++    }
++
++    pub fn matcher(g: Compiled) !Matcher {
++        return .{ .f = g.f, .h = g.f.matcher(g.h) orelse return error.Grammar };
++    }
++};
++
++/// A reply's place in its xgrammar grammar.
++pub const Matcher = struct {
++    f: Fns,
++    h: *anyopaque,
++
++    pub fn free(m: Matcher) void {
++        m.f.matcher_free(m.h);
++    }
++
++    pub fn rules(m: Matcher) Rules {
++        return .{ .ptr = m.h, .vtable = &.{ .accept = acceptFn, .rollback = rollbackFn, .terminated = terminatedFn, .fill = fillFn, .drafts = draftsFn, .free = freeFn } };
++    }
++
++    fn draftsFn(h: *anyopaque, out: []u32) anyerror!usize {
++        const n = lib.?.drafts(h, @ptrCast(out.ptr), @intCast(out.len));
++        return if (n < 0) error.Grammar else @intCast(n);
++    }
++
++    fn acceptFn(h: *anyopaque, token: u32) anyerror!bool {
++        return switch (lib.?.accept(h, @intCast(token))) {
++            1 => true,
++            0 => false,
++            else => error.Grammar,
++        };
++    }
++
++    fn rollbackFn(h: *anyopaque, n: usize) anyerror!void {
++        if (n > 0 and lib.?.rollback(h, @intCast(n)) != 0) return error.Grammar;
++    }
++
++    fn terminatedFn(h: *anyopaque) bool {
++        return lib.?.terminated(h) == 1;
++    }
++
++    fn fillFn(h: *anyopaque, words: []u32) anyerror!void {
++        if (lib.?.fill(h, @ptrCast(words.ptr), @intCast(words.len)) != 0) return error.Grammar;
++    }
++
++    fn freeFn(h: *anyopaque) void {
++        lib.?.matcher_free(h);
++    }
++};
++
++/// A grammar matcher as the round loop drives it: xgrammar's, or a test's.
++pub const Rules = struct {
++    ptr: *anyopaque,
++    vtable: *const VTable,
++
++    pub const VTable = struct {
++        /// Whether the grammar takes `token` next (it then has); a rejected token leaves it where it was.
++        accept: *const fn (ptr: *anyopaque, token: u32) anyerror!bool,
++        rollback: *const fn (ptr: *anyopaque, n: usize) anyerror!void,
++        /// The grammar has taken its stop token.
++        terminated: *const fn (ptr: *anyopaque) bool,
++        /// The next token's allowed bits (token t: bit t % 32 of word t / 32).
++        fill: *const fn (ptr: *anyopaque, words: []u32) anyerror!void,
++        /// Tokens spelling the text the grammar forces from here (none where it branches); the matcher stays put.
++        drafts: *const fn (ptr: *anyopaque, out: []u32) anyerror!usize,
++        free: *const fn (ptr: *anyopaque) void,
++    };
++};
++
++/// A window as the grammar keeps it: the rows an accepted path can use, in window order, and their bits.
++pub const Window = struct {
++    rows: []const u32, // the kept rows' indices in the planned window (row 0, the pending token, always)
++    parents: []const i32, // each kept row's parent among the kept rows (row 0: -1)
++    masks: []const u32, // each row's allowed bits, kept rows then `extra` (all set where unconstrained); empty: none
++    extra: []const u32 = &.{}, // the grammar's own drafts after a chain's last kept row
++};
++
++/// One reply's grammar at its committed tokens (Python Constraint).
++pub const Constraint = struct {
++    rules: Rules,
++    words: usize,
++    after: ?u32, // with thinking on, the grammar starts at the token after this one
++    active: bool,
++    ban: []const u32 = &.{}, // tokens no row allows while another is allowed (the constraint's own, freed with it)
++
++    pub fn init(rules: Rules, words: usize, after: ?u32) Constraint {
++        return .{ .rules = rules, .words = words, .after = after, .active = after == null };
++    }
++
++    pub fn deinit(c: *Constraint, gpa: Allocator) void {
++        c.rules.vtable.free(c.rules.ptr);
++        if (c.ban.len > 0) gpa.free(c.ban);
++        gpa.destroy(c);
++    }
++
++    /// The grammar has taken its stop token: the reply is complete.
++    pub fn finished(c: *const Constraint) bool {
++        return c.active and c.rules.vtable.terminated(c.rules.ptr);
++    }
++
++    /// Follow a committed token; false when the grammar rejects it (each is chosen under its mask, forced ones aside).
++    pub fn follow(c: *Constraint, token: u32) !bool {
++        if (!c.active) {
++            c.active = token == c.after.?;
++            return true;
++        }
++        if (c.rules.vtable.terminated(c.rules.ptr)) return true;
++        return c.rules.vtable.accept(c.rules.ptr, token);
++    }
++
++    /// The next token's bits on its own (a first token, or a one-row window); null when unconstrained.
++    pub fn next(c: *Constraint, a: Allocator) !?[]u32 {
++        if (!c.active or c.finished()) return null;
++        const bits = try a.alloc(u32, c.words);
++        try c.fill(bits);
++        return bits;
++    }
++
++    /// The next token's bits at the matcher's place, the banned tokens cleared where the row allows another; a row that
++    /// allows nothing is a dead grammar, never a draw.
++    fn fill(c: *Constraint, bits: []u32) !void {
++        try c.rules.vtable.fill(c.rules.ptr, bits);
++        if (c.ban.len > 0 and c.allowsOther(bits)) for (c.ban) |t| if (t / 32 < bits.len) {
++            bits[t / 32] &= ~(@as(u32, 1) << @intCast(t % 32));
++        };
++        for (bits) |w| if (w != 0) return;
++        return error.GrammarDeadEnd;
++    }
++
++    /// Whether a row allows a token outside the ban.
++    fn allowsOther(c: *const Constraint, bits: []const u32) bool {
++        for (bits, 0..) |w, i| {
++            var rest = w;
++            for (c.ban) |t| if (t / 32 == i) {
++                rest &= ~(@as(u32, 1) << @intCast(t % 32));
++            };
++            if (rest != 0) return true;
++        }
++        return false;
++    }
++
++    /// Rows of `tokens` (row 0 pending) an accepted path can use, with bits; `forced` keeps rows, unmasked past a miss.
++    pub fn window(c: *Constraint, a: Allocator, tokens: []const u32, parents: []const i32, forced: bool, room: usize) !Window {
++        const n = tokens.len;
++        const all = try a.alloc(u32, n);
++        for (all, 0..) |*r, i| r.* = @intCast(i);
++        if (c.finished() or (!c.active and std.mem.indexOfScalar(u32, tokens[1..], c.after.?) == null))
++            return .{ .rows = all, .parents = parents, .masks = &.{} }; // the reply has ended, or no row reaches the grammar
++        for (parents[1..], 0..) |p, i| {
++            if (p != @as(i32, @intCast(i))) break;
++        } else return c.chain(a, tokens, forced, room);
++        const bits = try a.alloc(u32, n * c.words);
++        @memset(bits, std.math.maxInt(u32));
++        const kept = try a.alloc(bool, n);
++        @memset(kept, forced);
++        kept[0] = true;
++        var walk: Walk = .{ .c = c, .tokens = tokens, .parents = parents, .bits = bits, .kept = kept };
++        try walk.visit(0, c.active);
++        var count: usize = 0;
++        for (kept) |k| count += @intFromBool(k);
++        const rows = try a.alloc(u32, count);
++        const index = try a.alloc(i32, n);
++        var at: usize = 0;
++        for (kept, 0..) |k, r| {
++            index[r] = if (k) @intCast(at) else -1;
++            if (!k) continue;
++            rows[at] = @intCast(r);
++            at += 1;
++        }
++        const out_parents = try a.alloc(i32, count);
++        const masks: []u32 = if (walk.filled) try a.alloc(u32, count * c.words) else &.{};
++        for (rows, out_parents, 0..) |r, *p, i| {
++            p.* = if (r == 0) -1 else index[@intCast(parents[r])];
++            if (walk.filled) @memcpy(masks[i * c.words ..][0..c.words], bits[r * c.words ..][0..c.words]);
++        }
++        return .{ .rows = rows, .parents = out_parents, .masks = masks };
++    }
++
++    /// A chain walked in order, then grown past its last kept row by the grammar's own drafts up to `room` rows.
++    fn chain(c: *Constraint, a: Allocator, tokens: []const u32, forced: bool, room: usize) !Window {
++        var masks: std.ArrayList(u32) = .empty;
++        var taken: usize = 0; // tokens the matcher took for this walk, all rolled back before returning
++        var active = c.active;
++        var free = false; // a forced row the grammar rejected: it and the rows after it stay unconstrained
++        var ended = false; // a planned draft was the stop token: nothing after it is verified
++        var filled = false;
++        var kept: usize = 0;
++        while (kept < tokens.len) {
++            const t = tokens[kept];
++            if (kept > 0) {
++                if (!active) {
++                    active = t == c.after.?;
++                } else if (!free and try c.rules.vtable.accept(c.rules.ptr, t)) {
++                    taken += 1;
++                    if (c.rules.vtable.terminated(c.rules.ptr)) {
++                        ended = true;
++                        break;
++                    }
++                } else if (forced) free = true else break;
++            }
++            const row = try masks.addManyAsSlice(a, c.words);
++            if (active and !free) {
++                try c.fill(row);
++                filled = true;
++            } else @memset(row, std.math.maxInt(u32));
++            kept += 1;
++        }
++        var extra: []u32 = &.{};
++        if (!forced and !free and !ended and active and room > kept) {
++            const drafts = try a.alloc(u32, room - kept);
++            const n = try c.rules.vtable.drafts(c.rules.ptr, drafts);
++            for (drafts[0..n]) |t| {
++                if (!try c.rules.vtable.accept(c.rules.ptr, t)) break;
++                taken += 1;
++                try c.fill(try masks.addManyAsSlice(a, c.words));
++                extra = drafts[0 .. extra.len + 1];
++            }
++        }
++        try c.rules.vtable.rollback(c.rules.ptr, taken);
++        const rows = try a.alloc(u32, kept);
++        const parents = try a.alloc(i32, kept);
++        for (rows, parents, 0..) |*r, *p, i| {
++            r.* = @intCast(i);
++            p.* = @as(i32, @intCast(i)) - 1;
++        }
++        return .{ .rows = rows, .parents = parents, .masks = if (filled) masks.items else &.{}, .extra = extra };
++    }
++
++    const Walk = struct {
++        c: *Constraint,
++        tokens: []const u32,
++        parents: []const i32,
++        bits: []u32,
++        kept: []bool,
++        filled: bool = false,
++
++        /// The matcher has taken row r's path (when `active`): fill its bits, then each child's.
++        fn visit(w: *Walk, r: usize, active: bool) !void {
++            const c = w.c;
++            if (active) {
++                try c.fill(w.bits[r * c.words ..][0..c.words]);
++                w.filled = true;
++            }
++            for (w.parents[1..], 1..) |p, child| {
++                if (p != @as(i32, @intCast(r))) continue;
++                if (!active) {
++                    w.kept[child] = true;
++                    try w.visit(child, w.tokens[child] == c.after.?);
++                } else if (try c.rules.vtable.accept(c.rules.ptr, w.tokens[child])) {
++                    if (!c.rules.vtable.terminated(c.rules.ptr)) {
++                        w.kept[child] = true;
++                        try w.visit(child, true);
++                    }
++                    try c.rules.vtable.rollback(c.rules.ptr, 1);
++                } // rejected: forced rows stay, unconstrained (kept and all set from the start)
++            }
++        }
++    };
++};
++
++/// Whether `token` is allowed by a row's bits.
++pub fn allows(bits: []const u32, token: usize) bool {
++    const word = token / 32;
++    return word < bits.len and (bits[word] >> @intCast(token % 32)) & 1 == 1;
++}
++
++/// A test grammar over small ids: the tokens of `want` in order, then `stop`; its drafts are the rest of `want`.
++pub const Sequence = struct {
++    want: []const u32,
++    stop: u32,
++    at: usize = 0,
++    log: std.ArrayList(usize) = .empty, // `at` before each accepted token, for rollback
++    gpa: Allocator,
++
++    pub fn rules(s: *Sequence) Rules {
++        return .{ .ptr = s, .vtable = &.{ .accept = acceptFn, .rollback = rollbackFn, .terminated = terminatedFn, .fill = fillFn, .drafts = draftsFn, .free = freeFn } };
++    }
++
++    fn draftsFn(ptr: *anyopaque, out: []u32) anyerror!usize {
++        const s = cast(ptr);
++        const rest = s.want[@min(s.at, s.want.len)..];
++        const n = @min(out.len, rest.len);
++        @memcpy(out[0..n], rest[0..n]);
++        return n;
++    }
++
++    fn cast(ptr: *anyopaque) *Sequence {
++        return @ptrCast(@alignCast(ptr));
++    }
++
++    fn expected(s: *const Sequence) ?u32 {
++        if (s.at < s.want.len) return s.want[s.at];
++        if (s.at == s.want.len) return s.stop;
++        return null;
++    }
++
++    fn acceptFn(ptr: *anyopaque, token: u32) anyerror!bool {
++        const s = cast(ptr);
++        if (s.expected() != token) return false;
++        try s.log.append(s.gpa, s.at);
++        s.at += 1;
++        return true;
++    }
++
++    fn rollbackFn(ptr: *anyopaque, n: usize) anyerror!void {
++        const s = cast(ptr);
++        for (0..n) |_| s.at = s.log.pop() orelse return error.Grammar;
++    }
++
++    fn terminatedFn(ptr: *anyopaque) bool {
++        return cast(ptr).at > cast(ptr).want.len;
++    }
++
++    fn fillFn(ptr: *anyopaque, words: []u32) anyerror!void {
++        @memset(words, 0);
++        const t = cast(ptr).expected() orelse return;
++        words[t / 32] |= @as(u32, 1) << @intCast(t % 32);
++    }
++
++    fn freeFn(ptr: *anyopaque) void {
++        cast(ptr).log.deinit(cast(ptr).gpa);
++    }
++};
++
++test "a window keeps the drafts the grammar takes, masks each kept row, and stops after the stop token" {
++    const gpa = std.testing.allocator;
++    var arena = std.heap.ArenaAllocator.init(gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var seq: Sequence = .{ .want = &.{ 5, 6, 7 }, .stop = 2, .gpa = gpa };
++    var c: Constraint = .init(seq.rules(), 1, null);
++    defer seq.log.deinit(gpa);
++    // a chain: pending 9 (already followed: the grammar is at 5), drafts 5 6 8 (8 rejected) 7
++    const w = try c.window(a, &.{ 9, 5, 6, 8, 7 }, &.{ -1, 0, 1, 2, 3 }, false, 1);
++    try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2 }, w.rows);
++    try std.testing.expectEqualSlices(i32, &.{ -1, 0, 1 }, w.parents);
++    try std.testing.expectEqualSlices(u32, &.{ 1 << 5, 1 << 6, 1 << 7 }, w.masks);
++    try std.testing.expectEqual(@as(usize, 0), seq.at); // the walk rolled back
++    // a tree: two branches from the pending row, one taken; the stop token's row is not verified
++    try std.testing.expect(try c.follow(5));
++    try std.testing.expect(try c.follow(6));
++    const t = try c.window(a, &.{ 9, 4, 7, 2, 3 }, &.{ -1, 0, 0, 2, 3 }, false, 1);
++    try std.testing.expectEqualSlices(u32, &.{ 0, 2 }, t.rows);
++    try std.testing.expectEqualSlices(u32, &.{ 1 << 7, 1 << 2 }, t.masks);
++    // forced rows all stay; the row after a rejected forced token is unconstrained
++    const f = try c.window(a, &.{ 9, 4, 3 }, &.{ -1, 0, 1 }, true, 8);
++    try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2 }, f.rows);
++    try std.testing.expectEqualSlices(u32, &.{ 1 << 7, std.math.maxInt(u32), std.math.maxInt(u32) }, f.masks);
++}
++
++test "with thinking on the grammar starts after the think end, and rows before it are unconstrained" {
++    const gpa = std.testing.allocator;
++    var arena = std.heap.ArenaAllocator.init(gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var seq: Sequence = .{ .want = &.{5}, .stop = 2, .gpa = gpa };
++    defer seq.log.deinit(gpa);
++    var c: Constraint = .init(seq.rules(), 1, 30);
++    try std.testing.expect((try c.next(a)) == null);
++    const none = try c.window(a, &.{ 9, 10, 11 }, &.{ -1, 0, 1 }, false, 1);
++    try std.testing.expectEqual(@as(usize, 0), none.masks.len);
++    // drafts 30 (the think end), then 5 and 4 (rejected)
++    const w = try c.window(a, &.{ 9, 30, 5, 4 }, &.{ -1, 0, 1, 2 }, false, 1);
++    try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2 }, w.rows);
++    try std.testing.expectEqualSlices(u32, &.{ std.math.maxInt(u32), 1 << 5, 1 << 2 }, w.masks);
++    try std.testing.expect(try c.follow(30));
++    try std.testing.expect(c.active and !try c.follow(4));
++    try std.testing.expect(try c.follow(5) and try c.follow(2) and c.finished());
++}
++
++test "a chain grows past its last kept row with the grammar's own drafts, never past the stop token or the room" {
++    const gpa = std.testing.allocator;
++    var arena = std.heap.ArenaAllocator.init(gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var seq: Sequence = .{ .want = &.{ 5, 6, 7, 8 }, .stop = 2, .gpa = gpa };
++    defer seq.log.deinit(gpa);
++    var c: Constraint = .init(seq.rules(), 1, null);
++    // the head's 5 is kept and its 4 cut: the grammar drafts 6 and 7 in the four rows of room
++    const w = try c.window(a, &.{ 9, 5, 4 }, &.{ -1, 0, 1 }, false, 4);
++    try std.testing.expectEqualSlices(u32, &.{ 0, 1 }, w.rows);
++    try std.testing.expectEqualSlices(u32, &.{ 6, 7 }, w.extra);
++    try std.testing.expectEqualSlices(u32, &.{ 1 << 5, 1 << 6, 1 << 7, 1 << 8 }, w.masks);
++    try std.testing.expectEqual(@as(usize, 0), seq.at);
++    // with no drafts at all the grammar drafts the rest of its text; its stop token is the last row's draw, not a row
++    const g = try c.window(a, &.{9}, &.{-1}, false, 16);
++    try std.testing.expectEqualSlices(u32, &.{ 5, 6, 7, 8 }, g.extra);
++    try std.testing.expectEqualSlices(u32, &.{ 1 << 5, 1 << 6, 1 << 7, 1 << 8, 1 << 2 }, g.masks);
++    // forced rows never grow
++    const f = try c.window(a, &.{ 9, 5 }, &.{ -1, 0 }, true, 16);
++    try std.testing.expectEqual(@as(usize, 0), f.extra.len);
++}
++
++test "a ban clears its tokens from a row that allows another token, and keeps a row that allows only them" {
++    const gpa = std.testing.allocator;
++    var arena = std.heap.ArenaAllocator.init(gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    // a grammar that takes 4 or 5 at every step
++    const Either = struct {
++        taken: usize = 0,
++        fn rules(e: *@This()) Rules {
++            return .{ .ptr = e, .vtable = &.{ .accept = acceptFn, .rollback = rollbackFn, .terminated = terminatedFn, .fill = fillFn, .drafts = draftsFn, .free = freeFn } };
++        }
++        fn acceptFn(ptr: *anyopaque, token: u32) anyerror!bool {
++            const e: *@This() = @ptrCast(@alignCast(ptr));
++            if (token != 4 and token != 5) return false;
++            e.taken += 1;
++            return true;
++        }
++        fn rollbackFn(ptr: *anyopaque, n: usize) anyerror!void {
++            const e: *@This() = @ptrCast(@alignCast(ptr));
++            e.taken -= n;
++        }
++        fn terminatedFn(_: *anyopaque) bool {
++            return false;
++        }
++        fn fillFn(_: *anyopaque, words: []u32) anyerror!void {
++            @memset(words, 0);
++            words[0] = 1 << 4 | 1 << 5;
++        }
++        fn draftsFn(_: *anyopaque, _: []u32) anyerror!usize {
++            return 0;
++        }
++        fn freeFn(_: *anyopaque) void {}
++    };
++    var either: Either = .{};
++    var c: Constraint = .init(either.rules(), 1, null);
++    try std.testing.expectEqualSlices(u32, &.{1 << 4 | 1 << 5}, (try c.next(a)).?);
++    c.ban = &.{4};
++    try std.testing.expectEqualSlices(u32, &.{1 << 5}, (try c.next(a)).?);
++    // every row of a window, the walk rolled back
++    const w = try c.window(a, &.{ 9, 5 }, &.{ -1, 0 }, false, 1);
++    try std.testing.expectEqualSlices(u32, &.{ 1 << 5, 1 << 5 }, w.masks);
++    try std.testing.expectEqual(@as(usize, 0), either.taken);
++    // a row whose every allowed token is banned keeps them: the grammar has no other way on
++    c.ban = &.{ 4, 5 };
++    try std.testing.expectEqualSlices(u32, &.{1 << 4 | 1 << 5}, (try c.next(a)).?);
++    var seq: Sequence = .{ .want = &.{5}, .stop = 2, .gpa = gpa };
++    defer seq.log.deinit(gpa);
++    var s: Constraint = .init(seq.rules(), 1, null);
++    s.ban = &.{5};
++    try std.testing.expectEqualSlices(u32, &.{1 << 5}, (try s.next(a)).?);
++}
++
++test "the file TENSORFOLD_GRAMMAR_LIB names, through the engine's calls: a choice's masks, a refusal, a rollback, the stop" {
++    // opt-in: TENSORFOLD_GRAMMAR_LIB=<a libtfgrammar build> TF_GRAMMAR_TOKENIZER=<a checkpoint's tokenizer.json>
++    // TF_GRAMMAR_VOCAB=<its logits' width> TF_GRAMMAR_STOP=<its eos id>
++    if (std.c.getenv(env) == null) return error.SkipZigTest;
++    const path = std.testing.environ.getPosix("TF_GRAMMAR_TOKENIZER") orelse return error.SkipZigTest;
++    const vocab = try std.fmt.parseInt(u32, std.testing.environ.getPosix("TF_GRAMMAR_VOCAB") orelse return error.SkipZigTest, 10);
++    const stop = try std.fmt.parseInt(u32, std.testing.environ.getPosix("TF_GRAMMAR_STOP") orelse return error.SkipZigTest, 10);
++    const io = std.testing.io;
++    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const text = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(256 << 20));
++    var err: [512]u8 = undefined;
++    var c = try Compiler.open(io, a, text, vocab, &.{stop}, &err);
++    defer c.close();
++    try std.testing.expectEqual(@as(usize, (vocab + 31) / 32), c.words);
++    try std.testing.expectError(error.Grammar, c.compile(io, .regex, "(unclosed", &err));
++    try std.testing.expect(std.mem.sliceTo(&err, 0).len > 0);
++    const g = try c.compile(io, .choice, "[\"yes\", \"no\"]", &err);
++    defer g.free();
++    const r = (try g.matcher()).rules();
++    defer r.vtable.free(r.ptr);
++    const first = try a.alloc(u32, c.words);
++    const words = try a.alloc(u32, c.words);
++    const has = struct {
++        fn has(w: []const u32, t: u32) bool {
++            return (w[t / 32] >> @intCast(t % 32)) & 1 == 1;
++        }
++    }.has;
++    try r.vtable.fill(r.ptr, first);
++    try std.testing.expect(!has(first, stop)); // a choice comes before the stop
++    try std.testing.expect(!try r.vtable.accept(r.ptr, stop)); // a forbidden token is refused
++    try r.vtable.fill(r.ptr, words);
++    try std.testing.expectEqualSlices(u32, first, words); // and the matcher stays where it was
++    var taken: usize = 0;
++    while (!r.vtable.terminated(r.ptr)) : (taken += 1) {
++        if (taken == 16) return error.TestUnexpectedResult;
++        try r.vtable.fill(r.ptr, words);
++        const t: u32 = if (has(words, stop)) stop else for (words, 0..) |w, i| {
++            if (w != 0) break @intCast(i * 32 + @ctz(w));
++        } else return error.TestUnexpectedResult;
++        try std.testing.expect(try r.vtable.accept(r.ptr, t));
++        if (taken == 0) { // a rollback gives the first mask back
++            try r.vtable.rollback(r.ptr, 1);
++            try r.vtable.fill(r.ptr, words);
++            try std.testing.expectEqualSlices(u32, first, words);
++            try std.testing.expect(try r.vtable.accept(r.ptr, t));
++        }
++    }
++    try std.testing.expect(taken >= 2); // a choice's tokens, then the stop
++}
+diff --git a/zig/src/core/lanes/lanes.zig b/zig/src/core/lanes/lanes.zig
+index 74ca8e1b..0b51fdef 100644
+--- a/zig/src/core/lanes/lanes.zig
++++ b/zig/src/core/lanes/lanes.zig
+@@ -20,6 +20,7 @@ pub const windows = @import("windows.zig");
+ pub const trail = @import("trail.zig");
+ pub const engine = @import("engine.zig");
+ pub const fake = @import("fake.zig");
++pub const grammar = @import("grammar.zig");
+ 
+ pub const Engine = engine.Engine;
+ pub const Config = config.Config;
+diff --git a/zig/src/core/lanes/stream.zig b/zig/src/core/lanes/stream.zig
+index 0d30eca3..b72c04c3 100644
+--- a/zig/src/core/lanes/stream.zig
++++ b/zig/src/core/lanes/stream.zig
+@@ -1,5 +1,6 @@
+ //! One stream (Python LaneStream) and the round loop's state for it (Python's dicts keyed by stream id).
+ const std = @import("std");
++const grammar = @import("grammar.zig");
+ const shape = @import("shape.zig");
+ const plan_lanes = @import("plan_lanes.zig");
+ const Allocator = std.mem.Allocator;
+@@ -145,6 +146,7 @@ pub const Spec = struct {
+     chunks: []const u32 = &.{}, // where prefill chunks start after 0 (Python's PrefillPlan); empty: the backend's step
+     reuse: Reuse = .{},
+     images: []const Image = &.{}, // in prompt order; the caller's until the stream is released
++    grammar: ?*grammar.Constraint = null, // structured output: the reply stays in it (the creator frees it)
+ };
+ 
+ pub const Stream = struct {
+@@ -164,6 +166,8 @@ pub const Stream = struct {
+     loop_guard: bool,
+     loop_period: ?u32 = null,
+     chunks: []const u32,
++    grammar: ?*grammar.Constraint = null, // follows each committed token; its masks keep the draws inside it
++    problem: []const u8 = "", // why a stream finished with `error` (static text)
+     reuse: Reuse = .{},
+     images: []const Image = &.{},
+     between: ?BetweenHook = null, // the host's round between this stream's prompt chunks (a backend may call it)
+@@ -222,6 +226,11 @@ pub const Stream = struct {
+             .chunks = spec.chunks,
+             .reuse = spec.reuse,
+             .images = spec.images,
++            .grammar = spec.grammar,
++        };
++        // under a grammar a forced close ends at the think end: the grammar takes the reply from the next token
++        if (spec.grammar) |g| if (g.after) |end| if (std.mem.indexOfScalar(u32, s.think_close, end)) |at| {
++            s.think_close = s.think_close[0 .. at + 1];
+         };
+         try s.context.appendSlice(gpa, spec.prompt);
+         return s;
+@@ -321,6 +330,19 @@ pub const Stream = struct {
+             try s.context.append(gpa, t);
+             landed += 1;
+             if (@as(i64, t) == s.think_end) s.think_open = false;
++            if (s.grammar) |g| {
++                if (!try g.follow(t)) {
++                    s.finished = true;
++                    s.reason = .@"error";
++                    s.problem = "the reply's grammar rejected a chosen token";
++                    break;
++                }
++                if (g.finished() and !s.isEos(t)) { // the grammar's stop token ends the reply (eos ignored or not)
++                    s.finished = true;
++                    s.reason = .stop;
++                    break;
++                }
++            }
+             const fire = if (s.loop_guard and s.think_open and s.think_end >= 0 and s.loop_period == null) detectLoop(s.emitted()) else null;
+             if (s.isEos(t) or s.stopped()) {
+                 s.finished = true;
+diff --git a/zig/src/core/lanes/windows.zig b/zig/src/core/lanes/windows.zig
+index 23ee7e64..940c7192 100644
+--- a/zig/src/core/lanes/windows.zig
++++ b/zig/src/core/lanes/windows.zig
+@@ -13,7 +13,7 @@ const Stream = @import("stream.zig").Stream;
+ const Value = ev.Value;
+ const f = ev.f;
+ 
+-pub const Kind = enum { forced, copy, head, fill, none };
++pub const Kind = enum { forced, copy, head, fill, grammar, none };
+ 
+ /// One stream's window as planned, then as allocated (Python's plan lists).
+ pub const Plan = struct {
+@@ -27,6 +27,8 @@ pub const Plan = struct {
+     branch_from: u32 = 0, // the first row of suffix-match branches (0: none; lanes/fill.zig)
+     tried: bool = false, // the planner read the head's chain back to graft branches
+     lanes: ?*const shape.Shape = null, // the held drafts' tree shape (each lane's depth and rank)
++    masks: []const u32 = &.{}, // structured output: the rows' allowed-token bits (constrain)
++    grammar_from: u32 = 0, // the first row the grammar drafted itself (0: none)
+ 
+     pub fn count(p: Plan) usize {
+         return p.held + p.tokens.len;
+@@ -221,6 +223,45 @@ pub fn nodeChances(e: *Engine, s: *Stream, n: usize) ![]const f64 {
+     return alloc.chainProbabilities(a, try e.rule.rates(who(s)), n);
+ }
+ 
++/// Structured output: the rows an accepted path can use, each row's bits, and the grammar's drafts after a lone chain.
++pub fn constrain(e: *Engine, p: *Plan) !void {
++    const g = p.stream.grammar orelse return;
++    const a = e.arena.allocator();
++    if (p.held > 0) {
++        // the held drafts (a chain or a tree, in window order) come back as host tokens, grafts after them
++        const read = e.backend.vtable.held orelse return error.HeldDraftsUnreadable;
++        const held = try a.alloc(u32, p.held);
++        try read(e.backend.ptr, p.stream, held);
++        p.tokens = try std.mem.concat(a, u32, &.{ held, p.tokens });
++        p.held = 0;
++    }
++    const rows = try a.alloc(u32, 1 + p.tokens.len);
++    rows[0] = p.stream.pending.?;
++    @memcpy(rows[1..], p.tokens);
++    const grows = p.stream.drafts and p.kind != .forced and e.alone;
++    const room = if (grows) @max(rows.len, e.cfg.family_width) else rows.len;
++    const w = try g.window(a, rows, try accept.rowParents(a, rows.len, p.parents), p.kind == .forced, room);
++    p.masks = w.masks;
++    if (w.rows.len == rows.len and w.extra.len == 0) return;
++    if (w.rows.len < rows.len) p.lanes = null; // the tree shape no longer matches the rows
++    const kept = try a.alloc(u32, w.rows.len - 1 + w.extra.len);
++    for (kept[0 .. w.rows.len - 1], w.rows[1..]) |*t, r| t.* = rows[r];
++    @memcpy(kept[w.rows.len - 1 ..], w.extra);
++    p.tokens = kept;
++    if (w.extra.len > 0) p.grammar_from = @intCast(w.rows.len);
++    if (p.parents != null) {
++        const parents = try a.alloc(i32, kept.len);
++        for (parents, w.parents[1..]) |*q, r| q.* = r - 1;
++        p.parents = if (accept.isChain(parents)) null else parents;
++    }
++    if (p.branch_from > 0) {
++        var below: u32 = 0;
++        for (w.rows) |r| below += @intFromBool(r < p.branch_from);
++        p.branch_from = below;
++    }
++    if (p.kind != .forced and w.rows.len == 1) p.kind = if (w.extra.len > 0) .grammar else .none;
++}
++
+ /// The window's rows, parents and keyed positions, ready for the backend.
+ pub fn build(e: *Engine, p: Plan, early: bool) !be.Window {
+     const a = e.arena.allocator();
+@@ -229,7 +270,7 @@ pub fn build(e: *Engine, p: Plan, early: bool) !be.Window {
+     const ds = try accept.depths(a, parents);
+     const positions = try a.alloc(u64, rows);
+     for (positions, ds) |*x, d| x.* = p.position + 1 + d;
+-    return .{ .stream = p.stream, .pending = p.stream.pending.?, .held = p.held, .tokens = p.tokens, .parents = if (p.parents != null) parents else null, .positions = positions, .early = early };
++    return .{ .stream = p.stream, .pending = p.stream.pending.?, .held = p.held, .tokens = p.tokens, .parents = if (p.parents != null) parents else null, .positions = positions, .early = early, .masks = p.masks };
+ }
+ 
+ pub fn rowParents(e: *Engine, w: be.Window) ![]const i32 {
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index 49be25bd..3bdb159c 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -12,7 +12,10 @@
+ //! positional, so keep only checks that a path is a prefix. Rank 0 runs the core; before each primitive it sends rank
+ //! 1 the primitive's inputs over the ranks' link, and rank 1 (follow) runs the same primitive: both ranks issue the
+ //! same kernels and collectives in the same order. The drafted reply is the serial one: every row is drawn with its
+-//! stream's key at its own position, whatever the round's composition.
++//! stream's key at its own position, whatever the round's composition. Structured output: a stream with a grammar
++//! draws each row among its mask's tokens (the row with the others at -inf, drawn as any row), its first token from
++//! the prompt's last row the prompt pass kept for it (first_masked), and the round loop reads its held drafts as host
++//! tokens (held) to walk them through the grammar; rank 1 runs the same rounds, the masks are rank 0's alone.
+ const std = @import("std");
+ const lanes = @import("lanes");
+ const model = @import("model.zig");
+@@ -243,6 +246,29 @@ pub fn draw(row: []const f32, position: u64, s: ?lanes.Sampling) !u32 {
+     return @intCast(t);
+ }
+ 
++/// A row's draw among a grammar's allowed tokens (token t: bit t % 32 of word t / 32, lanes/grammar.zig): the row
++/// with every other token at -inf (written into `buf`, the row's width), drawn as `draw` draws any row.
++pub fn drawMasked(buf: []f32, row: []const f32, position: u64, s: ?lanes.Sampling, mask: []const u32) !u32 {
++    var allowed = false;
++    for (buf, row, 0..) |*x, v, id| {
++        const on = lanes.grammar.allows(mask, id);
++        x.* = if (on) v else -std.math.inf(f32);
++        allowed = allowed or on;
++    }
++    if (!allowed) return error.NoAllowedToken;
++    return draw(buf, position, s);
++}
++
++/// A row's mask width in words: one bit a token.
++pub fn maskWords(vocab: usize) usize {
++    return (vocab + 31) / 32;
++}
++
++/// A window's masks: none, or each row's bits (rows x words).
++fn masksFit(w: be.Window, words: usize) bool {
++    return w.masks.len == 0 or w.masks.len == w.rows() * words;
++}
++
+ /// Where rank 0's backend calls spend their time (ns, summed; --profile): a round's frame to rank 1, its forward
+ /// and absorb (synchronized apart), the logits' copy to the host and the draws; the drafter passes; the prefills.
+ pub const Profile = struct {
+@@ -344,6 +370,11 @@ pub const Lanes = struct {
+     next: u64 = 0,
+     snaps: std.ArrayList(*Snap) = .empty, // kept prompt states, oldest first
+     next_snap: u64 = 1,
++    // structured output: the prompt's last row of the last stream with a grammar prefilled (its first token may be
++    // drawn again among the grammar's tokens), and a row with the disallowed tokens at -inf
++    first_row: []f32 = &.{},
++    first_of: ?*const lanes.Stream = null,
++    masked: []f32 = &.{},
+ 
+     pub fn init(gpa: std.mem.Allocator, m: *Model) Lanes {
+         var ln: Lanes = .{ .gpa = gpa, .m = m, .peer = if (m.world > 1) m.peer() else null };
+@@ -366,6 +397,8 @@ pub const Lanes = struct {
+         self.streams.deinit(self.gpa);
+         for (&self.seqs) |*q| q.deinit(self.gpa);
+         self.wire.deinit(self.gpa);
++        self.gpa.free(self.first_row);
++        self.gpa.free(self.masked);
+     }
+ 
+     /// TF_DS_PREFILL_YIELD=1: the served host advances a prompt a chunk at a time (prefillStep), admitting the queued
+@@ -383,6 +416,8 @@ pub const Lanes = struct {
+         .keep = keepFn,
+         .draft = draftFn,
+         .probabilities = probabilitiesFn,
++        .first_masked = firstMaskedFn,
++        .held = heldFn,
+         .release = releaseFn,
+     };
+     const vt_stepping: be.Backend.VTable = blk: {
+@@ -736,6 +771,12 @@ pub const Lanes = struct {
+         }
+         const token = try draw(logits, len, s.sampling);
+         self.streams.getPtr(s).?.first = self.take(token);
++        // a stream with a grammar: the row stays for its first token's draw among the grammar's tokens
++        if (s.grammar != null) {
++            self.first_row = try self.gpa.realloc(self.first_row, logits.len);
++            @memcpy(self.first_row, logits);
++            self.first_of = s;
++        }
+         f.deinit(gpa);
+         self.fills[lane.slot] = null;
+         if (self.prof) |*p| p.prefills += 1;
+@@ -749,6 +790,30 @@ pub const Lanes = struct {
+         return l.first;
+     }
+ 
++    /// `first` among a grammar's tokens: the prompt's last row (the prompt pass kept it for the stream) drawn again
++    /// with the other tokens at -inf, at the same keyed position.
++    fn firstMaskedFn(ptr: *anyopaque, s: *lanes.Stream, position: u64, mask: []const u32) anyerror!u64 {
++        const self = of(ptr);
++        _ = self.streams.getPtr(s) orelse return error.UnknownStream;
++        if (position != s.prompt_len) return error.PositionMismatch;
++        if (self.first_of != s) return error.NoPromptRow;
++        return self.take(try self.drawAllowed(self.first_row, position, s.sampling, mask));
++    }
++
++    /// The held drafts as host tokens in window order (a grammar walks them): draft holds them when its pass ends.
++    fn heldFn(ptr: *anyopaque, s: *lanes.Stream, out: []u32) anyerror!void {
++        const self = of(ptr);
++        const l = self.streams.getPtr(s) orelse return error.UnknownStream;
++        if (out.len > l.nheld) return error.HeldMismatch;
++        @memcpy(out, l.held[0..out.len]);
++    }
++
++    /// drawMasked into the backend's row.
++    fn drawAllowed(self: *Lanes, row: []const f32, position: u64, s: ?lanes.Sampling, mask: []const u32) !u32 {
++        self.masked = try self.gpa.realloc(self.masked, row.len);
++        return drawMasked(self.masked, row, position, s, mask);
++    }
++
+     fn queueFn(ptr: *anyopaque, s: *lanes.Stream, feed: be.Feed, position: u64) anyerror!u64 {
+         _ = .{ ptr, s, feed, position };
+         return error.NotPipelined;
+@@ -769,6 +834,8 @@ pub const Lanes = struct {
+         if (windows.len > max_streams) return error.WindowTooWide;
+         var ids: [max_streams][max_rows]i32 = undefined;
+         var wins: [max_streams]Win = undefined;
++        const words = maskWords(m.vocab);
++        var masked = false;
+         for (windows, 0..) |w, k| {
+             if (w.parents != null) return error.TreesNotBuilt;
+             const l = self.streams.getPtr(w.stream) orelse return error.UnknownStream;
+@@ -777,6 +844,8 @@ pub const Lanes = struct {
+             const start: usize = @intCast(w.stream.cache_len);
+             for (w.positions, 0..) |p, r| if (p != start + 1 + r) return error.PositionMismatch;
+             if (w.held > l.nheld) return error.HeldMismatch;
++            if (!masksFit(w, words)) return error.BadMasks;
++            masked = masked or w.masks.len > 0;
+             ids[k][0] = @intCast(w.pending);
+             for (l.held[0..w.held], 0..) |t, j| ids[k][1 + j] = @intCast(t);
+             for (w.tokens, 0..) |t, j| ids[k][1 + w.held + j] = @intCast(t);
+@@ -799,8 +868,8 @@ pub const Lanes = struct {
+         const rows = try self.built.build(gpa, &self.seqs, wins[0..windows.len]);
+         try m.verify(rows, self.built.absorb[0..windows.len]);
+         const t2 = m.now();
+-        // every row greedy: the device's argmax (R tokens back); else the logits for the host's draws
+-        var greedy = true;
++        // every row greedy and none masked: the device's argmax (R tokens back); else the logits for the host's draws
++        var greedy = !masked;
+         for (windows) |w| {
+             if (w.stream.sampling) |sm| if (sm.temperature > 0) {
+                 greedy = false;
+@@ -810,7 +879,7 @@ pub const Lanes = struct {
+         // Track B (TF_DS_SAMPLE_CAND=1): a sampled round's rows as their first candidates from the GPU (the host's
+         // draws read only those; sampling.sampleCandidates), the whole logits only when a row needs them
+         var cand_count: usize = 0;
+-        if (!greedy and candOn()) {
++        if (!greedy and !masked and candOn()) { // a masked row is drawn from its whole row
+             cand_count = 1;
+             for (windows) |w| if (w.stream.sampling) |sm| if (sm.temperature > 0) {
+                 if (sm.top_k == 0 or sampling.candidateCount(m.vocab, .{ .seed = sm.seed, .temperature = sm.temperature, .top_k = sm.top_k, .top_p = sm.top_p, .min_p = sm.min_p }) > sampling.max_candidates) {
+@@ -842,6 +911,8 @@ pub const Lanes = struct {
+             const row0 = self.built.wins[k].row;
+             for (0..w.rows()) |r| o.sampled[r] = if (greedy)
+                 tokens[row0 + r]
++            else if (w.masks.len > 0)
++                try self.drawAllowed(logits[(row0 + r) * V ..][0..V], w.positions[r], w.stream.sampling, w.masks[r * words ..][0..words])
+             else if (!whole)
+                 try drawCandidates(cand.?.vals[(row0 + r) * cand_count ..][0..cand_count], cand.?.ids[(row0 + r) * cand_count ..][0..cand_count], V, w.positions[r], w.stream.sampling)
+             else
+@@ -1052,6 +1123,7 @@ pub const Lanes = struct {
+ 
+     fn releaseFn(ptr: *anyopaque, s: *lanes.Stream) void {
+         const self = of(ptr);
++        if (self.first_of == s) self.first_of = null;
+         if (self.streams.fetchRemove(s)) |kv| {
+             const slot = kv.value.slot;
+             if (self.fills[slot]) |*f| {
+@@ -1344,3 +1416,107 @@ test "greedy draws take the first largest logit" {
+     try std.testing.expectEqual(@as(u32, 1), try draw(&row, 9, null));
+     try std.testing.expectEqual(@as(u32, 1), try draw(&row, 9, .{ .seed = 3, .temperature = 0 }));
+ }
++
++/// A test row: token i's logit from splitmix64(i + 1) (exact in f32, a few ties).
++fn testRow(row: []f32) void {
++    for (row, 0..) |*x, i| {
++        var z: u64 = @as(u64, i + 1) *% 0x9E3779B97F4A7C15;
++        z = (z ^ (z >> 30)) *% 0xBF58476D1CE4E5B9;
++        z = (z ^ (z >> 27)) *% 0x94D049BB133111EB;
++        x.* = @as(f32, @floatFromInt((z ^ (z >> 31)) >> 52)) / 256.0 - 8.0;
++    }
++}
++
++test "a masked draw is the row's draw with the other tokens at -inf, and never a disallowed token" {
++    const V = 1000;
++    var row: [V]f32 = undefined;
++    testRow(&row);
++    var buf: [V]f32 = undefined;
++    var off: [V]f32 = undefined;
++    var mask: [maskWords(V)]u32 = @splat(0);
++    for (0..V) |i| if (i % 7 == 3 or i % 250 == 1) {
++        mask[i / 32] |= @as(u32, 1) << @intCast(i % 32);
++    };
++    for (&off, row, 0..) |*o, v, i| o.* = if (lanes.grammar.allows(&mask, i)) v else -std.math.inf(f32);
++    const all: [maskWords(V)]u32 = @splat(std.math.maxInt(u32));
++    const settings = [_]?lanes.Sampling{
++        null,
++        .{ .seed = 5, .temperature = 0 },
++        .{ .seed = 11, .temperature = 1.0, .top_k = 1 },
++        .{ .seed = 12, .temperature = 1.0, .top_k = 20, .top_p = 0.95 },
++        .{ .seed = 13, .temperature = 0.7, .top_k = 56, .top_p = 0.9, .min_p = 0.05 },
++        .{ .seed = 14, .temperature = 1.3, .top_k = 40, .top_p = 1.0 },
++    };
++    for (settings) |s| for ([_]u64{ 0, 17, 4096, 1 << 20 }) |position| {
++        const got = try drawMasked(&buf, &row, position, s, &mask);
++        try std.testing.expect(lanes.grammar.allows(&mask, got));
++        try std.testing.expectEqual(try draw(&off, position, s), got);
++        // every token allowed: the row's own draw
++        try std.testing.expectEqual(try draw(&row, position, s), try drawMasked(&buf, &row, position, s, &all));
++    };
++    // greedy: the first largest allowed logit
++    var best: ?usize = null;
++    for (row, 0..) |v, i| if (lanes.grammar.allows(&mask, i) and (best == null or v > row[best.?])) {
++        best = i;
++    };
++    try std.testing.expectEqual(@as(u32, @intCast(best.?)), try drawMasked(&buf, &row, 3, null, &mask));
++    // one token allowed: that token at any sampling
++    var one: [maskWords(V)]u32 = @splat(0);
++    one[999 / 32] = @as(u32, 1) << (999 % 32);
++    for (settings) |s| try std.testing.expectEqual(@as(u32, 999), try drawMasked(&buf, &row, 9, s, &one));
++    // nothing allowed: no draw
++    try std.testing.expectError(error.NoAllowedToken, drawMasked(&buf, &row, 9, null, &@as([maskWords(V)]u32, @splat(0))));
++}
++
++test "a stream with a grammar draws its first token from the kept prompt row, and its held drafts read back as host tokens" {
++    const gpa = std.testing.allocator;
++    // no model here: rdma_idle set, so release (0034) has no RDMA proxies to park
++    var ln: Lanes = .{ .gpa = gpa, .m = undefined, .peer = null, .rdma_idle = true };
++    defer ln.deinit();
++    const b = ln.backend();
++    try std.testing.expect(b.vtable.first_masked != null and b.vtable.held != null);
++    var s = try lanes.Stream.init(gpa, .{ .id = "s", .prompt = &.{ 1, 2, 3 }, .max_new = 8, .sampling = .{ .seed = 7, .temperature = 0.8, .top_k = 20, .top_p = 0.95 } });
++    defer s.deinit(gpa);
++    try ln.streams.put(gpa, &s, .{ .slot = 0, .base = 0, .end = model.chunk_rows });
++    ln.used[0] = true;
++    var row: [1000]f32 = undefined;
++    testRow(&row);
++    var mask: [maskWords(1000)]u32 = @splat(0);
++    for ([_]usize{ 4, 100, 640, 999 }) |t| mask[t / 32] |= @as(u32, 1) << @intCast(t % 32);
++    // no kept row (the stream had no grammar at its prompt pass): no masked draw
++    try std.testing.expectError(error.NoPromptRow, b.vtable.first_masked.?(b.ptr, &s, 3, &mask));
++    ln.first_row = try gpa.dupe(f32, &row);
++    ln.first_of = &s;
++    try std.testing.expectError(error.PositionMismatch, b.vtable.first_masked.?(b.ptr, &s, 2, &mask));
++    var buf: [1000]f32 = undefined;
++    const want = try drawMasked(&buf, &row, 3, s.sampling, &mask);
++    try std.testing.expectEqual(want, try b.read(try b.vtable.first_masked.?(b.ptr, &s, 3, &mask)));
++    // the drafts the last pass held, in window order
++    const l = ln.streams.getPtr(&s).?;
++    l.held[0..3].* = .{ 50, 51, 52 };
++    l.nheld = 3;
++    var out: [2]u32 = undefined;
++    try b.vtable.held.?(b.ptr, &s, &out);
++    try std.testing.expectEqualSlices(u32, &.{ 50, 51 }, &out);
++    var four: [4]u32 = undefined;
++    try std.testing.expectError(error.HeldMismatch, b.vtable.held.?(b.ptr, &s, &four));
++    // a released stream's row is no one's
++    b.release(&s);
++    try std.testing.expect(ln.first_of == null);
++}
++
++test "a window's masks are none or every row's bits" {
++    const gpa = std.testing.allocator;
++    var s = try lanes.Stream.init(gpa, .{ .id = "s", .prompt = &.{1}, .max_new = 4 });
++    defer s.deinit(gpa);
++    const words = maskWords(129280);
++    try std.testing.expectEqual(@as(usize, 4040), words);
++    const bits: [3 * 4040]u32 = @splat(1);
++    const w: be.Window = .{ .stream = &s, .pending = 1, .held = 0, .tokens = &.{ 2, 3 }, .parents = null, .positions = &.{ 2, 3, 4 } };
++    try std.testing.expect(masksFit(w, words));
++    var with = w;
++    with.masks = &bits;
++    try std.testing.expect(masksFit(with, words));
++    with.masks = bits[0 .. 2 * words];
++    try std.testing.expect(!masksFit(with, words));
++}
+diff --git a/zig/src/grammar/tf_grammar.cc b/zig/src/grammar/tf_grammar.cc
+new file mode 100644
+index 00000000..733d5e18
+--- /dev/null
++++ b/zig/src/grammar/tf_grammar.cc
+@@ -0,0 +1,247 @@
++// libtfgrammar: a C ABI over xgrammar's C++ library for the native server (bitmask words: token t at bit t % 32 of t / 32).
++#include <dlpack/dlpack.h>
++#include <picojson.h>
++#include <xgrammar/xgrammar.h>
++
++#include <algorithm>
++#include <cstdint>
++#include <cstring>
++#include <exception>
++#include <memory>
++#include <stdexcept>
++#include <string>
++#include <unordered_map>
++#include <vector>
++
++namespace {
++
++// xgrammar's error without its timestamp and source location, first line only (grammar.py _message).
++void message(char* err, size_t len, const char* text) {
++    if (!err || len == 0) return;
++    std::string t(text);
++    t = t.substr(0, t.find('\n'));
++    if (!t.empty() && t[0] == '[') {
++        size_t close = t.find("] ");
++        size_t colon = close == std::string::npos ? close : t.find(": ", close + 2);
++        if (colon != std::string::npos) {
++            // "[time] path/file.cc:123: words": the location is one token ending in ":<digits>"
++            std::string where = t.substr(close + 2, colon - close - 2);
++            size_t last = where.rfind(':');
++            bool line = last != std::string::npos && last + 1 < where.size() && where.find(' ') == std::string::npos;
++            for (size_t i = last + 1; line && i < where.size(); i++) line = where[i] >= '0' && where[i] <= '9';
++            if (line) t = t.substr(colon + 2);
++        }
++    }
++    std::strncpy(err, t.c_str(), len - 1);
++    err[len - 1] = 0;
++}
++
++// Each token's decoded text to its id (the lowest id for a repeated text), for spelling a grammar's forced text.
++struct Spellings {
++    std::unordered_map<std::string, int32_t> ids;
++    size_t longest = 0;
++};
++
++std::shared_ptr<const Spellings> spellings(const xgrammar::TokenizerInfo& info) {
++    auto out = std::make_shared<Spellings>();
++    const auto& vocab = info.GetDecodedVocab();
++    std::vector<bool> skip(vocab.size(), false);
++    for (int32_t t : info.GetSpecialTokenIds()) if (t >= 0 && (size_t)t < skip.size()) skip[t] = true;
++    for (int32_t t : info.GetStopTokenIds()) if (t >= 0 && (size_t)t < skip.size()) skip[t] = true;
++    for (size_t t = 0; t < vocab.size(); t++) {
++        if (skip[t] || vocab[t].empty()) continue;
++        out->ids.emplace(vocab[t], (int32_t)t);  // emplace keeps the first (lowest) id
++        out->longest = std::max(out->longest, vocab[t].size());
++    }
++    return out;
++}
++
++struct Compiler {
++    xgrammar::TokenizerInfo info;
++    xgrammar::GrammarCompiler compiler;
++    int vocab;
++    std::shared_ptr<const Spellings> spell;
++};
++
++struct Compiled {
++    xgrammar::CompiledGrammar g;
++    std::shared_ptr<const Spellings> spell;
++};
++
++struct Matcher {
++    xgrammar::GrammarMatcher m;
++    std::shared_ptr<const Spellings> spell;
++};
++
++constexpr int BLANKS = 32;                      // grammar.py BLANKS
++constexpr int64_t CACHE_BYTES = 256ll << 20;    // grammar.py CACHE_BYTES
++const char* OBJECT = "{\"type\": \"object\"}";  // grammar.py OBJECT: json_object
++
++}  // namespace
++
++extern "C" {
++
++// tokenizer.json's text; vocab: the logits' width; stops: the model's eos ids. NULL with ``err`` on failure.
++void* tfg_open(const char* tokenizer_json, size_t len, int vocab, const int32_t* stops, int nstops, char* err, size_t errlen) {
++    try {
++        std::string text(tokenizer_json, len);
++        picojson::value v;
++        std::string perr = picojson::parse(v, text);
++        if (!perr.empty() || !v.is<picojson::object>()) { message(err, errlen, "tokenizer.json is not a JSON object"); return nullptr; }
++        const auto& o = v.get<picojson::object>();
++        std::vector<std::string> encoded(vocab);
++        auto model = o.find("model");
++        if (model == o.end() || !model->second.is<picojson::object>()) { message(err, errlen, "tokenizer.json has no model"); return nullptr; }
++        const auto& mo = model->second.get<picojson::object>();
++        auto vocab_it = mo.find("vocab");
++        if (vocab_it == mo.end() || !vocab_it->second.is<picojson::object>()) { message(err, errlen, "tokenizer.json's model has no vocab"); return nullptr; }
++        for (const auto& kv : vocab_it->second.get<picojson::object>()) {
++            int64_t id = (int64_t)kv.second.get<double>();
++            if (id >= 0 && id < vocab) encoded[id] = kv.first;
++        }
++        auto added = o.find("added_tokens");
++        if (added != o.end() && added->second.is<picojson::array>())
++            for (const auto& t : added->second.get<picojson::array>()) {
++                if (!t.is<picojson::object>()) continue;
++                const auto& to = t.get<picojson::object>();
++                auto id = to.find("id"), content = to.find("content");
++                if (id == to.end() || content == to.end() || !content->second.is<std::string>()) continue;
++                int64_t i = (int64_t)id->second.get<double>();
++                if (i >= 0 && i < vocab) encoded[i] = content->second.get<std::string>();
++            }
++        std::string metadata = xgrammar::TokenizerInfo::DetectMetadataFromHF(text);
++        picojson::value mv;
++        picojson::parse(mv, metadata);
++        const auto& mo2 = mv.get<picojson::object>();
++        auto type = (xgrammar::VocabType)(int)mo2.at("vocab_type").get<double>();
++        bool prefix = mo2.at("add_prefix_space").get<bool>();
++        std::vector<int32_t> stop(stops, stops + nstops);
++        xgrammar::TokenizerInfo info(encoded, type, vocab, stop, prefix);
++        return new Compiler{info, xgrammar::GrammarCompiler(info, 8, true, CACHE_BYTES), vocab, spellings(info)};
++    } catch (const std::exception& e) {
++        message(err, errlen, e.what());
++    } catch (...) {
++        message(err, errlen, "xgrammar failed");
++    }
++    return nullptr;
++}
++
++void tfg_close(void* c) { delete static_cast<Compiler*>(c); }
++
++// Words a row's bitmask holds.
++int tfg_words(void* c) { return (static_cast<Compiler*>(c)->vocab + 31) / 32; }
++
++// kind: 0 json (any object), 1 json_schema, 2 regex, 3 choice (JSON strings), 4 EBNF, 5 structural tag (xgrammar JSON).
++void* tfg_compile(void* cp, int kind, const char* text, size_t len, char* err, size_t errlen) {
++    auto* c = static_cast<Compiler*>(cp);
++    try {
++        std::string t(text, len);
++        xgrammar::CompiledGrammar g = [&] {
++            switch (kind) {
++                case 0: return c->compiler.CompileJSONSchema(OBJECT, true, std::nullopt, std::nullopt, true, BLANKS);
++                case 1: return c->compiler.CompileJSONSchema(t, true, std::nullopt, std::nullopt, true, BLANKS);
++                case 2: return c->compiler.CompileRegex(t);
++                case 3: {
++                    picojson::value v;
++                    std::string perr = picojson::parse(v, t);
++                    if (!perr.empty() || !v.is<picojson::array>()) throw std::runtime_error("choices must be a JSON array");
++                    std::string ebnf = "root ::= ";
++                    bool first = true;
++                    for (const auto& x : v.get<picojson::array>()) {
++                        if (!first) ebnf += " | ";
++                        first = false;
++                        ebnf += x.serialize();
++                    }
++                    return c->compiler.CompileGrammar(ebnf);
++                }
++                case 5: return c->compiler.CompileStructuralTag(t);
++                default: return c->compiler.CompileGrammar(t);
++            }
++        }();
++        return new Compiled{g, c->spell};
++    } catch (const std::exception& e) {
++        message(err, errlen, e.what());
++    } catch (...) {
++        message(err, errlen, "xgrammar failed");
++    }
++    return nullptr;
++}
++
++void tfg_free(void* g) { delete static_cast<Compiled*>(g); }
++
++void* tfg_matcher(void* g) {
++    try {
++        auto* c = static_cast<Compiled*>(g);
++        return new Matcher{xgrammar::GrammarMatcher(c->g), c->spell};
++    } catch (...) {
++        return nullptr;
++    }
++}
++
++void tfg_matcher_free(void* m) { delete static_cast<Matcher*>(m); }
++
++// 1 taken, 0 rejected, -1 failed.
++int tfg_accept(void* m, int32_t token) {
++    try {
++        return static_cast<Matcher*>(m)->m.AcceptToken(token) ? 1 : 0;
++    } catch (...) {
++        return -1;
++    }
++}
++
++int tfg_rollback(void* m, int n) {
++    try {
++        static_cast<Matcher*>(m)->m.Rollback(n);
++        return 0;
++    } catch (...) {
++        return -1;
++    }
++}
++
++int tfg_terminated(void* m) { return static_cast<Matcher*>(m)->m.IsTerminated() ? 1 : 0; }
++
++// The next token's allowed bits into ``words`` (tfg_words of them). 0, or -1 when it failed.
++int tfg_fill(void* m, int32_t* words, int n) {
++    try {
++        int64_t shape[2] = {1, n};
++        DLTensor t{};
++        t.data = words;
++        t.device = {kDLCPU, 0};
++        t.ndim = 2;
++        t.dtype = {kDLInt, 32, 1};
++        t.shape = shape;
++        static_cast<Matcher*>(m)->m.FillNextTokenBitmask(&t, 0);
++        return 0;
++    } catch (...) {
++        return -1;
++    }
++}
++
++// Up to n tokens spelling the grammar's forced text, longest first, never its last character (models join it on).
++int tfg_drafts(void* mp, int32_t* out, int n) {
++    auto* w = static_cast<Matcher*>(mp);
++    int got = 0;
++    bool failed = false;
++    try {
++        while (got < n && !w->m.IsTerminated()) {
++            std::string forced = w->m.FindJumpForwardString();
++            int32_t pick = -1;
++            for (size_t len = std::min(forced.size() - (forced.empty() ? 0 : 1), w->spell->longest); len > 0 && pick < 0; len--) {
++                auto it = w->spell->ids.find(forced.substr(0, len));
++                if (it != w->spell->ids.end()) pick = it->second;
++            }
++            if (pick < 0 || !w->m.AcceptToken(pick)) break;
++            out[got++] = pick;
++        }
++    } catch (...) {
++        failed = true;
++    }
++    try {
++        if (got > 0) w->m.Rollback(got);
++    } catch (...) {
++        return -1;
++    }
++    return failed ? -1 : got;
++}
++
++}  // extern "C"
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index 54706e20..17a3ed79 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -281,6 +281,18 @@ const Host = struct {
+                     return x.inner.vtable.alternatives.?(x.inner.ptr, s, out);
+                 }
+             }.f else null,
++            .first_masked = if (v.first_masked != null) struct {
++                fn f(p: *anyopaque, s: *lanes.Stream, position: u64, mask: []const u32) anyerror!u64 {
++                    const x = bind(p);
++                    return x.inner.vtable.first_masked.?(x.inner.ptr, s, position, mask);
++                }
++            }.f else null,
++            .held = if (v.held != null) struct {
++                fn f(p: *anyopaque, s: *lanes.Stream, out: []u32) anyerror!void {
++                    const x = bind(p);
++                    return x.inner.vtable.held.?(x.inner.ptr, s, out);
++                }
++            }.f else null,
+             .release = struct {
+                 fn f(p: *anyopaque, s: *lanes.Stream) void {
+                     const x = bind(p);
+@@ -383,7 +395,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+     };
+     // the family cuts its own prompt grid from position 0, as `tensorfold run` does: prefill_step 0
+     const vision: ?api.Vision = if (@hasField(@TypeOf(loaded), "vision")) loaded.vision else null;
+-    try h.serve(io, loaded.facts, loaded.rows, .{ .lanes = streams, .context_window = @intCast(window), .prompt_cache = h.cache != null, .startup = h.startup, .efforts = familyEfforts(F), .vision = vision }, .{ .ctx = loaded.ctx, .text = F.explain });
++    try h.serve(io, loaded.facts, loaded.rows, .{ .lanes = streams, .context_window = @intCast(window), .prompt_cache = h.cache != null, .startup = h.startup, .efforts = familyEfforts(F), .vision = vision, .structures = loaded.backend.vtable.first_masked != null }, .{ .ctx = loaded.ctx, .text = F.explain });
+     opened = true;
+     return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h };
+ }
+diff --git a/zig/src/server/main.zig b/zig/src/server/main.zig
+index 531064b6..da79ffc2 100644
+--- a/zig/src/server/main.zig
++++ b/zig/src/server/main.zig
+@@ -64,6 +64,7 @@ pub fn main(init: std.process.Init) !u8 {
+         .engine = opened.engine,
+         .text = text.text(),
+         .served = hub.servedName(args.name, args.model, dir),
++        .model_dir = dir,
+         .sampling = try sampling(a, io, dir, args),
+         .environ = init.environ_map,
+         .started = started,
+diff --git a/zig/src/server/openai.zig b/zig/src/server/openai.zig
+index 542e2c25..4a38a89a 100644
+--- a/zig/src/server/openai.zig
++++ b/zig/src/server/openai.zig
+@@ -150,6 +150,7 @@ fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Plan {
+     for ([_][]const u8{ "temperature", "top_p", "top_k", "min_p", "seed", "priority", "draft", "thinking_budget", "ignore_eos", "stop" } ++ grammar.fields) |k| if (body.get(k)) |v| try sampling.put(cx.a, k, v);
+     try grammar.refusal(cx, body);
+     if (input.tools.len > 0 and try tool_specs.choiceRequiresCall(cx.a, body.get("tool_choice"))) try sampling.put(cx.a, "tool_call_required", .{ .bool = true });
++    if (body.field("parallel_tool_calls")) |p| if (p == .bool and !p.bool) try sampling.put(cx.a, "tool_call_single", .{ .bool = true });
+     const thinking = try fields.thinkingFields(cx, body, srv.effort_levels);
+     if (thinking.effort) |e| try sampling.put(cx.a, "reasoning_effort", .{ .string = e });
+     if (thinking.enable) |on| try sampling.put(cx.a, "enable_thinking", .{ .bool = on });
+diff --git a/zig/src/server/root.zig b/zig/src/server/root.zig
+index 7efe9b4e..b9ba5d44 100644
+--- a/zig/src/server/root.zig
++++ b/zig/src/server/root.zig
+@@ -23,6 +23,7 @@ test {
+     _ = @import("tool_parse.zig");
+     _ = @import("tool_stream.zig");
+     _ = @import("tool_params.zig");
++    _ = @import("tool_grammar.zig");
+     _ = @import("pyrepr.zig");
+     _ = @import("metrics.zig");
+     _ = @import("http_conn.zig");
+diff --git a/zig/src/server/serve.zig b/zig/src/server/serve.zig
+index f92ee61d..8b653b78 100644
+--- a/zig/src/server/serve.zig
++++ b/zig/src/server/serve.zig
+@@ -65,6 +65,8 @@ pub const Setup = struct {
+     engine: api.Engine,
+     text: model_text.Text,
+     served: []const u8,
++    /// The checkpoint's folder (structured output reads its tokenizer.json and config.json).
++    model_dir: []const u8 = "",
+     /// Sampling defaults from generation_config.json and the flags, as a JSON object; null: greedy.
+     sampling: ?json.Value = null,
+     environ: ?*const std.process.Environ.Map = null,
+@@ -107,6 +109,7 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
+     };
+     const config: server_mod.Config = .{
+         .served_name = s.served,
++        .model_dir = s.model_dir,
+         .model_ids = ids.items,
+         .default_max_tokens = args.max_tokens,
+         .sse_keepalive_s = keepalive_s,
+diff --git a/zig/src/server/server.zig b/zig/src/server/server.zig
+index 0f972630..14445263 100644
+--- a/zig/src/server/server.zig
++++ b/zig/src/server/server.zig
+@@ -16,6 +16,7 @@ const grammar = @import("grammar.zig");
+ const clock = @import("clock.zig");
+ const prompt = @import("prompt.zig");
+ const tool_specs = @import("tool_specs.zig");
++const tool_grammar = @import("tool_grammar.zig");
+ const chunk_plan = @import("chunk_plan.zig");
+ const log = @import("log.zig");
+ const Value = json.Value;
+@@ -27,6 +28,7 @@ pub const CompactAt = union(enum) { auto, fraction: f64 };
+ 
+ pub const Config = struct {
+     served_name: []const u8,
++    model_dir: []const u8 = "",
+     /// The served name first, then aliases, without repeats.
+     model_ids: []const []const u8,
+     default_max_tokens: i64 = 4096,
+@@ -81,6 +83,10 @@ pub const Server = struct {
+     keepalive: ?*api.keepalive.Keepalive = null,
+     preparing: std.atomic.Value(i64) = .init(0),
+     arena: std.heap.ArenaAllocator,
++    /// Structured output's compiler, opened by the first structured request (Python's grammar.compiler).
++    grammars: ?*api.grammar.Compiler = null,
++    grammar_problem: ?[]const u8 = null,
++    grammar_mutex: std.Io.Mutex = .init,
+ 
+     /// Reads what the template and tokenizer decide once: late system role, think markers, efforts, the forced close.
+     pub fn init(gpa: Allocator, io: std.Io, engine: api.Engine, text: model_text.Text, config: Config, keys: ?*auth.Store) !*Server {
+@@ -119,6 +125,7 @@ pub const Server = struct {
+ 
+     pub fn deinit(srv: *Server) void {
+         if (srv.keepalive) |k| k.stop(); // before the engine's queue goes away
++        if (srv.grammars) |g| g.close();
+         srv.arena.deinit();
+         srv.store.deinit();
+         srv.gpa.destroy(srv);
+@@ -159,7 +166,10 @@ pub const Server = struct {
+     pub fn checkFeatures(srv: *Server, cx: *Cx, f: Value, has_tools: bool, thinking: bool, prompt_ids: []const u32, tools: []const Value, request: *api.Request) errors.Refused!void {
+         _ = prompt_ids;
+         const required = if (f.get("tool_call_required")) |r| r.truthy() else false;
+-        if (has_tools and required) {
++        if (has_tools and required and srv.info.structures) {
++            const one_call = if (f.get("tool_call_single")) |x| x.truthy() else false;
++            request.structure = try tool_grammar.structure(srv, cx, tools, !one_call, thinking);
++        } else if (has_tools and required) {
+             const form = try srv.callForm(cx);
+             const opener = if (form) |fm| srv.text.tokenId(fm.opener) else null;
+             if (opener == null) return cx.refuse("tool_choice \"required\" or a named function needs a chat template that marks tool calls (<tool_call> or <|tool_call>), and this one does not: send \"auto\"");
+@@ -177,10 +187,53 @@ pub const Server = struct {
+         }
+         if (try grammar.spec(cx, f)) |s| {
+             if (!srv.info.structures) return cx.refuse("structured output (response_format and the guided_* fields) is not supported by this engine yet");
+-            request.structure = .{ .kind = s.kind, .text = s.text, .after = if (thinking) srv.text.tokenId(srv.markers.close) else null };
++            request.structure = try srv.compiledStructure(cx, s.kind, s.text, s.field, thinking);
+         }
+     }
+ 
++    /// A request's grammar, compiled once here (a 400 with xgrammar's reason when it cannot be enforced).
++    pub fn compiledStructure(srv: *Server, cx: *Cx, kind: grammar.Kind, text: []const u8, field: []const u8, thinking: bool) errors.Refused!api.Structure {
++        const c = srv.grammarCompiler() orelse return cx.fail(.request, "{s}: {s}", .{ if (kind == .structural_tag) field else "structured output", srv.grammar_problem.? });
++        var err: [512]u8 = undefined;
++        const compiled = c.compile(srv.io, @fromBackingInt(@intCast(@backingInt(kind))), text, &err) catch
++            return cx.fail(.request, "{s}: the grammar cannot be enforced: {s}", .{ field, std.mem.sliceTo(&err, 0) });
++        compiled.free(); // kept in the compiler's cache for the engine's compile
++        return .{ .kind = kind, .text = text, .after = if (thinking) srv.text.tokenId(srv.markers.close) else null, .compiler = c };
++    }
++
++    /// The model's grammar compiler: tokenizer.json, config.json's vocab_size (text_config first), the eos ids.
++    fn grammarCompiler(srv: *Server) ?*api.grammar.Compiler {
++        srv.grammar_mutex.lockUncancelable(srv.io);
++        defer srv.grammar_mutex.unlock(srv.io);
++        if (srv.grammars) |g| return g;
++        if (srv.grammar_problem != null) return null;
++        const a = srv.arena.allocator();
++        srv.grammar_problem = blk: {
++            const dir = std.Io.Dir.cwd();
++            const tok = dir.readFileAlloc(srv.io, std.fs.path.join(a, &.{ srv.config.model_dir, "tokenizer.json" }) catch break :blk "out of memory", a, .limited(256 << 20)) catch break :blk "the checkpoint has no tokenizer.json";
++            const cfg_text = dir.readFileAlloc(srv.io, std.fs.path.join(a, &.{ srv.config.model_dir, "config.json" }) catch break :blk "out of memory", a, .limited(16 << 20)) catch break :blk "the checkpoint has no config.json";
++            const cfg = switch (json.parse(a, cfg_text) catch break :blk "out of memory") {
++                .ok => |v| v,
++                .err => break :blk "config.json is not JSON",
++            };
++            var vocab: ?u32 = null;
++            for ([_]?json.Value{ cfg.get("text_config"), cfg }) |part| if (vocab == null) if (part) |p| if (p.get("vocab_size")) |v| if (v.int64()) |n| {
++                vocab = @intCast(n);
++            };
++            if (vocab == null) break :blk "structured output needs the checkpoint's config.json vocab_size";
++            var err: [512]u8 = undefined;
++            const c = a.create(api.grammar.Compiler) catch break :blk "out of memory";
++            c.* = api.grammar.Compiler.open(srv.io, a, tok, vocab.?, srv.eos, &err) catch |e| break :blk switch (e) {
++                error.NoGrammarLibrary => "the server cannot load " ++ api.grammar.library ++ " (xgrammar; zig build grammar, or name the file in " ++ api.grammar.env ++ ")",
++                else => a.dupe(u8, std.mem.sliceTo(&err, 0)) catch "out of memory",
++            };
++            srv.grammars = c;
++            log.line("structured output: xgrammar over {d} tokens", .{vocab.?});
++            break :blk null;
++        };
++        return srv.grammars;
++    }
++
+     const Form = struct { opener: []const u8, lead: ?[]const u8, tail: ?[]const u8 };
+ 
+     /// (opener, lead, tail) of this template's tool calls, read from a rendered probe call.
+diff --git a/zig/src/server/tool_grammar.zig b/zig/src/server/tool_grammar.zig
+new file mode 100644
+index 00000000..1551b277
+--- /dev/null
++++ b/zig/src/server/tool_grammar.zig
+@@ -0,0 +1,364 @@
++//! tool_choice "required" or a named function as a grammar: calls in the template's markup, arguments in their schema.
++const std = @import("std");
++const api = @import("engine_api");
++const json = @import("json.zig");
++const errors = @import("errors.zig");
++const prompt = @import("prompt.zig");
++const tool_specs = @import("tool_specs.zig");
++const Server = @import("server.zig").Server;
++const Text = @import("model_text.zig").Text;
++const Value = json.Value;
++const Cx = errors.Cx;
++const Allocator = std.mem.Allocator;
++
++/// How the template writes a call: inside <tool_call>, Qwen3-Coder's XML (Nemotron, Qwen3.5) or a JSON object; or
++/// DeepSeek's DSML, one block of invokes whose parameters are tags (V4's <｜DSML｜tool_calls>, V4.1's <｜DSML｜ calls>).
++pub const Style = enum { xml, json, dsml, dsml41 };
++
++/// A DSML spelling: the block's tags, an invoke's opener up to its name and its closer, a parameter's opener up to its
++/// name, and xgrammar's json_schema style for the parameters. The layout is the template's (encoding.py's), as
++/// xgrammar's own DeepSeek structural tags write it: "<block>\n", each invoke "<invoke name=...>\n", its parameters
++/// one a line, "</invoke>\n", then "</block>".
++const Dsml = struct { open: []const u8, close: []const u8, invoke: []const u8, invoke_end: []const u8, parameter: []const u8, params: []const u8 };
++const marker = "\u{ff5c}DSML\u{ff5c}";
++const dsml_v4: Dsml = .{ .open = "<" ++ marker ++ "tool_calls>", .close = "</" ++ marker ++ "tool_calls>", .invoke = "<" ++ marker ++ "invoke name=\"", .invoke_end = "</" ++ marker ++ "invoke>", .parameter = "<" ++ marker ++ "parameter name=\"", .params = "deepseek_xml" };
++const dsml_v41: Dsml = .{ .open = "<" ++ marker ++ " calls>", .close = "</" ++ marker ++ " calls>", .invoke = "<" ++ marker ++ " invoke name=\"", .invoke_end = "</" ++ marker ++ " invoke>", .parameter = "<" ++ marker ++ " parameter name=\"", .params = "deepseek_v4_1_xml" };
++
++fn dsmlOf(s: Style) ?Dsml {
++    return switch (s) {
++        .dsml => dsml_v4,
++        .dsml41 => dsml_v41,
++        .xml, .json => null,
++    };
++}
++
++const probe = "tfprobe_fn";
++const key = "tfprobe_k";
++
++/// Blanks around and between calls: the template's newlines, never an endless run.
++const blanks = "[ \\t\\r\\n]{0,8}";
++
++/// The most blank characters between an argument's JSON tokens (grammar.py BLANKS).
++const value_blanks = 32;
++
++/// The style of `rendered`, a turn that calls `probe` with {key: "v"}; null: markup this grammar does not write.
++pub fn style(rendered: []const u8) ?Style {
++    inline for (.{ .{ Style.dsml41, dsml_v41 }, .{ Style.dsml, dsml_v4 } }) |c| if (std.mem.lastIndexOf(u8, rendered, c[1].open)) |at| {
++        const text = rendered[at..];
++        if (std.mem.indexOf(u8, text, c[1].invoke ++ probe ++ "\">") != null and std.mem.indexOf(u8, text, c[1].parameter ++ key ++ "\"") != null) return c[0];
++    };
++    const at = std.mem.lastIndexOf(u8, rendered, "<tool_call>") orelse return null;
++    const text = rendered[at..];
++    if (std.mem.indexOf(u8, text, "<function=" ++ probe ++ ">") != null and std.mem.indexOf(u8, text, "<parameter=" ++ key ++ ">") != null) return .xml;
++    if (std.mem.indexOf(u8, text, "\"" ++ probe ++ "\"") != null and std.mem.indexOf(u8, text, "\"arguments\"") != null) return .json;
++    return null;
++}
++
++/// The grammar for a reply that must call one of `tools`: one call, or (`parallel`) one or more, then the end.
++pub fn structure(srv: *Server, cx: *Cx, tools: []const Value, parallel: bool, thinking: bool) errors.Refused!api.Structure {
++    const probe_turn = (try json.parse(cx.a, "[{\"role\": \"user\", \"content\": \"x\"}, {\"role\": \"assistant\", \"content\": \"\", \"tool_calls\": [{\"id\": \"call_0\", \"type\": \"function\", \"function\": {\"name\": \"" ++ probe ++ "\", \"arguments\": {\"" ++ key ++ "\": \"v\"}}}]}]")).ok;
++    var scratch: Cx = .{ .a = cx.a };
++    const rendered = if (prompt.renderIds(srv, &scratch, probe_turn, &.{}, false, null, false)) |ids| try srv.text.decode(cx.a, ids) else |_| "";
++    const s = style(rendered) orelse return cx.refuse("tool_choice \"required\" or a named function needs a chat template that writes <tool_call> calls (XML parameters or a JSON object) or DeepSeek's DSML calls, and this one does not: send \"auto\"");
++    const text = try build(cx.a, s, tools, parallel);
++    var out = try srv.compiledStructure(cx, .structural_tag, text, "tool_choice \"required\" or a named function", thinking);
++    out.ban = try spelled(cx.a, srv.text, s);
++    return out;
++}
++
++/// The tokens a forced DSML call never draws: "\u{ff5c}", where the tokenizer holds the marker as one token. The
++/// grammar holds the block's text, so a sampled reply could start a marker in plain characters, and the model then
++/// writes its closing tags with a second space ("</" ++ marker ++ "  parameter>", after the marker it takes for its
++/// token): the parameter never closes, and the reply runs to max_tokens as text. With "\u{ff5c}" banned every marker
++/// is its token, as the model writes it unforced and as the template renders it.
++fn spelled(a: Allocator, text: Text, s: Style) Allocator.Error![]const u32 {
++    if (dsmlOf(s) == null) return &.{};
++    const token = text.tokenId(marker) orelse return &.{};
++    const bar = text.encode(a, "\u{ff5c}", false) catch |e| switch (e) {
++        error.OutOfMemory => return error.OutOfMemory,
++        else => return &.{},
++    };
++    return if (bar.len == 1 and bar[0] != token) bar else &.{};
++}
++
++/// The structural tag's JSON text (xgrammar's form).
++pub fn build(a: Allocator, s: Style, tools: []const Value, parallel: bool) Allocator.Error![]const u8 {
++    const calls = try a.alloc(Value, tools.len);
++    for (tools, calls) |t, *c| c.* = try call(a, s, try tool_specs.toolName(a, t), try parameters(a, t));
++    const one: Value = if (calls.len == 1) calls[0] else try node(a, "or", &.{.{ "elements", .{ .array = calls } }});
++    const ws = try node(a, "regex", &.{.{ "pattern", .{ .string = blanks } }});
++    var parts: std.ArrayList(Value) = .empty;
++    if (dsmlOf(s)) |d| {
++        // one block holds every call, the invokes back to back (each ends with the template's newline)
++        try parts.appendSlice(a, &.{ ws, try constant(a, try std.mem.concat(a, u8, &.{ d.open, "\n" })), one });
++        if (parallel) try parts.append(a, try node(a, "star", &.{.{ "content", one }}));
++        try parts.appendSlice(a, &.{ try constant(a, d.close), ws });
++    } else {
++        try parts.appendSlice(a, &.{ ws, one });
++        if (parallel) try parts.append(a, try node(a, "star", &.{.{ "content", try node(a, "sequence", &.{.{ "elements", try list(a, &.{ ws, one }) }}) }}));
++        try parts.append(a, ws);
++    }
++    const format = try node(a, "sequence", &.{.{ "elements", .{ .array = parts.items } }});
++    return json.stringify(a, try node(a, "structural_tag", &.{.{ "format", format }}), .{ .ascii = false, .compact = true });
++}
++
++/// One call to `name`: <tool_call>, the name and its arguments in the template's style, </tool_call>; for DSML, an
++/// invoke of `name` with its parameters in their tags.
++fn call(a: Allocator, s: Style, name: []const u8, schema: Value) Allocator.Error!Value {
++    const ws = try node(a, "regex", &.{.{ "pattern", .{ .string = blanks } }});
++    const elements = switch (s) {
++        .xml => try list(a, &.{
++            try constant(a, "<tool_call>"),                                        ws,
++            try constant(a, try std.fmt.allocPrint(a, "<function={s}>", .{name})), try arguments(a, schema, "qwen_xml"),
++            try constant(a, "</function>"),                                        ws,
++            try constant(a, "</tool_call>"),
++        }),
++        .json => blk: {
++            const props = try json.newObject(a);
++            const fixed = try json.newObject(a);
++            try fixed.put(a, "const", .{ .string = name });
++            try props.put(a, "name", .{ .object = fixed });
++            try props.put(a, "arguments", schema);
++            const whole = try json.newObject(a);
++            try whole.put(a, "type", .{ .string = "object" });
++            try whole.put(a, "properties", .{ .object = props });
++            try whole.put(a, "required", try list(a, &.{ .{ .string = "name" }, .{ .string = "arguments" } }));
++            break :blk try list(a, &.{ try constant(a, "<tool_call>"), ws, try arguments(a, .{ .object = whole }, "json"), ws, try constant(a, "</tool_call>") });
++        },
++        .dsml, .dsml41 => blk: {
++            const d = dsmlOf(s).?;
++            break :blk try list(a, &.{
++                try constant(a, try std.mem.concat(a, u8, &.{ d.invoke, name, "\">\n" })),
++                try arguments(a, schema, d.params),
++                try constant(a, try std.mem.concat(a, u8, &.{ d.invoke_end, "\n" })),
++            });
++        },
++    };
++    return node(a, "sequence", &.{.{ "elements", elements }});
++}
++
++/// The tool's parameter schema (OpenAI's function.parameters, a bare tool's parameters or input_schema).
++fn parameters(a: Allocator, tool: Value) Allocator.Error!Value {
++    const function = if (tool.get("function")) |f| (if (f == .object) f else tool) else tool;
++    for ([_][]const u8{ "parameters", "input_schema" }) |k| if (function.get(k)) |p| if (p == .object) return p;
++    const empty = try json.newObject(a);
++    try empty.put(a, "type", .{ .string = "object" });
++    try empty.put(a, "properties", .{ .object = try json.newObject(a) });
++    return .{ .object = empty };
++}
++
++fn arguments(a: Allocator, schema: Value, style_name: []const u8) Allocator.Error!Value {
++    return node(a, "json_schema", &.{ .{ "json_schema", schema }, .{ "style", .{ .string = style_name } }, .{ "max_whitespace_cnt", try json.intValue(a, value_blanks) } });
++}
++
++fn constant(a: Allocator, text: []const u8) Allocator.Error!Value {
++    return node(a, "const_string", &.{.{ "value", .{ .string = text } }});
++}
++
++fn list(a: Allocator, items: []const Value) Allocator.Error!Value {
++    return .{ .array = try a.dupe(Value, items) };
++}
++
++/// {"type": kind, fields...}.
++fn node(a: Allocator, kind: []const u8, entries: []const struct { []const u8, Value }) Allocator.Error!Value {
++    const o = try json.newObject(a);
++    try o.put(a, "type", .{ .string = kind });
++    for (entries) |e| try o.put(a, e[0], e[1]);
++    return .{ .object = o };
++}
++
++test "the probe call's markup picks the style" {
++    try std.testing.expectEqual(Style.xml, style("<think></think><tool_call>\n<function=tfprobe_fn>\n<parameter=tfprobe_k>\nv\n</parameter>\n</function>\n</tool_call>\n").?);
++    try std.testing.expectEqual(Style.json, style("<tool_call>\n{\"name\": \"tfprobe_fn\", \"arguments\": {\"tfprobe_k\": \"v\"}}\n</tool_call>").?);
++    try std.testing.expectEqual(@as(?Style, null), style("<|tool_call>call:tfprobe_fn{tfprobe_k:<|\"|>v<|\"|>}<tool_call|>"));
++    const v41 = "</think>\n\n<" ++ marker ++ " calls>\n<" ++ marker ++ " invoke name=\"tfprobe_fn\">\n<" ++ marker ++ " parameter name=\"tfprobe_k\" string=\"true\">v</" ++ marker ++ " parameter>\n</" ++ marker ++ " invoke>\n</" ++ marker ++ " calls>";
++    try std.testing.expectEqual(Style.dsml41, style(v41).?);
++    const v4 = "\n\n<" ++ marker ++ "tool_calls>\n<" ++ marker ++ "invoke name=\"tfprobe_fn\">\n<" ++ marker ++ "parameter name=\"tfprobe_k\" string=\"true\">v</" ++ marker ++ "parameter>\n</" ++ marker ++ "invoke>\n</" ++ marker ++ "tool_calls>";
++    try std.testing.expectEqual(Style.dsml, style(v4).?);
++    // the block's tag alone, as a tools prompt shows it, is no call
++    try std.testing.expectEqual(@as(?Style, null), style("write a \"<" ++ marker ++ " calls>\" block"));
++}
++
++test "a required call's grammar names every offered tool and its schema; one call without parallel" {
++    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const tools = (try json.parse(a, "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"now\"}}]")).ok;
++    const many = try build(a, .xml, tools.array, true);
++    try std.testing.expect(std.mem.indexOf(u8, many, "\"value\":\"<function=get_weather>\"") != null);
++    try std.testing.expect(std.mem.indexOf(u8, many, "\"value\":\"<function=now>\"") != null);
++    try std.testing.expect(std.mem.indexOf(u8, many, "\"style\":\"qwen_xml\"") != null);
++    try std.testing.expect(std.mem.indexOf(u8, many, "\"required\":[\"city\"]") != null);
++    try std.testing.expect(std.mem.indexOf(u8, many, "\"type\":\"star\"") != null);
++    const single = try build(a, .json, tools.array[0..1], false);
++    try std.testing.expect(std.mem.indexOf(u8, single, "\"type\":\"star\"") == null and std.mem.indexOf(u8, single, "\"type\":\"or\"") == null);
++    try std.testing.expect(std.mem.indexOf(u8, single, "\"const\":\"get_weather\"") != null);
++}
++
++test "a DSML grammar holds every call in one block, each invoke's parameters in the template's tags" {
++    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const tools = (try json.parse(a, "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"now\"}}]")).ok;
++    const many = try build(a, .dsml41, tools.array, true);
++    try std.testing.expect(std.mem.indexOf(u8, many, "\"value\":\"<" ++ marker ++ " calls>\\n\"") != null);
++    try std.testing.expect(std.mem.indexOf(u8, many, "\"value\":\"</" ++ marker ++ " calls>\"") != null);
++    try std.testing.expect(std.mem.indexOf(u8, many, "\"value\":\"<" ++ marker ++ " invoke name=\\\"get_weather\\\">\\n\"") != null);
++    try std.testing.expect(std.mem.indexOf(u8, many, "\"value\":\"<" ++ marker ++ " invoke name=\\\"now\\\">\\n\"") != null);
++    try std.testing.expect(std.mem.indexOf(u8, many, "\"value\":\"</" ++ marker ++ " invoke>\\n\"") != null);
++    try std.testing.expect(std.mem.indexOf(u8, many, "\"style\":\"deepseek_v4_1_xml\"") != null);
++    try std.testing.expect(std.mem.indexOf(u8, many, "\"type\":\"star\"") != null and std.mem.indexOf(u8, many, "\"type\":\"or\"") != null);
++    // the block opens once: a parallel reply's invokes repeat inside it, not the block
++    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, many, "<" ++ marker ++ " calls>"));
++    const single = try build(a, .dsml41, tools.array[0..1], false);
++    try std.testing.expect(std.mem.indexOf(u8, single, "\"type\":\"star\"") == null and std.mem.indexOf(u8, single, "\"type\":\"or\"") == null);
++    const v4 = try build(a, .dsml, tools.array[0..1], false);
++    try std.testing.expect(std.mem.indexOf(u8, v4, "\"value\":\"<" ++ marker ++ "tool_calls>\\n\"") != null);
++    try std.testing.expect(std.mem.indexOf(u8, v4, "\"style\":\"deepseek_xml\"") != null);
++}
++
++test "a forced DSML call's marker is its token: spelled in plain characters, the reply's parameter never closes; with the ban the token follows \"<\"" {
++    // opt-in, as the test below: TF_GRAMMAR_DIR, TF_GRAMMAR_TEMPLATE, TF_GRAMMAR_VOCAB, TF_GRAMMAR_STOP and libtfgrammar
++    const dir = std.testing.environ.getPosix("TF_GRAMMAR_DIR") orelse return error.SkipZigTest;
++    const template = std.testing.environ.getPosix("TF_GRAMMAR_TEMPLATE") orelse return error.SkipZigTest;
++    const vocab = try std.fmt.parseInt(u32, std.testing.environ.getPosix("TF_GRAMMAR_VOCAB") orelse return error.SkipZigTest, 10);
++    const stop = try std.fmt.parseInt(u32, std.testing.environ.getPosix("TF_GRAMMAR_STOP") orelse return error.SkipZigTest, 10);
++    const gpa = std.testing.allocator;
++    const io = std.testing.io;
++    var arena = std.heap.ArenaAllocator.init(gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var problem: []const u8 = "";
++    const hf = try @import("hf_text.zig").HfText.load(gpa, io, dir, template, a, &problem);
++    defer hf.deinit();
++    const text = hf.text();
++    const tok = try std.Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(a, &.{ dir, "tokenizer.json" }), a, .limited(256 << 20));
++    var err: [512]u8 = undefined;
++    var c = try api.grammar.Compiler.open(io, a, tok, vocab, &.{stop}, &err);
++    defer c.close();
++
++    const tools = (try json.parse(a, "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}}]")).ok.array;
++    const g = try build(a, .dsml41, tools, true);
++    const dsml = text.tokenId(marker).?;
++    const bar = try spelled(a, text, .dsml41);
++    try std.testing.expectEqual(@as(usize, 1), bar.len);
++    try std.testing.expectEqualStrings("\u{ff5c}", try text.decode(a, bar));
++    try std.testing.expectEqual(@as(usize, 0), (try spelled(a, text, .xml)).len);
++
++    // the reply a sampled forced call wrote on the served lane ("Hello there.", temperature 1): the markers in plain
++    // characters, the closing tags with two spaces; the grammar takes all of it as the parameter's value, never the end
++    const reply = "<" ++ marker ++ " calls>\n<" ++ marker ++ " invoke name=\"get_weather\">\n<" ++ marker ++ " parameter name=\"city\" string=\"true\">London</" ++ marker ++ "  parameter>\n</" ++ marker ++ "  invoke>\n</" ++ marker ++ "  calls> \n\nHello! How can I help you today?";
++    const plain = try text.encodePlain(a, reply);
++    try std.testing.expect(std.mem.indexOfScalar(u32, plain, dsml) == null and std.mem.indexOfScalar(u32, plain, bar[0]) != null);
++    const w = try walk(&c, io, g, plain, stop);
++    try std.testing.expect(w.taken == plain.len and !w.ended);
++
++    // the row after "<": the marker's token and its first character, then the token alone with the ban
++    const k = try c.constraint(gpa, io, .structural_tag, g, null);
++    defer k.deinit(gpa);
++    const lt = try text.encode(a, "<", false);
++    try std.testing.expect(lt.len == 1 and try k.follow(lt[0]));
++    const open = (try k.next(a)).?;
++    try std.testing.expect(api.grammar.allows(open, dsml) and api.grammar.allows(open, bar[0]));
++    k.ban = try gpa.dupe(u32, bar);
++    const banned = (try k.next(a)).?;
++    try std.testing.expect(api.grammar.allows(banned, dsml) and !api.grammar.allows(banned, bar[0]));
++    // the template's own call still walks to the stop: the ban takes nothing it writes
++    const own = try text.encode(a, "<" ++ marker ++ " calls>\n<" ++ marker ++ " invoke name=\"get_weather\">\n<" ++ marker ++ " parameter name=\"city\" string=\"true\">London</" ++ marker ++ " parameter>\n</" ++ marker ++ " invoke>\n</" ++ marker ++ " calls>", false);
++    try std.testing.expect(std.mem.indexOfScalar(u32, own, bar[0]) == null);
++    const done = try walk(&c, io, g, own, stop);
++    try std.testing.expect(done.taken == own.len and done.ended);
++}
++
++/// How far a reply's ids walk in a grammar: the ids it takes, and whether it then takes the stop and ends.
++const Walk = struct { taken: usize, ended: bool };
++
++fn walk(c: *api.grammar.Compiler, io: std.Io, grammar_text: []const u8, ids: []const u32, stop: u32) !Walk {
++    var err: [512]u8 = undefined;
++    const g = c.compile(io, .structural_tag, grammar_text, &err) catch |e| {
++        std.debug.print("the grammar does not compile: {s}\n", .{std.mem.sliceTo(&err, 0)});
++        return e;
++    };
++    defer g.free();
++    const m = try g.matcher();
++    defer m.free();
++    const r = m.rules();
++    for (ids, 0..) |t, i| if (!try r.vtable.accept(r.ptr, t)) return .{ .taken = i, .ended = false };
++    return .{ .taken = ids.len, .ended = try r.vtable.accept(r.ptr, stop) and r.vtable.terminated(r.ptr) };
++}
++
++test "DSML grammars through libtfgrammar, a checkpoint's tokenizer and its template: the template's calls end at the stop; prose, an unoffered name, a missing or mistyped parameter and a second call when single do not" {
++    // opt-in: TF_GRAMMAR_DIR=<a DeepSeek-V4.1 checkpoint folder: tokenizer.json, tokenizer_config.json, config.json>
++    // TF_GRAMMAR_TEMPLATE=<its chat template> TF_GRAMMAR_VOCAB=<its logits' width> TF_GRAMMAR_STOP=<its eos id>, and
++    // libtfgrammar where the loader finds it
++    const dir = std.testing.environ.getPosix("TF_GRAMMAR_DIR") orelse return error.SkipZigTest;
++    const template = std.testing.environ.getPosix("TF_GRAMMAR_TEMPLATE") orelse return error.SkipZigTest;
++    const vocab = try std.fmt.parseInt(u32, std.testing.environ.getPosix("TF_GRAMMAR_VOCAB") orelse return error.SkipZigTest, 10);
++    const stop = try std.fmt.parseInt(u32, std.testing.environ.getPosix("TF_GRAMMAR_STOP") orelse return error.SkipZigTest, 10);
++    const gpa = std.testing.allocator;
++    const io = std.testing.io;
++    var arena = std.heap.ArenaAllocator.init(gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var problem: []const u8 = "";
++    const hf = try @import("hf_text.zig").HfText.load(gpa, io, dir, template, a, &problem);
++    defer hf.deinit();
++    const text = hf.text();
++    const tok = try std.Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(a, &.{ dir, "tokenizer.json" }), a, .limited(256 << 20));
++    var err: [512]u8 = undefined;
++    var c = try api.grammar.Compiler.open(io, a, tok, vocab, &.{stop}, &err);
++    defer c.close();
++
++    // the template's own probe turn picks the style, as structure() renders it
++    const probe_turn = (try json.parse(a, "[{\"role\": \"user\", \"content\": \"x\"}, {\"role\": \"assistant\", \"content\": \"\", \"tool_calls\": [{\"id\": \"call_0\", \"type\": \"function\", \"function\": {\"name\": \"" ++ probe ++ "\", \"arguments\": {\"" ++ key ++ "\": \"v\"}}}]}]")).ok;
++    const s = style(try text.render(a, probe_turn, .{ .add_generation_prompt = false }, &problem)) orelse return error.TestUnexpectedResult;
++    try std.testing.expectEqual(Style.dsml41, s);
++
++    const tools = (try json.parse(a, "[{\"type\": \"function\", \"function\": {\"name\": \"weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"now\"}}]")).ok.array;
++    const any = try build(a, s, tools, true);
++    const single = try build(a, s, tools, false);
++    const weather_only = try build(a, s, tools[0..1], false);
++    const now_only = try build(a, s, tools[1..2], false);
++
++    // a reply as the template writes an assistant turn's calls: the block from its blank lines to its closer
++    const Reply = struct {
++        fn ids(t: @import("model_text.zig").Text, al: Allocator, calls: []const u8, prose: []const u8) ![]u32 {
++            var p: []const u8 = "";
++            const turn = try std.fmt.allocPrint(al, "[{{\"role\": \"user\", \"content\": \"x\"}}, {{\"role\": \"assistant\", \"content\": \"\", \"tool_calls\": {s}}}]", .{calls});
++            const whole = try t.render(al, (try json.parse(al, turn)).ok, .{ .add_generation_prompt = false }, &p);
++            const at = std.mem.indexOf(u8, whole, "\n\n<" ++ marker ++ " calls>") orelse return error.NoCalls;
++            const close = "</" ++ marker ++ " calls>";
++            const end = (std.mem.indexOfPos(u8, whole, at, close) orelse return error.NoCalls) + close.len;
++            return t.encode(al, try std.mem.concat(al, u8, &.{ prose, whole[at..end] }), false);
++        }
++    };
++    const weather = "{\"type\": \"function\", \"function\": {\"name\": \"weather\", \"arguments\": {\"city\": \"Oslo\", \"days\": 3}}}";
++    const now = "{\"type\": \"function\", \"function\": {\"name\": \"now\", \"arguments\": {}}}";
++    const one = try Reply.ids(text, a, "[" ++ weather ++ "]", "");
++    const two = try Reply.ids(text, a, "[" ++ weather ++ ", " ++ now ++ "]", "");
++    const empty = try Reply.ids(text, a, "[" ++ now ++ "]", "");
++    // the DSML marker is its token in each reply, as the model writes it
++    try std.testing.expect(std.mem.indexOfScalar(u32, one, text.tokenId(marker).?) != null);
++
++    const Case = struct { grammar: []const u8, ids: []const u32, ends: bool };
++    const cases = [_]Case{
++        .{ .grammar = any, .ids = one, .ends = true },
++        .{ .grammar = any, .ids = two, .ends = true },
++        .{ .grammar = single, .ids = one, .ends = true },
++        .{ .grammar = single, .ids = two, .ends = false }, // a second call where one is asked for
++        .{ .grammar = now_only, .ids = empty, .ends = true }, // a call with no arguments
++        .{ .grammar = weather_only, .ids = empty, .ends = false }, // a named function: no other
++        .{ .grammar = any, .ids = try Reply.ids(text, a, "[" ++ weather ++ "]", "Sure."), .ends = false }, // prose first
++        .{ .grammar = any, .ids = try Reply.ids(text, a, "[{\"type\": \"function\", \"function\": {\"name\": \"forecast\", \"arguments\": {\"city\": \"Oslo\"}}}]", ""), .ends = false },
++        .{ .grammar = any, .ids = try Reply.ids(text, a, "[{\"type\": \"function\", \"function\": {\"name\": \"weather\", \"arguments\": {\"days\": 3}}}]", ""), .ends = false }, // city missing
++        .{ .grammar = any, .ids = try Reply.ids(text, a, "[{\"type\": \"function\", \"function\": {\"name\": \"weather\", \"arguments\": {\"city\": \"Oslo\", \"days\": \"three\"}}}]", ""), .ends = false }, // days a string
++        .{ .grammar = try build(a, .dsml, tools, true), .ids = one, .ends = false }, // V4's spelling is another block
++    };
++    for (cases, 0..) |case, i| {
++        const w = try walk(&c, io, case.grammar, case.ids, stop);
++        if (w.ended != case.ends or (case.ends and w.taken != case.ids.len)) {
++            std.debug.print("case {d}: took {d} of {d} ids, ended {}: {s}\n", .{ i, w.taken, case.ids.len, w.ended, try text.decode(a, case.ids[0..@min(case.ids.len, w.taken + 1)]) });
++            return error.TestUnexpectedResult;
++        }
++    }
++}

@@ -46,10 +46,8 @@ rank's rendezvous address). Full list: [Credits](#credits) and [`CREDITS.md`](CR
 
 - Checkpoint: `deepseek-ai/DeepSeek-V4.1-Flash-1017` @ `1bae0e10`, ~510 GB, downloaded once on spark1; the other three
   Sparks read it, and their weight files, from spark1 over NFS
-- API model id: `DeepSeek-V4.1-Flash-1017`, port 8888. Not on this engine pin yet: structured output
-  (`response_format` with `json_schema` or `json_object`, and the `guided_*` fields) and `tool_choice` set to
-  `"required"` or to a named function return HTTP 400; `tool_choice: "auto"` works
-  ([#6](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/issues/6))
+- API model id: `DeepSeek-V4.1-Flash-1017`, port 8888; structured output (`response_format`, `guided_*`) and
+  `tool_choice: "required"` or a named function ([below](#structured-output-and-required-tool-calls))
 - Engine: TensorFold native (Zig 0.17.0), BertholomusAI's `dsv41` family, plus [`zig/patches`](zig/patches):
   DeepSeek's native FP8 / MXFP4 weights, the ring's node order and links, video input, tool-call arguments
 - One command on spark1: `./start.sh` (a switch) or `./start-switchless.sh` (a ring) sets up all four Sparks and
@@ -57,7 +55,9 @@ rank's rendezvous address). Full list: [Credits](#credits) and [`CREDITS.md`](CR
 
 **This recipe's own patches** ([`zig/patches`](zig/patches)) **are Mia's AI Lab's work, except `0008` (Hector), `0026`
 (knapcio), `0027` (Thomas Kempka), `0028` and `0029` (upstream TensorFold fixes backported by Mauvis Ledford), `0030`
-and `0031` (Mauvis Ledford), `0033` (a backport by Manuel, manuel1618) and `0034` (Hironori Uchikawa, uchkw)** -- see
+and `0031` (Mauvis Ledford), `0033` (a backport by Manuel, manuel1618), `0034` (Hironori Uchikawa, uchkw) and `0036`
+(upstream TensorFold's structured output by BobClawblaw and Ash Hart, and BertholomusAI's DeepSeek-V4.1 part of it,
+ported here)** -- see
 [What the patches change](#what-the-patches-change) and [Credits](#credits) for who found or shaped each specific fix
 along the way.
 
@@ -68,6 +68,7 @@ along the way.
 - [Quick start](#quick-start)
 - [ABLIT (opt-in)](#ablit-opt-in)
 - [Images and video](#images-and-video)
+- [Structured output and required tool calls](#structured-output-and-required-tool-calls)
 - [DSpark drafting](#dspark-drafting)
 - [NFS](#nfs)
 - [Engram's packed rows (opt-in)](#engrams-packed-rows-opt-in)
@@ -245,6 +246,26 @@ User turns and tool results take `image_url` and `video_url` parts as base64 `da
 {"type": "video_url", "video_url": {"url": "data:video/mp4;base64,AAAA..."}}
 ```
 
+## Structured output and required tool calls
+
+Patch `0036` brings TensorFold's structured output to this engine: every token of the reply is drawn among the tokens
+a grammar allows, so the reply is always valid.
+
+- `response_format` `{"type": "json_schema", ...}` or `{"type": "json_object"}`, and vLLM's `guided_json`,
+  `guided_regex`, `guided_choice`, `guided_grammar` (EBNF) and `structured_outputs`.
+- `tool_choice: "required"` or a named function: the reply is a DSML calls block for one of the offered tools (or the
+  named one), with arguments that follow its schema, and comes back as `tool_calls`.
+- With thinking on, the grammar starts after `</think>`: the reasoning is free, the answer is constrained.
+- A grammar that cannot be enforced (a malformed regex, say) is refused with HTTP 400 and xgrammar's reason, before
+  anything is decoded.
+
+The grammars are [xgrammar](https://github.com/mlc-ai/xgrammar)'s (v0.2.8, Apache-2.0), compiled into the image as
+`/opt/tensorfold/lib/libtfgrammar.so` and loaded by the server at the first structured request. Rank 0 alone applies
+the masks; requests without a grammar decode exactly as before (`tools/validate.py`: its 8 greedy replies equal). On
+this cluster one structured stream decodes about as fast as the same reply unconstrained (25 cities as a JSON schema:
+108 tok/s greedy, 121 sampled, against 104 and 109 for the plain request), since the grammar drafts the text it forces;
+beside other streams a masked row is drawn on the host from its whole row, so it runs slower than they do.
+
 ## DSpark drafting
 
 The checkpoint carries DSpark draft blocks: after each decode step they propose a block of 5 tokens, which the next
@@ -371,6 +392,7 @@ measurements and rationale: [`CHANGELOG.md`](CHANGELOG.md); authorship: [`CREDIT
 | `0033` | manuel1618 | -- (on) | `/metrics` adds `prompt_tokens_cached_total` (and vLLM's `prefix_cache_hits_total` / `prefix_cache_queries_total`): prompt tokens restored from kept prompt states |
 | `0034` | uchkw | -- (on with RDMA) | Parks idle RDMA proxies with a futex after all ranks quiesce; wakes before the next compute frame |
 | `0035` | Mia's AI Lab | `TF_DS_CONNECT_S` (300 s) | Rank 0 opens every worker's rendezvous port before loading its weights, so a worker that loads first waits there instead of exiting with `ConnectFailed` 300 s later ([#3](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/issues/3)) |
+| `0036` | BobClawblaw, Ash Hart, bertholomus (ported by Mia's AI Lab) | -- (on) | Structured output and `tool_choice` required on the DeepSeek-V4.1 engine ([above](#structured-output-and-required-tool-calls); [#6](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/issues/6))
 
 ### Idle RDMA CPU use
 
@@ -464,6 +486,12 @@ part of this repository.
   [`5e1bf27`](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/commit/5e1bf27)), john (each
   rank's rendezvous at its link's address of the head,
   [`58eaed0`](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/commit/58eaed0)).
+- **BobClawblaw ([BobClawblaw](https://github.com/BobClawblaw))**, **Ash Hart ([ashhart](https://github.com/ashhart))**
+  and **BertholomusAI ([bertholomus](https://github.com/bertholomus))**: the structured output that patch `0036`
+  ports to this recipe (BobClawblaw's lane-core grammar and libtfgrammar, Ash Hart's required tool calls and
+  grammar-aware drafting, bertholomus's DeepSeek-V4.1 hooks and DSML tool-call grammar).
+- [xgrammar](https://github.com/mlc-ai/xgrammar) (Apache-2.0) with dlpack (Apache-2.0) and picojson (BSD-2-Clause),
+  compiled into the image's `libtfgrammar.so`.
 - [PyAV](https://github.com/PyAV-Org/PyAV) (BSD-3-Clause), [Zig](https://ziglang.org) (MIT), NVIDIA's PyTorch
   container, [huggingface_hub](https://github.com/huggingface/huggingface_hub) (Apache-2.0).
 
