@@ -44,7 +44,7 @@ DGX Sparks. Almost everything that makes it work was built by others. Its own wo
 
 ## This recipe's patches (`zig/patches`)
 
-**Every patch is Mia's AI Lab's own work, except `0008`, which is Hector's, and `0026`, which is knapcio's.** At a glance:
+**Every patch is Mia's AI Lab's own work, except `0008`, which is Hector's, `0026`, which is knapcio's, and `0027`, a backport by manuel1618.** At a glance:
 
 | Patches | Author | What |
 | --- | --- | --- |
@@ -54,6 +54,7 @@ DGX Sparks. Almost everything that makes it work was built by others. Its own wo
 | `0017`-`0024` | Mia's AI Lab | the decode plan: G0.1-G0.3, tracks A2/B/C/D/A3 |
 | `0025` | Mia's AI Lab | WP6(b), the indexer's own row-sharding |
 | `0026` | knapcio | the RDMA queue pairs' path MTU from the port's active MTU |
+| `0027` | manuel1618 | `/metrics`' cached prompt-token counter, backported |
 
 The per-patch notes below also credit everyone who helped find or shape a specific fix along the way -- Hector's
 reviewer, Codex and Grok's live-bug diagnosis and design reviews, an outside reviewer's observation -- without
@@ -175,6 +176,14 @@ Contributed by knapcio ([knapcio](https://github.com/knapcio)):
   MikroTik CRS812 whose ports keep the default Ethernet MTU 1500. The idea is BertholomusAI's
   [TensorFold#12](https://github.com/bertholomus/TensorFold/pull/12) (negotiated MTU), ported to this recipe's engine
   pin for the local endpoint only.
+
+Backported by manuel1618 ([manuel1618](https://github.com/manuel1618)):
+
+- `0027` (cached prompt tokens on `/metrics`): juliankang4's BertholomusAI/TensorFold `ce0d9053` (on
+  `deepseek-v41-zig-tp4`), which eleata ports to the two-node branch in
+  [TensorFold#44](https://github.com/bertholomus/TensorFold/pull/44). Neither turns the counter on for the
+  DeepSeek-V4.1 engine this recipe serves; `0027` adds that line (`native/cuda.zig`, `.prompt_cache = h.cache != null`,
+  as #44 does for two nodes) and carries the rest to this recipe's engine pin.
 
 ## Chat template
 
