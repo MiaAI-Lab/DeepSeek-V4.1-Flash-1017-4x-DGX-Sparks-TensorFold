@@ -292,7 +292,8 @@ OpenAI Chat/Responses streams use SSE comments; Anthropic Messages streams use `
 `TF_SSE_KEEPALIVE_S=0` to disable, or a positive number of seconds to change the interval; `start.sh` forwards it.
 An HTTP proxy may consume backend comments, so configure and verify its own downstream heartbeats as well.
 
-Patch `0029` backports Ash Hart's fix for the golden test server's unread stdout pipe, which otherwise stalls the suite.
+Patch `0029` backports BobClawblaw's fix (upstream TensorFold's `0baccf36`) for the golden test server's unread stdout
+pipe, which otherwise stalls the suite.
 See [`CREDITS.md`](CREDITS.md) for the upstream commits. `tools/test_sse_keepalive.py` checks the actual HTTP routes,
 including tool requests, refusal handling, disconnect cancellation and the disabled setting, against a CPU fixture.
 
@@ -354,7 +355,7 @@ measurements and rationale: [`CHANGELOG.md`](CHANGELOG.md); authorship: [`CREDIT
 | `0024` | Mia's AI Lab | `TF_DS_DRAFT_ROW_MS` | Draft rows priced at a measured constant instead of the round table (mixed; kept for later) |
 | `0025` | Mia's AI Lab | `TF_DS_IDX_SHARD` (on, this cluster) | Indexer scores and picks only its own owned quarter of rows |
 | `0026` | knapcio | -- (on) | RDMA queue pairs use the port's active MTU (capped at 4096) instead of a fixed 4096, so RDMA works on a switch whose Ethernet MTU is 1500 |
-| `0027` | this cluster | -- (on) | A kept prompt state is keyed by the request's images as well as its tokens: an image's positions hold only its placeholder's token, so a chat with a picture in its history used to keep nothing and re-prefill every turn |
+| `0027` | Thomas Kempka | -- (on) | A kept prompt state is keyed by the request's images as well as its tokens: an image's positions hold only its placeholder's token, so a chat with a picture in its history used to keep nothing and re-prefill every turn |
 | `0030` | Mauvis Ledford | -- (on) | Skip vision encoding for image spans wholly covered by a verified cached prefix; a span crossing the cut is still encoded |
 | `0031` | Mauvis Ledford | -- (on) | Admit requests between prompt chunks, rotate partially filled prompts, and decode between chunks; coordinated update required on every TP rank |
 | `0027` | manuel1618 | -- (on) | `/metrics` adds `prompt_tokens_cached_total` (and vLLM's `prefix_cache_hits_total` / `prefix_cache_queries_total`): prompt tokens restored from kept prompt states |

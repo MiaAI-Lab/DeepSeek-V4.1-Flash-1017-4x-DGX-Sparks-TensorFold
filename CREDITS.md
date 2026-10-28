@@ -44,7 +44,9 @@ DGX Sparks. Almost everything that makes it work was built by others. Its own wo
 
 ## This recipe's patches (`zig/patches`)
 
-**Every patch is Mia's AI Lab's own work, except `0008`, which is Hector's, `0026`, which is knapcio's, `0027` (`/metrics`), a backport by manuel1618, and `0027` (idle RDMA), which is uchkw's (Codex-assisted).** At a glance:
+**Every patch is Mia's AI Lab's own work, except `0008`, which is Hector's, `0026`, which is knapcio's, `0027`, which is
+Thomas Kempka's, `0028` and `0029`, upstream TensorFold fixes backported by Mauvis Ledford, `0030` and `0031`, which
+are Mauvis Ledford's, `0033`, a backport by manuel1618, and `0034`, which is uchkw's (Codex-assisted).** At a glance:
 
 | Patches | Author | What |
 | --- | --- | --- |
@@ -54,8 +56,12 @@ DGX Sparks. Almost everything that makes it work was built by others. Its own wo
 | `0017`-`0024` | Mia's AI Lab | the decode plan: G0.1-G0.3, tracks A2/B/C/D/A3 |
 | `0025` | Mia's AI Lab | WP6(b), the indexer's own row-sharding |
 | `0026` | knapcio | the RDMA queue pairs' path MTU from the port's active MTU |
-| `0027` | manuel1618 | `/metrics`' cached prompt-token counter, backported |
-| `0027` | [uchkw](https://github.com/uchkw) (Codex-assisted) | globally quiesce and futex-park idle RDMA proxies; wake before compute |
+| `0027` | [Thomas Kempka](https://github.com/thkempka) | the prompt cache keys a kept state by the request's images as well as its tokens |
+| `0028`-`0029` | backported by [Mauvis Ledford](https://github.com/krunkosaurus) | upstream TensorFold's pre-token SSE keepalives (JJ Eaton, Ash Hart) and its golden harness's stdout drain (BobClawblaw) |
+| `0030`-`0031` | [Mauvis Ledford](https://github.com/krunkosaurus) | vision work skipped for restored images; requests admitted between a prompt's prefill chunks |
+| `0032` | Mia's AI Lab | `0031` behind `TF_DS_PREFILL_YIELD` |
+| `0033` | manuel1618 | `/metrics`' cached prompt-token counter, backported |
+| `0034` | [uchkw](https://github.com/uchkw) (Codex-assisted) | globally quiesce and futex-park idle RDMA proxies; wake before compute |
 
 The per-patch notes below also credit everyone who helped find or shape a specific fix along the way -- Hector's
 reviewer, Codex and Grok's live-bug diagnosis and design reviews, an outside reviewer's observation -- without
@@ -178,13 +184,41 @@ Contributed by knapcio ([knapcio](https://github.com/knapcio)):
   [TensorFold#12](https://github.com/bertholomus/TensorFold/pull/12) (negotiated MTU), ported to this recipe's engine
   pin for the local endpoint only.
 
-Backported by manuel1618 ([manuel1618](https://github.com/manuel1618)):
+Contributed by Thomas Kempka ([thkempka](https://github.com/thkempka)), [PR #10](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/10):
 
-- `0027` (cached prompt tokens on `/metrics`): juliankang4's BertholomusAI/TensorFold `ce0d9053` (on
+- `0027` (the image-keyed prompt cache): a kept prompt state is keyed by the images inside its prefix (each one's
+  position, length and bytes, hashed) as well as its tokens, so a chat with a picture in its history resumes its
+  prefill instead of running it from 0 on every turn. A prompt without images keys every prefix to 0 and takes the
+  path it took before, and a state kept for a picture is never learned to disk.
+
+Contributed by Mauvis Ledford ([krunkosaurus](https://github.com/krunkosaurus)), [PR #15](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/15) and
+[PR #13](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/13):
+
+- `0030` (vision work skipped for an image wholly inside a restored image-keyed prefix) and `0031` (bounded prefill
+  admission: the native host advances a prompt one chunk a turn, admits new requests and runs the live streams'
+  rounds between its chunks, and rotates partially filled prompts; a new control frame selects the same slot on every
+  rank). `0032`, Mia's AI Lab's, puts `0031` behind `TF_DS_PREFILL_YIELD=1`.
+- The backports `0028` and `0029`, below under "Native server backports".
+
+Backported by manuel1618 ([manuel1618](https://github.com/manuel1618)), [PR #8](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/8):
+
+- `0033` (cached prompt tokens on `/metrics`): juliankang4's BertholomusAI/TensorFold `ce0d9053` (on
   `deepseek-v41-zig-tp4`), which eleata ports to the two-node branch in
   [TensorFold#44](https://github.com/bertholomus/TensorFold/pull/44). Neither turns the counter on for the
-  DeepSeek-V4.1 engine this recipe serves; `0027` adds that line (`native/cuda.zig`, `.prompt_cache = h.cache != null`,
+  DeepSeek-V4.1 engine this recipe serves; `0033` adds that line (`native/cuda.zig`, `.prompt_cache = h.cache != null`,
   as #44 does for two nodes) and carries the rest to this recipe's engine pin.
+
+Contributed by uchkw ([uchkw](https://github.com/uchkw)), Codex-assisted, [PR #2](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/2):
+
+- `0034` (idle RDMA parking): once no stream is live, every rank synchronizes its GPU and answers a READY/COMMIT
+  handshake before any RDMA proxy parks in a futex wait; the next compute frame wakes them, and idle followers block
+  on the control link instead of spinning. Its design, handshake and tests are uchkw's; Mia's AI Lab ported it onto
+  `0031` (its frame takes value 11, after `0031`'s, and the release path keeps `0031`'s partial-fill cleanup).
+
+Written for this recipe by Mia's AI Lab:
+
+- `0032` (`0031` behind `TF_DS_PREFILL_YIELD=1`): the DeepSeek-V4.1 lane offers the host its chunk-at-a-time prefill
+  only with that switch set; without it a prompt runs whole, as served before `0031`.
 
 ## Chat template
 
@@ -227,5 +261,8 @@ Upstream TensorFold fixes backported to this recipe:
   [TensorFold #663](https://github.com/ashhart/TensorFold/pull/663); this patch adapts the implementation integrated
   by **Ash Hart** in [`cc857503`](https://github.com/ashhart/TensorFold/commit/cc8575039b191df20d7739713b77744f462221c4)
   to the recipe's older handler, which opens the response before the generation loop.
-- `0029`: **Ash Hart** fixed the golden server's unread stdout pipe in
-  [`0baccf36`](https://github.com/ashhart/TensorFold/commit/0baccf3687972fb83bb8e95a4a4cb222600b800b).
+- `0029`: **BobClawblaw ([BobClawblaw](https://github.com/BobClawblaw))** wrote the drain of the golden server's
+  stdout pipe in [`0baccf36`](https://github.com/ashhart/TensorFold/commit/0baccf3687972fb83bb8e95a4a4cb222600b800b),
+  in Ash Hart's TensorFold.
+- Both were backported to this recipe by Mauvis Ledford ([krunkosaurus](https://github.com/krunkosaurus)),
+  [PR #13](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/13).
