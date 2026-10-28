@@ -1,0 +1,34 @@
+From: Ash Hart <71890694+ashhart@users.noreply.github.com>
+Subject: Drain golden fixture logs after reading its port
+
+Backported from ashhart/TensorFold 0baccf3687972fb83bb8e95a4a4cb222600b800b.
+On macOS the unread pipe fills during the golden suite and blocks log.writeOut.
+
+diff --git a/zig/tests/server/golden_check.zig b/zig/tests/server/golden_check.zig
+--- a/zig/tests/server/golden_check.zig
++++ b/zig/tests/server/golden_check.zig
+@@ -17,6 +17,14 @@
+     .{ .group = "metrics-open", .name = "v1-metrics" },
+     .{ .group = "keys", .name = "metrics-counted" },
+ };
++
++/// Drain the child server's logs so a full stdout pipe cannot block its request threads.
++fn drainStdout(io: Io, out: Io.File) void {
++    defer out.close(io);
++    var buf: [4096]u8 = undefined;
++    var reader = out.reader(io, &buf);
++    while ((reader.interface.discardShort(buf.len) catch return) == buf.len) {}
++}
+ 
+ fn isKnown(group: []const u8, name: []const u8) bool {
+     for (known_diffs) |k| {
+@@ -383,6 +391,9 @@
+         const line = reader.interface.takeDelimiterExclusive('\n') catch return error.NoPortLine;
+         if (std.mem.startsWith(u8, line, "PORT ")) {
+             const port = try std.fmt.parseInt(u16, std.mem.trim(u8, line[5..], " \r"), 10);
++            const drain = try std.Thread.spawn(.{}, drainStdout, .{ io, child.stdout.? });
++            child.stdout = null; // the drain owns and closes the pipe
++            drain.detach();
+             return .{ .child = child, .port = port, .log_path = log_path, .key_path = key_path };
+         }
+     }

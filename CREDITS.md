@@ -208,3 +208,14 @@ Contributed by knapcio ([knapcio](https://github.com/knapcio)):
 
 "DeepSeek" belongs to DeepSeek; "DGX Spark" and "GB10" belong to NVIDIA. This recipe is not affiliated with or endorsed
 by DeepSeek, NVIDIA, the TensorFold authors or BertholomusAI.
+
+## Native server backports
+
+Upstream TensorFold fixes backported to this recipe:
+
+- `0028`: **JJ Eaton ([jayleaton](https://github.com/jayleaton))** introduced pre-token keepalives in
+  [TensorFold #663](https://github.com/ashhart/TensorFold/pull/663); this patch adapts the implementation integrated
+  by **Ash Hart** in [`cc857503`](https://github.com/ashhart/TensorFold/commit/cc8575039b191df20d7739713b77744f462221c4)
+  to the recipe's older handler, which opens the response before the generation loop.
+- `0029`: **Ash Hart** fixed the golden server's unread stdout pipe in
+  [`0baccf36`](https://github.com/ashhart/TensorFold/commit/0baccf3687972fb83bb8e95a4a4cb222600b800b).

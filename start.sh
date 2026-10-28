@@ -119,7 +119,7 @@ ENGINE_ENV=(TF_DS_2D_GU=parity "TF_DS_2D_ORDER=$NODE_ORDER" "TF_DS_ROUND_ROWS=$R
 # Engram's packed shards (ENGRAM_PACKED=1, zig/patches/0003): every rank reads its own at /engram-packed
 [[ "$ENGRAM_PACKED" != 1 ]] || ENGINE_ENV+=(TF_DS_ENGRAM_PACKED=/engram-packed "TF_DS_ENGRAM_OWNED=$ENGRAM_OWNED"
                                             "TF_DS_ENGRAM_CACHE_MIB=$ENGRAM_CACHE_MIB" "TF_DS_ENGRAM_INSTREAM=$ENGRAM_INSTREAM")
-while IFS='=' read -r name _; do ENGINE_ENV+=("$name=${!name}"); done < <(env | grep -E '^(TENSORFOLD|TF_DS)_[A-Z0-9_]+=' | grep -vE '^TF_DS_(2D_GU|2D_ORDER|ROUND_ROWS|STREAMS|SERVED_K|WINDOW|GRAPHS|HC_SIDE|L2_PREFETCH|ENGRAM_AIO|ENGRAM_PACKED|ENGRAM_OWNED|ENGRAM_CACHE_MIB|ENGRAM_INSTREAM|ROUND_MS|DRAFT_MS)=' || true)
+while IFS='=' read -r name _; do ENGINE_ENV+=("$name=${!name}"); done < <(env | grep -E '^(TENSORFOLD|TF_DS|TF_SSE)_[A-Z0-9_]+=' | grep -vE '^TF_DS_(2D_GU|2D_ORDER|ROUND_ROWS|STREAMS|SERVED_K|WINDOW|GRAPHS|HC_SIDE|L2_PREFETCH|ENGRAM_AIO|ENGRAM_PACKED|ENGRAM_OWNED|ENGRAM_CACHE_MIB|ENGRAM_INSTREAM|ROUND_MS|DRAFT_MS)=' || true)
 envs() { local x; for x in "$@"; do printf -- '-e %q ' "$x"; done; }
 RUN_ARGS="--gpus all --ipc=host --network host --ulimit memlock=-1 --ulimit stack=67108864 --cap-add IPC_LOCK --device /dev/infiniband"
 DATA=/hf/$DATA_SUB
