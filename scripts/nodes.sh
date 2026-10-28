@@ -34,7 +34,8 @@ declare -A WORKER_DOWN=()
 worker() {
   local i=$1; shift
   [[ -z "${WORKER_DOWN[$i]:-}" ]] || return 255
-  ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 "$(worker_host "$i")" "$@"
+  # Launcher locks belong to the parent, not persistent SSH children.
+  ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 "$(worker_host "$i")" "$@" 8>&- 9>&-
 }
 
 # save_log <dir> <rank> <container> <keep>: the container's log (stdout and stderr, with timestamps) gzipped into

@@ -177,7 +177,8 @@ log "Rank 0 here: ${SERVE[*]}"
 
 # ---------------------------------------------------------------- 4. load
 step 4 "Loading: ~75 GiB of weights on each Spark over NFS, then the caches (a few minutes)"
-docker logs -f "$CONTAINER_NAME" 2>&1 | sed -u "s/^/  ${D}│${R} /" &
+# Neither log follower may retain the parent launcher lock after it exits.
+docker logs -f "$CONTAINER_NAME" 8>&- 2>&1 | sed -u "s/^/  ${D}│${R} /" 8>&- &
 LOGS_PID=$!
 trap 'kill $LOGS_PID 2>/dev/null || true' EXIT
 fail() {
