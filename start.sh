@@ -201,12 +201,16 @@ step 5 "Smoke test: one chat completion through all 4 ranks"
 if smoke=$(curl -s --max-time 300 -w '\n%{http_code}' "$URL/v1/chat/completions" -H 'Content-Type: application/json' \
              -d "{\"model\": \"$SERVED_NAME\", \"max_tokens\": 16, \"temperature\": 0, \"chat_template_kwargs\": {\"enable_thinking\": false}, \"messages\": [{\"role\": \"user\", \"content\": \"Reply with OK.\"}]}" |
            python3 -c 'import json,sys
+def no(why): sys.exit(why)
 body, _, code = sys.stdin.read().rpartition("\n")
-assert code == "200", "HTTP " + code
-r = json.loads(body); assert not r.get("error"), "an error reply"
-m = r["choices"][0]["message"]; assert m.get("role", "assistant") == "assistant", "not the assistant"
-c = (m.get("content") or "").strip(); assert c, "no reply text"
-assert len(c) < 8 or len(set(c)) > 2, "one repeated character"
+code == "200" or no("HTTP " + code)
+r = json.loads(body)
+r.get("error") is None or no("an error reply")
+m = r["choices"][0]["message"]
+m.get("role", "assistant") == "assistant" or no("not the assistant")
+c = (m.get("content") or "").strip()
+c or no("no reply text")
+len(c) < 8 or len(set(c)) > 2 or no("one repeated character")
 print(repr(c[:40]) + ",", r["usage"]["completion_tokens"], "tokens")' 2>/dev/null); then
   log "OK: $smoke"
 else

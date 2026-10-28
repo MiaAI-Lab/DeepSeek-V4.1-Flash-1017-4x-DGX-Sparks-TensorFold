@@ -65,7 +65,7 @@ if [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null)" 
   busy=$(curl -s --max-time 3 "http://$api_host:$PORT/health" 2>/dev/null |
          python3 -c 'import json,sys
 n = json.load(sys.stdin)["live"]["connections"]
-assert type(n) is int and n >= 0
+type(n) is int and n >= 0 or sys.exit(1)
 print(n)' 2>/dev/null) || busy="?"
   if [[ "$busy" == "?" ]]; then warn "could not read the open requests from /health: any still running will be cut off"
   elif (( busy > 0 )); then warn "$busy request(s) open (running or waiting) will be cut off"; fi

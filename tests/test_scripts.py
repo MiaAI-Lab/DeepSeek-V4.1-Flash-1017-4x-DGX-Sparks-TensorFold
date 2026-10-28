@@ -307,6 +307,15 @@ class StopHealth(ScriptTest):
                 self.assertIn("could not read the open requests from /health", out)
                 self.assertNoTraceback(out)
 
+    def test_stop_health_check_holds_with_python_optimizing(self):
+        # the checks are no asserts: PYTHONOPTIMIZE would drop those
+        for h in ["head", "w1", "w2", "w3"]:
+            self.containers(h, NAME)
+        (self.sim / "health").write_text('{"live": {"connections": -1}}')
+        code, out = self.run_script(["stop.sh"], {"PYTHONOPTIMIZE": "1"})
+        self.assertEqual(code, 0, out)
+        self.assertIn("could not read the open requests from /health", out)
+
 
 class StartRestart(ScriptTest):
     """./start.sh with only what needs a Spark replaced: the links (detect_links), flock, ss, free, hostname, curl's
@@ -320,7 +329,8 @@ class StartRestart(ScriptTest):
         # or 200) on the last line, as curl prints it
         "curl": "#!/bin/sh\ncase \"$*\" in *completions*)\n"
                 "  if [ -e \"$SIM/smoke\" ]; then cat \"$SIM/smoke\"; else printf '%s' '{\"choices\": [{\"message\": {\"role\": \"assistant\", \"content\": \"OK\"}}], \"usage\": {\"completion_tokens\": 1}}'; fi\n"
-                "  case \"$*\" in *http_code*) printf '\\n%s' \"$(cat \"$SIM/smoke_status\" 2>/dev/null || echo 200)\" ;; esac ;;\n"
+                "  case \"$*\" in *http_code*) printf '\\n%s' \"$(cat \"$SIM/smoke_status\" 2>/dev/null || echo 200)\" ;; esac\n"
+                "  if [ -e \"$SIM/smoke_exit\" ]; then exit \"$(cat \"$SIM/smoke_exit\")\"; fi ;;\n"
                 "*) echo '{\"status\": \"ok\", \"live\": {\"connections\": 0, \"waiting\": 0}}' ;; esac\n",
     }
 
@@ -361,17 +371,37 @@ node_order() { echo 0,1,2,3; }
         cases = {"HTTP 500 with a completion's body": (ok_body, "500"),
                  "HTTP 200 with an error object": ('{"error": {"message": "boom"}, "choices": [{"message": {"role": "assistant", "content": "OK"}}], "usage": {"completion_tokens": 1}}', "200"),
                  "HTTP 200 without reply text": ('{"choices": [{"message": {"role": "assistant", "content": ""}}], "usage": {"completion_tokens": 0}}', "200"),
-                 "HTTP 200, not the assistant's": ('{"choices": [{"message": {"role": "user", "content": "OK"}}], "usage": {"completion_tokens": 1}}', "200")}
-        for name, (body, status) in cases.items():
+                 "HTTP 200 with an empty error object": ('{"error": {}, "choices": [{"message": {"role": "assistant", "content": "OK"}}], "usage": {"completion_tokens": 1}}', "200"),
+                 "HTTP 200, not the assistant's": ('{"choices": [{"message": {"role": "user", "content": "OK"}}], "usage": {"completion_tokens": 1}}', "200"),
+                 "HTTP 200, then curl fails (a timeout)": (ok_body, "200", "28")}
+        for name, (body, status, *exit_) in cases.items():
             with self.subTest(name):
                 (self.sim / "smoke").write_text(body)
                 (self.sim / "smoke_status").write_text(status)
+                if exit_:
+                    (self.sim / "smoke_exit").write_text(exit_[0])
+                else:
+                    (self.sim / "smoke_exit").unlink(missing_ok=True)
                 code, out = self.run_script(["start.sh"], {"PREPARE": "0"})
                 self.assertNotEqual(code, 0, out)
                 self.assertIn("the smoke test request failed", out)
                 self.assertNotIn("is now LIVE", out)
                 for h in ["head", "w1", "w2", "w3"]:
                     self.containers(h)
+
+    def test_smoke_test_passes_without_a_role_and_with_python_optimizing(self):
+        # a reply whose message has no "role" is the assistant's; the checks are no asserts (PYTHONOPTIMIZE drops those)
+        (self.sim / "smoke").write_text('{"choices": [{"message": {"content": "OK"}}], "usage": {"completion_tokens": 1}}')
+        code, out = self.run_script(["start.sh"], {"PREPARE": "0"})
+        self.assertEqual(code, 0, out)
+        self.assertIn("is now LIVE", out)
+        for h in ["head", "w1", "w2", "w3"]:
+            self.containers(h)
+        (self.sim / "smoke").write_text('{"choices": [{"message": {"role": "assistant", "content": "OK"}}], "usage": {"completion_tokens": 1}}')
+        (self.sim / "smoke_status").write_text("500")
+        code, out = self.run_script(["start.sh"], {"PREPARE": "0", "PYTHONOPTIMIZE": "1"})
+        self.assertNotEqual(code, 0, out)
+        self.assertNotIn("is now LIVE", out)
 
     def test_restart_stops_when_a_rank_cannot_be_stopped(self):
         for h in ["head", "w1", "w2", "w3"]:
