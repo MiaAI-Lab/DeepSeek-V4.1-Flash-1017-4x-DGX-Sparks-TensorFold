@@ -12,6 +12,8 @@
       response_format     JSON schema object, rendered into the system block
 
     Notes:
+      * Each piece is written out as it is made, not added to one growing string: an engine that
+        copies the string on every append needs memory in proportion to messages x prompt length.
       * Role markers use FULLWIDTH vertical bars (U+FF5C).
       * BOS is part of the template, so tokenize with add_special_tokens=False.
       * Tool messages are merged into the preceding user turn as <tool_result> blocks,
@@ -78,7 +80,7 @@ You MUST strictly follow the above defined tool name and parameter schemas to in
 {#- ---- 1. Merge tool results into user turns (reference merge_tool_messages) and rank each
      result by its position in the preceding assistant's tool_calls (sort_tool_results_by_call_order).
      The template environment is sandboxed, so lists are rebuilt rather than mutated. ---- -#}
-{%- set ns = namespace(msgs = [], out = "", last_calls = []) -%}
+{%- set ns = namespace(msgs = [], last_calls = []) -%}
 {%- for message in messages -%}
     {%- set role = message.role -%}
     {%- if role == "tool" or role == "user" -%}
@@ -123,7 +125,7 @@ You MUST strictly follow the above defined tool name and parameter schemas to in
     {%- endif -%}
 {%- endfor -%}
 
-{%- set ns.out = bos -%}
+{{- bos -}}
 
 {#- ---- 3. Render ---- -#}
 {%- for m in ns.msgs -%}
@@ -133,27 +135,27 @@ You MUST strictly follow the above defined tool name and parameter schemas to in
     {#- Reasoning-effort prefix, first message only, thinking mode only. The System token
         also leads when the conversation opens with a system message. -#}
     {%- if idx == 0 and (thinking or role == "system") -%}
-        {%- set ns.out = ns.out + sys_tok -%}
+        {{- "" + sys_tok -}}
     {%- endif -%}
     {%- if idx == 0 and thinking -%}
-        {%- set ns.out = ns.out + "Reasoning Effort: " ~ effort ~ " (range 1-100, the higher the value, the more thorough the reasoning)\n\n" -%}
+        {{- "" + "Reasoning Effort: " ~ effort ~ " (range 1-100, the higher the value, the more thorough the reasoning)\n\n" -}}
     {%- endif -%}
 
     {%- if role == "system" -%}
-        {%- if idx > 0 -%}{%- set ns.out = ns.out + sys_tok -%}{%- endif -%}
-        {%- set ns.out = ns.out + m.parts[0].t -%}
+        {%- if idx > 0 -%}{{- "" + sys_tok -}}{%- endif -%}
+        {{- "" + m.parts[0].t -}}
         {%- if idx == 0 and tools is defined and tools -%}
-            {%- set ns.out = ns.out + "\n\n" + tools_tmpl -%}
+            {{- "" + "\n\n" + tools_tmpl -}}
         {%- endif -%}
         {%- if idx == 0 and response_format is defined and response_format -%}
-            {%- set ns.out = ns.out + "\n\n## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n" + (response_format | tojson) -%}
+            {{- "" + "\n\n## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n" + (response_format | tojson) -}}
         {%- endif -%}
 
     {%- elif role == "user" -%}
         {#- Tools with no leading system message still have to reach the model -#}
         {%- if idx == 0 and tools is defined and tools -%}
-            {%- if not thinking -%}{%- set ns.out = ns.out + sys_tok -%}{%- endif -%}
-            {%- set ns.out = ns.out + tools_tmpl -%}
+            {%- if not thinking -%}{{- "" + sys_tok -}}{%- endif -%}
+            {{- "" + tools_tmpl -}}
         {%- endif -%}
         {#- More than one tool result in a turn is emitted in call order, not arrival order -#}
         {%- set tool_parts = m.parts | selectattr("tool") | list -%}
@@ -172,34 +174,34 @@ You MUST strictly follow the above defined tool name and parameter schemas to in
         {%- else -%}
             {%- set body = m.parts | map(attribute = "t") | join("\n\n") -%}
         {%- endif -%}
-        {%- set ns.out = ns.out + user_tok + body -%}
+        {{- "" + user_tok + body -}}
 
     {%- elif role == "latest_reminder" -%}
-        {%- set ns.out = ns.out + reminder_tok + m.parts[0].t -%}
+        {{- "" + reminder_tok + m.parts[0].t -}}
 
     {%- elif role == "assistant" -%}
         {#- Reasoning is kept for turns after the last user message, or everywhere with tools -#}
         {%- if thinking and (not drop_thinking or idx > li.last_user) -%}
-            {%- set ns.out = ns.out + (m.reasoning_content if m.reasoning_content else "") + think_close -%}
+            {{- "" + (m.reasoning_content if m.reasoning_content else "") + think_close -}}
         {%- endif -%}
-        {%- set ns.out = ns.out + m.parts[0].t -%}
+        {{- "" + m.parts[0].t -}}
         {%- if m.tool_calls -%}
-            {%- set ns.out = ns.out + "\n\n<" ~ dsml ~ " calls>\n" -%}
+            {{- "" + "\n\n<" ~ dsml ~ " calls>\n" -}}
             {%- for tc in m.tool_calls -%}
                 {%- set fn = tc.function if tc.function is defined else tc -%}
-                {%- set ns.out = ns.out + "<" ~ dsml ~ " invoke name=\"" ~ fn.name ~ "\">\n" -%}
+                {{- "" + "<" ~ dsml ~ " invoke name=\"" ~ fn.name ~ "\">\n" -}}
                 {%- if fn.arguments is mapping -%}
                     {%- for k, v in fn.arguments.items() -%}
-                        {%- set ns.out = ns.out + "<" ~ dsml ~ " parameter name=\"" ~ k ~ "\" string=\"" ~ ("true" if v is string else "false") ~ "\">" ~ (v if v is string else (v | tojson)) ~ "</" ~ dsml ~ " parameter>" ~ ("\n" if not loop.last else "") -%}
+                        {{- "" + "<" ~ dsml ~ " parameter name=\"" ~ k ~ "\" string=\"" ~ ("true" if v is string else "false") ~ "\">" ~ (v if v is string else (v | tojson)) ~ "</" ~ dsml ~ " parameter>" ~ ("\n" if not loop.last else "") -}}
                     {%- endfor -%}
                 {%- else -%}
-                    {%- set ns.out = ns.out + "<" ~ dsml ~ " parameter name=\"arguments\" string=\"true\">" ~ fn.arguments ~ "</" ~ dsml ~ " parameter>" -%}
+                    {{- "" + "<" ~ dsml ~ " parameter name=\"arguments\" string=\"true\">" ~ fn.arguments ~ "</" ~ dsml ~ " parameter>" -}}
                 {%- endif -%}
-                {%- set ns.out = ns.out + "\n</" ~ dsml ~ " invoke>" ~ ("\n" if not loop.last else "") -%}
+                {{- "" + "\n</" ~ dsml ~ " invoke>" ~ ("\n" if not loop.last else "") -}}
             {%- endfor -%}
-            {%- set ns.out = ns.out + "\n</" ~ dsml ~ " calls>" -%}
+            {{- "" + "\n</" ~ dsml ~ " calls>" -}}
         {%- endif -%}
-        {%- set ns.out = ns.out + eos -%}
+        {{- "" + eos -}}
     {%- else -%}
         {{ raise_exception("Unknown role: " ~ role) }}
     {%- endif -%}
@@ -210,13 +212,12 @@ You MUST strictly follow the above defined tool name and parameter schemas to in
     {%- set next_is_asst = (not loop.last) and (ns.msgs[idx + 1].role in ["assistant", "latest_reminder"]) -%}
     {%- if (is_last and add_generation_prompt) or next_is_asst -%}
         {%- if role == "user" or (role == "system" and idx > 0) -%}
-            {%- set ns.out = ns.out + asst_tok -%}
+            {{- "" + asst_tok -}}
             {%- if thinking and (not drop_thinking or idx >= li.last_user) -%}
-                {%- set ns.out = ns.out + think_open -%}
+                {{- "" + think_open -}}
             {%- else -%}
-                {%- set ns.out = ns.out + think_close -%}
+                {{- "" + think_close -}}
             {%- endif -%}
         {%- endif -%}
     {%- endif -%}
 {%- endfor -%}
-{{- ns.out -}}
