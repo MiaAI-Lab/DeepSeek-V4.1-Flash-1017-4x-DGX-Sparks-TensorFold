@@ -1,5 +1,9 @@
 # Changelog
 
+- **2026-10-26** -- `tools/validate.py`, `tools/needle_bench.py`: a check passes only on a real completion. An HTTP
+  error, an `error` object, a reply that is not the assistant's, a malformed tool call or a short or empty `--compare`
+  reference now fails instead of passing; bad arguments stop with a message. Offline regression tests in
+  `tests/test_validation_tools.py` (standard library only, no GPU).
 - **2026-10-26** -- `0026` (knapcio): the RDMA rings' queue pairs take the port's active MTU (`ibv_query_port`,
   capped at 4096) as their path MTU instead of a fixed 4096. On a switched fabric whose Ethernet MTU is 1500 the RoCE
   active MTU is 1024, and with the fixed 4096 every request failed (`RDMA=1`); with the port's MTU it serves. On a
