@@ -136,7 +136,10 @@ if [[ ! -s "$DATA_DIR/dsv41_token_map.json" ]]; then
 fi
 for g in 0 1 2 3; do
   # the file the engine looks for: its name carries the index's hash (tf-dsv41-rank-cache --index-only)
-  want=$(in_hf --entrypoint bash "$IMAGE" -c "tf-dsv41-rank-cache $SNAP_C /tmp/x $g 4 --parity --index-only | sha256sum | cut -c1-20")
+  # pipefail inside the container too: without it a failed --index-only hashes empty output, matches no weight file,
+  # and the loop below deletes the good one before a rebuild that fails the same way
+  want=$(in_hf --entrypoint bash "$IMAGE" -c "set -o pipefail; tf-dsv41-rank-cache $SNAP_C /tmp/x $g 4 --parity --index-only | sha256sum | cut -c1-20") ||
+    die "cannot compute node $g's weight-file index from $SNAP (tf-dsv41-rank-cache --index-only): is the checkpoint complete?"
   if [[ -f "$DATA_DIR/rank-cache/rank${g}of4-$want.bin" ]]; then log "Weight file of node $g: ready"; continue; fi
   rm -f "$DATA_DIR/rank-cache/rank${g}of4-"*.bin "$DATA_DIR/rank-cache/.rank${g}of4.partial"
   log "Weight file of node $g from the checkpoint (~80 GB, a few minutes)"

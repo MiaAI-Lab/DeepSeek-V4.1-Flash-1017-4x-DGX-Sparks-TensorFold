@@ -1,4 +1,5 @@
-"""Regression tests for stop.sh, ./start.sh restart, the ring's NCCL graph files under DRY_RUN=1, and the prepared marker.
+"""Regression tests for stop.sh, ./start.sh restart, the ring's NCCL graph files under DRY_RUN=1, the prepared marker
+and prepare.sh's weight-file loop.
 
 Offline: no Spark, GPU, Docker or network. Each test copies the scripts into a temporary folder and puts fake `ssh`,
 `docker`, `curl` and `getent` first on PATH. The fake ssh runs a worker's command locally with that worker's own HOME
@@ -506,6 +507,80 @@ class PreparedState(ScriptTest):
         for var, value in [("ORDER", "0,1,2,3"), ("ABLIT", "1"), ("WORKER2", "w9")]:
             with self.subTest(var=var):
                 self.assertChanges({var: value})
+
+
+# a stand-in for the image's tf-dsv41-rank-cache: --index-only prints "[rank G]" (or fails for a rank in $FAIL_INDEX,
+# with nothing on stdout, as the real one does on a tensor it cannot describe); otherwise it writes the weight file
+# under the name the engine looks for, and refuses an OUT_DIR that already holds one of that rank (as the real one)
+FAKE_RANK_CACHE = r"""#!BASH
+g=$3; out=${2/#\/hf/$HF_CACHE}
+if [[ " $* " == *" --index-only "* ]]; then
+  [[ ",$FAIL_INDEX," != *",$g,"* ]] || { echo "layers.0.attn.wq_a.weight: FileNotFound" >&2; exit 1; }
+  printf '[rank %s]' "$g"; exit 0
+fi
+echo "$g" >> "$SIM/built"
+compgen -G "$out/rank${g}of4-*.bin" >/dev/null && { echo "$out already holds a weight file of rank $g" >&2; exit 1; }
+printf 'weights %s' "$g" > "$out/rank${g}of4-$(printf '[rank %s]' "$g" | sha256sum | cut -c1-20).bin"
+"""
+
+
+class PrepareWeightFiles(ScriptTest):
+    """Step 5 of prepare.sh, the loop that keeps or rebuilds each node's weight file, run with in_hf as a local stand-in."""
+
+    def setUp(self):
+        super().setUp()
+        tools = self.tmp / "tools"
+        tools.mkdir()
+        (tools / "tf-dsv41-rank-cache").write_text(FAKE_RANK_CACHE.replace("BASH", BASH))
+        (tools / "tf-dsv41-rank-cache").chmod(0o755)
+        if not shutil.which("sha256sum"):
+            (tools / "sha256sum").write_text("#!/bin/sh\nexec shasum -a 256 \"$@\"\n")
+            (tools / "sha256sum").chmod(0o755)
+        self.env["TOOLS"] = str(tools)
+        self.env["HF_CACHE"] = str(self.tmp / "hf")
+        lines = (self.repo / "scripts" / "prepare.sh").read_text().splitlines()
+        start = next(i for i, l in enumerate(lines) if l.startswith("for g in 0 1 2 3; do")
+                     and "--index-only" in "\n".join(lines[i:i + 4]))
+        end = next(i for i in range(start, len(lines)) if lines[i] == "done")
+        self.loop = "\n".join(lines[start:end + 1])
+
+    def run_loop(self, fail_index=""):
+        body = (
+            'in_hf() { local ep; while [[ "$1" == --* ]]; do [[ "$1" != --entrypoint ]] || ep=$2; shift 2; done; shift\n'
+            '  PATH="$TOOLS:$PATH" "$ep" "$@"; }\n'
+            'IMAGE=image SNAP=/snap SNAP_C=/hf/snap\n'
+            'mkdir -p "$DATA_DIR/rank-cache"\n' + self.loop)
+        return self.bash(body, {"FAIL_INDEX": fail_index})
+
+    def rank_files(self):
+        d = next((self.tmp / "hf").glob("tensorfold-dsv41/*/rank-cache"), None)
+        return sorted(f.name for f in d.glob("rank*of4-*.bin")) if d else []
+
+    def built(self):
+        f = self.sim / "built"
+        return f.read_text().split() if f.exists() else []
+
+    def test_builds_then_keeps_the_weight_files(self):
+        code, out = self.run_loop()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(len(self.rank_files()), 4, out)
+        self.assertEqual(self.built(), ["0", "1", "2", "3"])
+        code, out = self.run_loop()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(out.count("ready"), 4, out)
+        self.assertEqual(self.built(), ["0", "1", "2", "3"], "a ready weight file was rebuilt")
+
+    def test_failed_index_keeps_that_ranks_weight_file(self):
+        code, out = self.run_loop()
+        self.assertEqual(code, 0, out)
+        before = self.rank_files()
+        for rank in "0123":
+            with self.subTest(rank=rank):
+                code, out = self.run_loop(fail_index=rank)
+                self.assertNotEqual(code, 0, out)
+                self.assertIn(f"node {rank}'s weight-file index", out)
+                self.assertEqual(self.rank_files(), before, out)
+        self.assertEqual(self.built(), ["0", "1", "2", "3"], "a weight file was rebuilt after a failed index")
 
 
 if __name__ == "__main__":
