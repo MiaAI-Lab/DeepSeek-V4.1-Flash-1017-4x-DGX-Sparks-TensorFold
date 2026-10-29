@@ -1,0 +1,30 @@
+diff --git a/zig/src/families/dsv41/draft.zig b/zig/src/families/dsv41/draft.zig
+index cad18ad..a22115d 100644
+--- a/zig/src/families/dsv41/draft.zig
++++ b/zig/src/families/dsv41/draft.zig
+@@ -350,8 +350,8 @@ pub const PassGraphs = struct {
+             std.log.err("drafter pass graph of {d} streams, {d} steps failed on another rank; the pass fails on every rank", .{ N, steps });
+             return error.GraphCaptureFailed;
+         }
+-        var exec = exec_got.?;
+-        errdefer exec.deinit();
++        const exec = exec_got.?;
++        // The cache owns exec from here, including when the first launch fails.
+         g.map.putAssumeCapacity(key, exec);
+         try exec.launchOn(e.s);
+     }
+diff --git a/zig/src/families/dsv41/round.zig b/zig/src/families/dsv41/round.zig
+index deff59a..28d92f9 100644
+--- a/zig/src/families/dsv41/round.zig
++++ b/zig/src/families/dsv41/round.zig
+@@ -1078,8 +1078,8 @@ pub const Graphs = struct {
+             std.log.err("graph capture of rows {d} bucket {d} stretch {d} failed on another rank; the round fails on every rank", .{ key.rows, key.bucket, key.stretch });
+             return error.GraphCaptureFailed;
+         }
+-        var exec = exec_got.?;
+-        errdefer exec.deinit();
++        const exec = exec_got.?;
++        // The cache owns exec from here, including when the first launch fails.
+         g.map.putAssumeCapacity(key, .{ .exec = exec, .start = start, .end = cy.* });
+         try exec.launchOn(e.s);
+     }

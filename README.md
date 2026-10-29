@@ -393,6 +393,7 @@ measurements and rationale: [`CHANGELOG.md`](CHANGELOG.md); authorship: [`CREDIT
 | `0034` | uchkw | -- (on with RDMA) | Parks idle RDMA proxies with a futex after all ranks quiesce; wakes before the next compute frame |
 | `0035` | Mia's AI Lab | `TF_DS_CONNECT_S` (300 s) | Rank 0 opens every worker's rendezvous port before loading its weights, so a worker that loads first waits there instead of exiting with `ConnectFailed` 300 s later ([#3](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/issues/3)) |
 | `0036` | BobClawblaw, Ash Hart, bertholomus (ported by Mia's AI Lab) | -- (on) | Structured output and `tool_choice` required on the DeepSeek-V4.1 engine ([above](#structured-output-and-required-tool-calls); [#6](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/issues/6))
+| `0040` | SvangenStudios | -- (on) | Decode and drafter graph caches keep ownership of an executable whose first launch fails, so a destroyed handle is never launched or destroyed twice |
 
 ### Idle RDMA CPU use
 
