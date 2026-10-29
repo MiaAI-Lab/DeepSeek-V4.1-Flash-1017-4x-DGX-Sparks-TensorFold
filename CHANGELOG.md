@@ -1,5 +1,9 @@
 # Changelog
 
+- **2026-10-29** -- `0041` (SvangenStudios): the engine's server tests (`zig test` on `zig/src/server/root.zig`)
+  compile again: two opt-in tests in `tool_grammar.zig` still called `HfText.load` with the removed template argument
+  and a removed `encodePlain` (also noted in #20). Test code only; no production code or tokenizer API changes. On
+  CPU: compile error before, 70 passed and 2 skipped (the checkpoint tests) after.
 - **2026-10-28** -- `0036`, structured output and required tool calls
   ([#6](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/issues/6)): upstream TensorFold's
   structured output (BobClawblaw's lane-core grammar and libtfgrammar, Ash Hart's required tool calls and grammar-aware

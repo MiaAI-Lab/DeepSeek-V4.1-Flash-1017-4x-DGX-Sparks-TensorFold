@@ -1,0 +1,60 @@
+diff --git a/zig/src/server/tool_grammar.zig b/zig/src/server/tool_grammar.zig
+index 1551b27..ea0e454 100644
+--- a/zig/src/server/tool_grammar.zig
++++ b/zig/src/server/tool_grammar.zig
+@@ -218,9 +218,8 @@ test "a DSML grammar holds every call in one block, each invoke's parameters in
+ }
+ 
+ test "a forced DSML call's marker is its token: spelled in plain characters, the reply's parameter never closes; with the ban the token follows \"<\"" {
+-    // opt-in, as the test below: TF_GRAMMAR_DIR, TF_GRAMMAR_TEMPLATE, TF_GRAMMAR_VOCAB, TF_GRAMMAR_STOP and libtfgrammar
++    // opt-in, as the test below: TF_GRAMMAR_DIR, TF_GRAMMAR_VOCAB, TF_GRAMMAR_STOP and libtfgrammar
+     const dir = std.testing.environ.getPosix("TF_GRAMMAR_DIR") orelse return error.SkipZigTest;
+-    const template = std.testing.environ.getPosix("TF_GRAMMAR_TEMPLATE") orelse return error.SkipZigTest;
+     const vocab = try std.fmt.parseInt(u32, std.testing.environ.getPosix("TF_GRAMMAR_VOCAB") orelse return error.SkipZigTest, 10);
+     const stop = try std.fmt.parseInt(u32, std.testing.environ.getPosix("TF_GRAMMAR_STOP") orelse return error.SkipZigTest, 10);
+     const gpa = std.testing.allocator;
+@@ -229,7 +228,7 @@ test "a forced DSML call's marker is its token: spelled in plain characters, the
+     defer arena.deinit();
+     const a = arena.allocator();
+     var problem: []const u8 = "";
+-    const hf = try @import("hf_text.zig").HfText.load(gpa, io, dir, template, a, &problem);
++    const hf = try @import("hf_text.zig").HfText.load(gpa, io, dir, a, &problem);
+     defer hf.deinit();
+     const text = hf.text();
+     const tok = try std.Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(a, &.{ dir, "tokenizer.json" }), a, .limited(256 << 20));
+@@ -248,7 +247,13 @@ test "a forced DSML call's marker is its token: spelled in plain characters, the
+     // the reply a sampled forced call wrote on the served lane ("Hello there.", temperature 1): the markers in plain
+     // characters, the closing tags with two spaces; the grammar takes all of it as the parameter's value, never the end
+     const reply = "<" ++ marker ++ " calls>\n<" ++ marker ++ " invoke name=\"get_weather\">\n<" ++ marker ++ " parameter name=\"city\" string=\"true\">London</" ++ marker ++ "  parameter>\n</" ++ marker ++ "  invoke>\n</" ++ marker ++ "  calls> \n\nHello! How can I help you today?";
+-    const plain = try text.encodePlain(a, reply);
++    // Borrow the tokenizer model and vocabulary; only this copy loses added-token
++    // matching. Keep model.added_only so BPE cannot reintroduce special tokens.
++    // Do not deinit the borrowed copy: hf still owns every allocation.
++    var plain_tokenizer = hf.tok;
++    plain_tokenizer.raw = .{};
++    plain_tokenizer.normalized = .{};
++    const plain = try plain_tokenizer.encode(a, reply);
+     try std.testing.expect(std.mem.indexOfScalar(u32, plain, dsml) == null and std.mem.indexOfScalar(u32, plain, bar[0]) != null);
+     const w = try walk(&c, io, g, plain, stop);
+     try std.testing.expect(w.taken == plain.len and !w.ended);
+@@ -289,10 +294,9 @@ fn walk(c: *api.grammar.Compiler, io: std.Io, grammar_text: []const u8, ids: []c
+ 
+ test "DSML grammars through libtfgrammar, a checkpoint's tokenizer and its template: the template's calls end at the stop; prose, an unoffered name, a missing or mistyped parameter and a second call when single do not" {
+     // opt-in: TF_GRAMMAR_DIR=<a DeepSeek-V4.1 checkpoint folder: tokenizer.json, tokenizer_config.json, config.json>
+-    // TF_GRAMMAR_TEMPLATE=<its chat template> TF_GRAMMAR_VOCAB=<its logits' width> TF_GRAMMAR_STOP=<its eos id>, and
++    // Its template is loaded from that folder. TF_GRAMMAR_VOCAB=<its logits' width> TF_GRAMMAR_STOP=<its eos id>, and
+     // libtfgrammar where the loader finds it
+     const dir = std.testing.environ.getPosix("TF_GRAMMAR_DIR") orelse return error.SkipZigTest;
+-    const template = std.testing.environ.getPosix("TF_GRAMMAR_TEMPLATE") orelse return error.SkipZigTest;
+     const vocab = try std.fmt.parseInt(u32, std.testing.environ.getPosix("TF_GRAMMAR_VOCAB") orelse return error.SkipZigTest, 10);
+     const stop = try std.fmt.parseInt(u32, std.testing.environ.getPosix("TF_GRAMMAR_STOP") orelse return error.SkipZigTest, 10);
+     const gpa = std.testing.allocator;
+@@ -301,7 +305,7 @@ test "DSML grammars through libtfgrammar, a checkpoint's tokenizer and its templ
+     defer arena.deinit();
+     const a = arena.allocator();
+     var problem: []const u8 = "";
+-    const hf = try @import("hf_text.zig").HfText.load(gpa, io, dir, template, a, &problem);
++    const hf = try @import("hf_text.zig").HfText.load(gpa, io, dir, a, &problem);
+     defer hf.deinit();
+     const text = hf.text();
+     const tok = try std.Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(a, &.{ dir, "tokenizer.json" }), a, .limited(256 << 20));
