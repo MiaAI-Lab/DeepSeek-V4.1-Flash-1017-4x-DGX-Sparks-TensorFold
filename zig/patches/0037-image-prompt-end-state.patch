@@ -1,0 +1,64 @@
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index 3bdb159c..1e3ffcc9 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -740,7 +740,16 @@ pub const Lanes = struct {
+         const f = &self.fills[lane.slot].?;
+         const seq = &self.seqs[lane.slot];
+         const len = s.prompt_len;
+-        const n = @min(model.chunk_rows, len - f.start);
++        // 0037: stop the pass at the start of the prompt last sliding window (16-aligned), so the state kept
++        // there covers every row before it. A warm replay then recomputes the window (128-143 rows) instead
++        // of the last chunk plus the window, and re-encodes no image before those rows.
++        const win = self.m.cfg.window;
++        const target = if (len > win) ((len - win) / 16) * 16 else 0;
++        const n = if (f.start < target and target - f.start >= 16)
++            @min(model.chunk_rows, target - f.start)
++        else
++            len - f.start;
++        const final = f.start + n == len;
+         if (try self.begin(.fill_chunk)) {
+             try self.wire.int(gpa, u64, f.start);
+             try self.wire.int(gpa, u32, @intCast(n));
+@@ -749,8 +758,14 @@ pub const Lanes = struct {
+         }
+         const head = try m.fillChunk(seq.items[0 .. f.start + n], f.start, n, f.replay);
+         f.start += n;
+-        if (s.reuse.hook) |k| if (f.start < len and f.start <= f.replay and
+-            (f.start == f.last_end or markEnds(s.reuse.marks, f.start))) k.at(k.ptr, s, @intCast(f.start));
++        if (s.reuse.hook) |k| {
++            if (final and f.start == len and f.start - n > 0) {
++                // the window chunk start: the last position a state can cover, and <= the replay bound
++                const at = f.start - n;
++                if (at <= f.replay) k.at(k.ptr, s, @intCast(at));
++            } else if (f.start < len and f.start <= f.replay and
++                (f.start == f.last_end or markEnds(s.reuse.marks, f.start))) k.at(k.ptr, s, @intCast(f.start));
++        }
+         if (f.start < len) {
+             // Leave read-ahead running for a prompt alone; a slot switch joins it in startFill/selectFill. Without
+             // TF_DS_PREFILL_YIELD no round runs between the chunks, so the read-ahead runs on, as served
+@@ -1017,7 +1032,12 @@ pub const Lanes = struct {
+     /// prompt's replay (the rows before it ran the encoder layers alone, as a fresh pass of this prompt runs them).
+     fn usable(self: *const Lanes, sn: *const Snap, len: usize) bool {
+         if (std.mem.indexOfScalar(*Snap, self.snaps.items, @constCast(sn)) == null) return false;
+-        return !sn.stale and sn.at > 0 and sn.at < len and sn.at % model.chunk_rows == 0 and sn.at <= len -| self.m.cfg.window;
++        // 0037: any 16-row-aligned state may start the pass. A state kept at the last window chunk start of an
++        // earlier prompt is a valid prefix of this one (the cache requires the tokens to be a prefix and the images
++        // to match), and the row blocks the kernels capture are 16 rows, so the pass can begin there. Refusing a
++        // state here drops it and runs the whole prompt from 0, which is what a chat whose history grew past the
++        // state would see.
++        return !sn.stale and sn.at > 0 and sn.at < len and sn.at <= len -| self.m.cfg.window and sn.at % 16 == 0;
+     }
+ 
+     /// The first extent that fits around the live streams and the kept states. Kept states give their room oldest
+@@ -1088,7 +1108,9 @@ pub const Lanes = struct {
+         const self = of(ptr);
+         const s: *const lanes.Stream = @ptrCast(@alignCast(owner orelse return error.NoStream));
+         const l = self.streams.getPtr(s) orelse return error.UnknownStream;
+-        if (at == 0 or at % model.chunk_rows != 0 or at > s.prompt_len -| self.m.cfg.window) return error.NotAChunkEnd;
++        // 0037: the pass stands at a chunk end it reached, which need not be a full 2048-row chunk (the window
++        // chunk of a prompt ends 128-143 rows before its end); the row blocks the kernels capture are 16 rows.
++        if (at == 0 or at % 16 != 0 or at > s.prompt_len -| self.m.cfg.window) return error.NotAChunkEnd;
+         const sn = try self.gpa.create(Snap);
+         errdefer self.gpa.destroy(sn);
+         sn.* = .{ .id = self.next_snap, .at = at, .base = l.base, .end = l.end, .buf = try cuda.DeviceBuffer.alloc(self.m.ctx.d, self.m.snapBytes()) };

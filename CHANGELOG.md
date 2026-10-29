@@ -1,5 +1,18 @@
 # Changelog
 
+- **2026-10-29** -- `0037` (Thomas Kempka), a prompt's state kept at its last sliding window: the prompt cache kept a
+  state only at a 2048-row chunk end, so a warm replay re-prefilled up to 2,047 rows, and with pictures in them their
+  vision encoding ran again (a 20-image prompt replayed in 1.87-2.90 s with `cached=8192`; rigmark's 64K replay
+  76,832 tok/s). The pass now stops at `floor((prompt_len - sliding_window) / 16) * 16`, the start of the last sliding
+  window (`text_config.sliding_window` is 128), and `usable()`/`snapSaveFn` accept that 16-row-aligned chunk end, both
+  for the state a pass keeps and for one an earlier turn kept: a refused state is not a miss but is dropped and its
+  prompt runs from 0, which is what made a chat whose history grew past its newest state prefill cold. Measured: the
+  same 20-image prompt replays in 0.80 s with `cached=9296`, a 65k prompt carrying 30 pictures in 1.01 s with
+  `cached=65200`, 8 x 1920x1080 in 1.89 s, a 9.7k text prompt in 0.27 s, and rigmark's 64K replay reaches
+  281,112 tok/s. Cold cost is unchanged, a changed picture still misses completely (`cached=0`), rigmark passes 15/15
+  gates with decode within noise, and a warm reply is not bit-identical to a cold one: the rows after the resume
+  point are computed in chunks anchored at it instead of on a cold pass's grid (`Rules.planned` is the engine's own
+  rule for such families, relaxed here from 2048 rows to 16). No flag, no checkpoint or rank-cache change.
 - **2026-10-28** -- `0036`, structured output and required tool calls
   ([#6](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/issues/6)): upstream TensorFold's
   structured output (BobClawblaw's lane-core grammar and libtfgrammar, Ash Hart's required tool calls and grammar-aware
