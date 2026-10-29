@@ -97,11 +97,11 @@ if [[ ! -d "$KIT_DIR/.git" ]]; then
 fi
 [[ "$(git -C "$KIT_DIR" rev-parse HEAD)" == "$KIT_REF" ]] || die "$KIT_DIR is not at KIT_REF ${KIT_REF:0:8}: remove it and run this again"
 log "Checking the kit (its RoPE tables and image bias made from the checkpoint; CPU only)"
-kit_out=$(IMAGE="$BASE_IMAGE" "$KIT_DIR/kit/verify_kit.sh" "$SNAP" "$SNAP" 2>&1 | tail -1) || true
+kit_out=$(IMAGE="$IMAGE" "$KIT_DIR/kit/verify_kit.sh" "$SNAP" "$SNAP" 2>&1 | tail -1) || true
 # 1017's image routing bias is its own, not the original release's: the one file allowed to differ from MANIFEST
 [[ "$kit_out" == *"356 of 356 files match"* || "$kit_out" == *"355 of 356 files match"*"1 differ, 0 missing"* ]] ||
   die "the kit does not check out: $kit_out"
-grep -q "DIFFERS (bias): vision/gate_bias_vl.safetensors" <(IMAGE="$BASE_IMAGE" "$KIT_DIR/kit/verify_kit.sh" "$SNAP" 2>&1) ||
+grep -q "DIFFERS (bias): vision/gate_bias_vl.safetensors" <(IMAGE="$IMAGE" "$KIT_DIR/kit/verify_kit.sh" "$SNAP" 2>&1) ||
   [[ "$kit_out" == *"356 of 356"* ]] || die "a kit file other than the image bias differs from MANIFEST"
 log "Kit: $kit_out (the image bias is 1017's own)"
 
@@ -169,7 +169,7 @@ for i in 1 2 3; do
     die "$(worker_host "$i") cannot mount this Spark's :$NFS_PATH from $(nfs_server "$i") over NFS ($NFS_VOLUME): $(tail -1 <<<"$out")
     This Spark must export HF_CACHE (as $NFS_PATH) read-only to that worker's address on its link (README: NFS)"
   fi
-  have=$(worker "$i" "docker run --rm --network none -v '$NFS_VOLUME:/hf:ro' -w /hf --entrypoint find '$BASE_IMAGE' -L 'hub/models--${MODEL_ID//\//--}/snapshots/$(snapshot_rev)' '$DATA_SUB' '$KIT_SUB/kit' -path '*/.git' -prune -o -type f -printf '%p %s\n'" 2>/dev/null | LC_ALL=C sort || true)
+  have=$(worker "$i" "docker run --rm --network none -v '$NFS_VOLUME:/hf:ro' -w /hf --entrypoint find '$IMAGE' -L 'hub/models--${MODEL_ID//\//--}/snapshots/$(snapshot_rev)' '$DATA_SUB' '$KIT_SUB/kit' -path '*/.git' -prune -o -type f -printf '%p %s\n'" 2>/dev/null | LC_ALL=C sort || true)
   [[ "$have" == "$want" ]] || { diff <(printf '%s\n' "$want") <(printf '%s\n' "$have") | head -10 >&2
     die "$(worker_host "$i") does not see every file over NFS ($NFS_VOLUME)"; }
   log "Worker $i ($(worker_host "$i")) reads the checkpoint, its weight file and the kit over NFS"
@@ -215,7 +215,7 @@ for i in 1 2 3; do
   free=$(worker "$i" "mkdir -p $WORKER_ENGRAM_DIR && df -B1 --output=avail $WORKER_ENGRAM_DIR | tail -1")
   (( free + have > need + 10 * 1024 ** 3 )) || die "$(worker_host "$i") has $(( free / 1024 ** 3 )) GiB free: Engram's tables need $(( need / 1024 ** 3 )) GiB on its disk (WORKER_ENGRAM_DIR) and 10 GiB to spare"
   log "Worker $i ($(worker_host "$i")): copying Engram's tables to its disk ($(( need / 1024 ** 3 )) GiB over NFS, once)"
-  worker "$i" "docker run --rm --network none --user \$(id -u):\$(id -g) -v '$NFS_VOLUME:/hf:ro' -v $WORKER_ENGRAM_DIR:/out --entrypoint bash '$BASE_IMAGE' -c 'for f in ${shards[*]}; do cp /hf/$SNAP_REL/\$f /out/\$f.part && mv /out/\$f.part /out/\$f || exit 1; done'" ||
+  worker "$i" "docker run --rm --network none --user \$(id -u):\$(id -g) -v '$NFS_VOLUME:/hf:ro' -v $WORKER_ENGRAM_DIR:/out --entrypoint bash '$IMAGE' -c 'for f in ${shards[*]}; do cp /hf/$SNAP_REL/\$f /out/\$f.part && mv /out/\$f.part /out/\$f || exit 1; done'" ||
     die "copying Engram's tables to $(worker_host "$i") failed"
 done
 
