@@ -1,0 +1,33 @@
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index 0c93615..c7ef694 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -450,6 +450,13 @@ pub const LaneHost = struct {
+             _ = h.drop(job, "the drafter could not start");
+             return false;
+         };
++        // Keep ownership here until Stream.init succeeds. A failed setup drops
++        // the job; drop's true means work was handled, not that setup succeeded.
++        const reply_grammar = if (r.structure) |st| h.constraint(st) catch |e| {
++            job.proposer.deinit();
++            _ = h.drop(job, if (e == error.OutOfMemory) "out of memory" else "the reply's grammar could not start (xgrammar)");
++            return false;
++        } else null;
+         job.stream = lanes.Stream.init(h.gpa, .{
+             .id = "request",
+             .prompt = r.prompt,
+@@ -467,12 +474,10 @@ pub const LaneHost = struct {
+             .chunks = r.chunks,
+             .reuse = reuse,
+             .images = r.images,
+-            .grammar = if (r.structure) |st| h.constraint(st) catch |e| {
+-                job.proposer.deinit();
+-                return h.drop(job, if (e == error.OutOfMemory) "out of memory" else "the reply's grammar could not start (xgrammar)");
+-            } else null,
++            .grammar = reply_grammar,
+         }) catch {
+             job.proposer.deinit();
++            if (reply_grammar) |g| g.deinit(h.gpa);
+             _ = h.drop(job, "out of memory");
+             return false;
+         };

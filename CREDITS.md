@@ -66,6 +66,7 @@ BertholomusAI's DeepSeek-V4.1 part of it (bertholomus).** At a glance:
 | `0034` | Hironori Uchikawa ([uchkw](https://github.com/uchkw)) (Codex-assisted) | globally quiesce and futex-park idle RDMA proxies; wake before compute |
 | `0035` | Mia's AI Lab | rank 0's rendezvous ports open before its weights load, so a worker that loads first waits |
 | `0036` | BobClawblaw, [Ash Hart](https://github.com/ashhart), [bertholomus](https://github.com/bertholomus); ported by Mia's AI Lab | structured output and required tool calls (below) |
+| `0039` | [SvangenStudios](https://github.com/SvangenStudios) | a reply grammar that cannot start fails its request (no use of the freed job) |
 
 The per-patch notes below also credit everyone who helped find or shape a specific fix along the way -- Hector's
 reviewer, Codex and Grok's live-bug diagnosis and design reviews, an outside reviewer's observation -- without
