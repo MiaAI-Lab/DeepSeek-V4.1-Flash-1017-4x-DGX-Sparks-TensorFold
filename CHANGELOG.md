@@ -1,5 +1,11 @@
 # Changelog
 
+- **2026-10-29** -- `0039` (SvangenStudios): when a request's reply grammar could not be built at admission (xgrammar
+  compile error or out of memory), `LaneHost.setup` dropped and freed the job but returned `drop`'s `true`, so both
+  callers went on with the freed job; it now returns `false`, and a grammar built before a failed `Stream.init` is
+  freed. CPU fault-injection and lifecycle tests: 24 of 24 with the patch, 12 fault paths failing without it; live on
+  this cluster with `0040`-`0043` proposed alongside: `tools/validate.py` 8 of 8 equal, structured and tool-call
+  replies unchanged. The failure path itself was not caused on the GPU.
 - **2026-10-28** -- `0036`, structured output and required tool calls
   ([#6](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/issues/6)): upstream TensorFold's
   structured output (BobClawblaw's lane-core grammar and libtfgrammar, Ash Hart's required tool calls and grammar-aware
