@@ -1,0 +1,65 @@
+diff --git a/zig/src/server/chat.zig b/zig/src/server/chat.zig
+index 2906f72..c916222 100644
+--- a/zig/src/server/chat.zig
++++ b/zig/src/server/chat.zig
+@@ -7,6 +7,7 @@ const fields_mod = @import("fields.zig");
+ const reply_text = @import("reply_text.zig");
+ const tool_stream = @import("tool_stream.zig");
+ const tool_parse = @import("tool_parse.zig");
++const output_diagnostics = @import("output_diagnostics.zig");
+ const prompt_mod = @import("prompt.zig");
+ const log = @import("log.zig");
+ const ids = @import("ids.zig");
+@@ -523,6 +524,11 @@ const Generation = struct {
+         const decode_s: f64 = if (prefilled) |p| @max(0, seconds(finished_ns - p)) else 0;
+         const decode_tokens = g.collected.items.len -| 1;
+         const runtime = try json.newObject(a);
++        if (g.tools.len > 0) if (output_diagnostics.toolWarning(content)) |warning| {
++            const code = @tagName(warning);
++            try runtime.put(a, "tool_parse_warning", .{ .string = code });
++            log.line("warning: {s} tool_parse_warning={s}", .{ g.reply_id, code });
++        };
+         try runtime.put(a, "enable_thinking", .{ .bool = thinking });
+         try runtime.put(a, "reasoning_effort", if (!thinking) .{ .string = "none" } else if (effort) |e| .{ .string = e } else .null);
+         try runtime.put(a, "engine", .{ .string = g.srv.info.name });
+diff --git a/zig/src/server/output_diagnostics.zig b/zig/src/server/output_diagnostics.zig
+new file mode 100644
+index 0000000..67bcb86
+--- /dev/null
++++ b/zig/src/server/output_diagnostics.zig
+@@ -0,0 +1,35 @@
++//! Conservative output diagnostics. A warning never repairs or reclassifies content.
++const std = @import("std");
++
++pub const ToolWarning = enum { orphan_dsml_closers };
++
++/// Recognize only a whole answer made of known closing tags and ASCII whitespace.
++/// Prose, quotes, JSON, code fences, openers and partial/unknown tags remain ordinary text.
++/// The caller limits this check to answers with active tools outside the JSON channel.
++pub fn toolWarning(answer: []const u8) ?ToolWarning {
++    const blanks = " \t\r\n";
++    const closers = [_][]const u8{
++        "</\u{ff5c}DSML\u{ff5c} parameter>",
++        "</\u{ff5c}DSML\u{ff5c} invoke>",
++        "</\u{ff5c}DSML\u{ff5c} calls>",
++        "</\u{ff5c}DSML\u{ff5c}parameter>",
++        "</\u{ff5c}DSML\u{ff5c}invoke>",
++        "</\u{ff5c}DSML\u{ff5c}tool_calls>",
++    };
++    var rest = std.mem.trim(u8, answer, blanks);
++    if (rest.len == 0) return null;
++    while (rest.len > 0) {
++        const n = for (closers) |tag| {
++            if (std.mem.startsWith(u8, rest, tag)) break tag.len;
++        } else return null;
++        rest = std.mem.trimStart(u8, rest[n..], blanks);
++    }
++    return .orphan_dsml_closers;
++}
++
++test "output diagnostic is limited to complete orphan closing tags" {
++    const close = "</\u{ff5c}DSML\u{ff5c} calls>";
++    try std.testing.expectEqual(ToolWarning.orphan_dsml_closers, toolWarning(" \n" ++ close ++ "\t" ++ close ++ "\r").?);
++    try std.testing.expectEqual(ToolWarning.orphan_dsml_closers, toolWarning("</\u{ff5c}DSML\u{ff5c}parameter></\u{ff5c}DSML\u{ff5c}invoke></\u{ff5c}DSML\u{ff5c}tool_calls>").?);
++    for ([_][]const u8{ "", " \t", "\"" ++ close ++ "\"", "```\n" ++ close ++ "\n```", "Example: " ++ close, close ++ " suffix", "{\"example\":\"" ++ close ++ "\"}", "<\u{ff5c}DSML\u{ff5c} calls>" ++ close, "</\u{ff5c}DSML\u{ff5c}  calls>", "</\u{ff5c}DSML\u{ff5c} calls" }) |text| try std.testing.expect(toolWarning(text) == null);
++}
