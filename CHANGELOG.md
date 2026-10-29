@@ -1,5 +1,10 @@
 # Changelog
 
+- **2026-10-29** -- (SvangenStudios) `scripts/prepare.sh` stops when it cannot compute a node's weight-file index
+  instead of deleting that node's weight file. The index was hashed inside the container's own `bash -c`, which the
+  script's `pipefail` does not reach, so a failed `tf-dsv41-rank-cache --index-only` (a missing or unreadable shard)
+  hashed empty output, matched no weight file, and the loop deleted the node's good one (~80 GB) before a rebuild that
+  failed the same way. Regression tests in `tests/test_scripts.py` (`PrepareWeightFiles`).
 - **2026-10-28** -- `0036`, structured output and required tool calls
   ([#6](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/issues/6)): upstream TensorFold's
   structured output (BobClawblaw's lane-core grammar and libtfgrammar, Ash Hart's required tool calls and grammar-aware
