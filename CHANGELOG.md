@@ -1,5 +1,11 @@
 # Changelog
 
+- **2026-10-29** -- [`docs/engram-zfs-dataset.md`](docs/engram-zfs-dataset.md): what an Engram host's ZFS dataset has
+to be set to, measured on one GB10 of this cluster -- `recordsize=4K`, `encryption=off`, `compression=off`,
+`primarycache=metadata` -- with the row counts behind each one. A pool's defaults (`recordsize=128K`, `zstd`) made every
+row read pull a whole compressed record: about 500 rows a second, and over 500 seconds to prefill a 16k-token prompt.
+The recipe itself is unchanged.
+
 - **2026-10-28** -- `0036`, structured output and required tool calls
   ([#6](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/issues/6)): upstream TensorFold's
   structured output (BobClawblaw's lane-core grammar and libtfgrammar, Ash Hart's required tool calls and grammar-aware
