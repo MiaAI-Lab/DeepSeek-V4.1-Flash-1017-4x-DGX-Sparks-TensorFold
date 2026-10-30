@@ -304,6 +304,11 @@ check `tools/validate.py` and replies against the default path before you rely o
 the decode kernels' known issue stands, so a difference is the Engram path's. With packing on, the workers' old copies
 of the tables (`WORKER_ENGRAM_DIR`) are no longer read and can be removed.
 
+Either path is a random-read workload on whatever holds the tables, so a ZFS host wants its own dataset for them: on a
+pool's defaults every row read pulled a whole compressed record, and a 16k-token prompt took over 500 seconds to
+prefill. [`docs/engram-zfs-dataset.md`](docs/engram-zfs-dataset.md) has the settings that were measured, and the
+self-check that says whether the reads are direct.
+
 ## How it is split across the four Sparks
 
 BertholomusAI's 2D split: each Spark is a node `g = 2p + r` of a 2 x 2 grid, its row partner `g ^ 1` and column
