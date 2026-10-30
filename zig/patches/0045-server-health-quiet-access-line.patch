@@ -1,0 +1,13 @@
+diff --git a/zig/src/server/status_routes.zig b/zig/src/server/status_routes.zig
+index 186a4e19..c59c1b20 100644
+--- a/zig/src/server/status_routes.zig
++++ b/zig/src/server/status_routes.zig
+@@ -11,6 +11,8 @@ const Allocator = std.mem.Allocator;
+ 
+ /// With keys on, health names nothing about the model.
+ pub fn health(srv: *Server, conn: *Conn, a: Allocator) !void {
++    // polled by guards and dashboards, and ungated by design: its access line is noise, and reads as an auth failure
++    conn.quiet_log = true;
+     if (srv.keys) |k| if (k.enabled()) return conn.sendJson(200, "{\"status\": \"ok\"}");
+     const o = try json.newObject(a);
+     try o.put(a, "status", .{ .string = "ok" });

@@ -47,8 +47,8 @@ DGX Sparks. Almost everything that makes it work was built by others. Its own wo
 **Every patch is Mia's AI Lab's own work, except `0008`, which is Hector's, `0026`, which is knapcio's, `0027`, which is
 Thomas Kempka's, `0028` and `0029`, upstream TensorFold fixes backported by Mauvis Ledford, `0030` and `0031`, which are
 Mauvis Ledford's, `0033`, a backport by Manuel (manuel1618), `0034`, which is Hironori Uchikawa's (uchkw,
-Codex-assisted), and `0036`, a port of upstream TensorFold's structured output (BobClawblaw, Ash Hart) and of
-BertholomusAI's DeepSeek-V4.1 part of it (bertholomus).** At a glance:
+Codex-assisted), `0036`, a port of upstream TensorFold's structured output (BobClawblaw, Ash Hart) and of
+BertholomusAI's DeepSeek-V4.1 part of it (bertholomus), and `0045`, which is Christopher A. Williamson's.** At a glance:
 
 | Patches | Author | What |
 | --- | --- | --- |
@@ -66,6 +66,7 @@ BertholomusAI's DeepSeek-V4.1 part of it (bertholomus).** At a glance:
 | `0034` | Hironori Uchikawa ([uchkw](https://github.com/uchkw)) (Codex-assisted) | globally quiesce and futex-park idle RDMA proxies; wake before compute |
 | `0035` | Mia's AI Lab | rank 0's rendezvous ports open before its weights load, so a worker that loads first waits |
 | `0036` | BobClawblaw, [Ash Hart](https://github.com/ashhart), [bertholomus](https://github.com/bertholomus); ported by Mia's AI Lab | structured output and required tool calls (below) |
+| `0045` | Christopher A. Williamson ([cawilliamson](https://github.com/cawilliamson)) | `/health`'s access line is quiet, so an ungated poll no longer reads as an auth failure (below) |
 
 The per-patch notes below also credit everyone who helped find or shape a specific fix along the way -- Hector's
 reviewer, Codex and Grok's live-bug diagnosis and design reviews, an outside reviewer's observation -- without
@@ -256,6 +257,12 @@ BertholomusAI's fork ([bertholomus/TensorFold](https://github.com/bertholomus/Te
   round reads its whole logits row instead of `0021`'s candidates; the release path keeps `0034`'s idle parking),
   the parts of other families and of the release tooling left out, and the image's build of libtfgrammar
   (`zig/Dockerfile`).
+
+Christopher A. Williamson's `0045` quietens `/health`'s access line. The route is ungated by design: a guard or a
+dashboard polls it, and it answers `{"status": "ok"}` with keys on. Every one of those polls still printed an access
+line tagged `key=unauthenticated`, which reads like an auth failure and, on this cluster's deployment, repeated 1,440
+times a day from one guard alone. The patch sets the `quiet_log` flag upstream already built for `/stats`; nothing else
+changes, and the route, its 200 and the gate's behaviour are as they were.
 
 ## Chat template
 

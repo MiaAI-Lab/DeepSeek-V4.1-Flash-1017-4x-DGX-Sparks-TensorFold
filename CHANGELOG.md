@@ -1,5 +1,14 @@
 # Changelog
 
+- **2026-10-29** -- `0045` (Christopher A. Williamson): `/health` prints no access line. The route is ungated by design
+  -- a guard or a dashboard polls it, and it answers `{"status": "ok"}` with keys on -- but every poll still printed a
+  line tagged `key=unauthenticated`, which reads like an auth failure: 1,440 of them a day from one guard's timer in
+  the deployment this was found on, and more with a dashboard beside it. The patch sets the `quiet_log` flag upstream
+  TensorFold already built for `/stats` (`http_conn.startResponse` consumes it before `log.request`), so a health reply
+  writes no access line. Nothing else changes: the route, its 200 and the gate behave as before, and a 401 on a gated
+  route is still logged. This matters only to a deployment that passes `--api-key-file`; the recipe's own `start.sh`
+  sets no key.
+
 - **2026-10-28** -- `0036`, structured output and required tool calls
   ([#6](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/issues/6)): upstream TensorFold's
   structured output (BobClawblaw's lane-core grammar and libtfgrammar, Ash Hart's required tool calls and grammar-aware
