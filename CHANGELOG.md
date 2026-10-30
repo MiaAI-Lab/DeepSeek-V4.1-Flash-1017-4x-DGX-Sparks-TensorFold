@@ -1,5 +1,15 @@
 # Changelog
 
+- **2026-10-29** -- `0044` (Christopher A. Williamson): a `GET` or `DELETE` that carries a request body has it read
+  and dropped before the route. The dispatch read no body on either method, so a body-carrying one (a scanner probe,
+  or a proxy that always sends one) left its bytes in the socket, and at the next keep-alive reuse they were glued onto
+  a real request's request line: cross-session `400 bad request syntax` replies, with the probe's bytes inside an
+  agent's error page (2026-10-08, behind an nginx that pooled its upstream connections to rank 0). A bodyless request
+  reads nothing, and a body whose framing is uncertain closes the connection instead of desyncing it. Upstream
+  TensorFold's Zig dispatch drains every non-POST body already; this pin predates that fix, so the patch can go on the
+  next engine bump. [`docs/reverse-proxy.md`](docs/reverse-proxy.md) has the proxy setup this makes safe, including the
+  keep-alive timeouts that keep a pool alive between an agent's turns.
+
 - **2026-10-28** -- `0036`, structured output and required tool calls
   ([#6](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/issues/6)): upstream TensorFold's
   structured output (BobClawblaw's lane-core grammar and libtfgrammar, Ash Hart's required tool calls and grammar-aware
