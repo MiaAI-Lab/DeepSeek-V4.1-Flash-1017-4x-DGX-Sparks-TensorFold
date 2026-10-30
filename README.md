@@ -319,6 +319,7 @@ Silent streaming requests send a heartbeat every 15 seconds, including while que
 OpenAI Chat/Responses streams use SSE comments; Anthropic Messages streams use `ping` events. Set
 `TF_SSE_KEEPALIVE_S=0` to disable, or a positive number of seconds to change the interval; `start.sh` forwards it.
 An HTTP proxy may consume backend comments, so configure and verify its own downstream heartbeats as well.
+The same proxy pools its upstream connections, so a request's leftover body must never become the next request's: patch `0044` drains a `GET` or a `DELETE` body, and [`docs/reverse-proxy.md`](docs/reverse-proxy.md) has the nginx settings, including the timeouts that keep a pool alive between an agent's turns.
 
 Patch `0029` backports BobClawblaw's fix (upstream TensorFold's `0baccf36`) for the golden test server's unread stdout
 pipe, which otherwise stalls the suite.
@@ -393,6 +394,7 @@ measurements and rationale: [`CHANGELOG.md`](CHANGELOG.md); authorship: [`CREDIT
 | `0034` | uchkw | -- (on with RDMA) | Parks idle RDMA proxies with a futex after all ranks quiesce; wakes before the next compute frame |
 | `0035` | Mia's AI Lab | `TF_DS_CONNECT_S` (300 s) | Rank 0 opens every worker's rendezvous port before loading its weights, so a worker that loads first waits there instead of exiting with `ConnectFailed` 300 s later ([#3](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/issues/3)) |
 | `0036` | BobClawblaw, Ash Hart, bertholomus (ported by Mia's AI Lab) | -- (on) | Structured output and `tool_choice` required on the DeepSeek-V4.1 engine ([above](#structured-output-and-required-tool-calls); [#6](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/issues/6))
+| `0044` | Christopher A. Williamson ([cawilliamson](https://github.com/cawilliamson)) | -- (on) | A `GET` or `DELETE` that carries a body has it read and dropped, so a kept connection cannot hand one request's bytes to the next ([above](#native-streaming-keepalives)) |
 
 ### Idle RDMA CPU use
 
