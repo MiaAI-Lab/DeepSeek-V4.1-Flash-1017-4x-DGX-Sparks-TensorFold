@@ -1,0 +1,355 @@
+{
+  "date": "2026-11-01",
+  "engine": "59402086381a42c74d53053443224eec2790b4c5",
+  "snapshot": "1bae0e1088993b9b82de08f59de5be5a34e42170",
+  "lane": "4x DGX Spark (GB10) TP4, switchless cabled ring, 16 streams, the sparkrun recipe mirroring ./start-switchless.sh",
+  "what": "0047's TF_DS_KEEP_AT_WINDOW: each prompt sent cold and then immediately warm, on three builds; plus bench-image-prefill.py's 20-picture replay on the switch-on build",
+  "validation_tool": {
+    "path": "tools/validate_keep_at_window.py",
+    "sha256": "984945e15417a34edfc1ff0709941b459cf741449d5eee15e3e9ccea5b301943"
+  },
+  "runs": [
+    {
+      "build": "0001-0036 (36 patches)",
+      "image": "tensorfold-dsv41:native-f72a456798db",
+      "tf_ds_keep_at_window": false,
+      "cases": {
+        "text 900 tokens": {
+          "prompt_tokens": 783,
+          "cold_token_sha": "bff467c2d220",
+          "warm_token_sha": "bff467c2d220",
+          "cold_warm_equal": true,
+          "cold_cached_tokens": 0,
+          "warm_cached_tokens": 0,
+          "cold_seconds": 0.737,
+          "warm_seconds": 0.719
+        },
+        "text 3000 tokens": {
+          "prompt_tokens": 2583,
+          "cold_token_sha": "5634dbcd4dc7",
+          "warm_token_sha": "5634dbcd4dc7",
+          "cold_warm_equal": true,
+          "cold_cached_tokens": 0,
+          "warm_cached_tokens": 2048,
+          "cold_seconds": 1.3,
+          "warm_seconds": 0.625
+        },
+        "text 9500 tokens": {
+          "prompt_tokens": 8156,
+          "cold_token_sha": "84322b446ad6",
+          "warm_token_sha": "84322b446ad6",
+          "cold_warm_equal": true,
+          "cold_cached_tokens": 2048,
+          "warm_cached_tokens": 6144,
+          "cold_seconds": 2.28,
+          "warm_seconds": 1.075
+        },
+        "images 20": {
+          "prompt_tokens": 18932,
+          "cold_token_sha": "ff16d6322878",
+          "warm_token_sha": "ff16d6322878",
+          "cold_warm_equal": true,
+          "cold_cached_tokens": 0,
+          "warm_cached_tokens": 18432,
+          "cold_seconds": 29.477,
+          "warm_seconds": 2.681
+        }
+      }
+    },
+    {
+      "build": "0001-0036, 0039-0043, 0046, 0047",
+      "image": "tensorfold-dsv41:native-5e0a4ca74c1e",
+      "tf_ds_keep_at_window": false,
+      "cases": {
+        "text 900 tokens": {
+          "prompt_tokens": 783,
+          "cold_token_sha": "bff467c2d220",
+          "warm_token_sha": "bff467c2d220",
+          "cold_warm_equal": true,
+          "cold_cached_tokens": 0,
+          "warm_cached_tokens": 0,
+          "cold_seconds": 0.743,
+          "warm_seconds": 0.712
+        },
+        "text 3000 tokens": {
+          "prompt_tokens": 2583,
+          "cold_token_sha": "5634dbcd4dc7",
+          "warm_token_sha": "5634dbcd4dc7",
+          "cold_warm_equal": true,
+          "cold_cached_tokens": 0,
+          "warm_cached_tokens": 2048,
+          "cold_seconds": 1.359,
+          "warm_seconds": 0.619
+        },
+        "text 9500 tokens": {
+          "prompt_tokens": 8156,
+          "cold_token_sha": "84322b446ad6",
+          "warm_token_sha": "84322b446ad6",
+          "cold_warm_equal": true,
+          "cold_cached_tokens": 2048,
+          "warm_cached_tokens": 6144,
+          "cold_seconds": 2.322,
+          "warm_seconds": 1.072
+        },
+        "images 20": {
+          "prompt_tokens": 18932,
+          "cold_token_sha": "ff16d6322878",
+          "warm_token_sha": "ff16d6322878",
+          "cold_warm_equal": true,
+          "cold_cached_tokens": 0,
+          "warm_cached_tokens": 18432,
+          "cold_seconds": 28.795,
+          "warm_seconds": 2.646
+        }
+      }
+    },
+    {
+      "build": "0001-0036, 0039-0043, 0046, 0047",
+      "image": "tensorfold-dsv41:native-5e0a4ca74c1e",
+      "tf_ds_keep_at_window": true,
+      "cases": {
+        "text 900 tokens": {
+          "prompt_tokens": 783,
+          "cold_token_sha": "bff467c2d220",
+          "warm_token_sha": "bff467c2d220",
+          "cold_warm_equal": true,
+          "cold_cached_tokens": 0,
+          "warm_cached_tokens": 640,
+          "cold_seconds": 0.794,
+          "warm_seconds": 0.508
+        },
+        "text 3000 tokens": {
+          "prompt_tokens": 2583,
+          "cold_token_sha": "5634dbcd4dc7",
+          "warm_token_sha": "5634dbcd4dc7",
+          "cold_warm_equal": true,
+          "cold_cached_tokens": 640,
+          "warm_cached_tokens": 2448,
+          "cold_seconds": 1.118,
+          "warm_seconds": 0.498
+        },
+        "text 9500 tokens": {
+          "prompt_tokens": 8156,
+          "cold_token_sha": "84322b446ad6",
+          "warm_token_sha": "84322b446ad6",
+          "cold_warm_equal": true,
+          "cold_cached_tokens": 2448,
+          "warm_cached_tokens": 8016,
+          "cold_seconds": 2.225,
+          "warm_seconds": 0.509
+        },
+        "images 20": {
+          "prompt_tokens": 18932,
+          "cold_token_sha": "ff16d6322878",
+          "warm_token_sha": "ff16d6322878",
+          "cold_warm_equal": true,
+          "cold_cached_tokens": 0,
+          "warm_cached_tokens": 18800,
+          "cold_seconds": 29.268,
+          "warm_seconds": 2.479
+        }
+      }
+    }
+  ],
+  "benchmark": {
+    "tool": "spark-arena-recipes/scripts/bench-image-prefill.py (not part of this repository)",
+    "images": {
+      "count": 20,
+      "width": 1024,
+      "height": 576,
+      "png_crc32": [
+        "4e286b88",
+        "cf12b81b",
+        "f17a89e2",
+        "1ba30f6a",
+        "93c639f1",
+        "9358ad6d",
+        "07d33338",
+        "8a1db348",
+        "5f2f4f27",
+        "fddebec6",
+        "6a395ffa",
+        "729e737e",
+        "ada1d795",
+        "addf2505",
+        "4d76730c",
+        "5f7b7937",
+        "74ff9be8",
+        "de320bc3",
+        "a3531611",
+        "d0b1829c"
+      ],
+      "payload_mb": 11.44,
+      "changed_index": 10
+    },
+    "size": "1024x576",
+    "filler_tokens": 2000,
+    "calls": [
+      {
+        "label": "cold",
+        "at": "2026-11-01T10:03:48+0100",
+        "idle_before": true,
+        "idle_wait_s": 2.01,
+        "live_connections_before": 0,
+        "contaminated": false,
+        "request": {
+          "ttft_client_s": 8.884871482849121,
+          "wall_s": 8.884984731674194,
+          "sse_chunks": 3,
+          "finish_reason": "length",
+          "usage": {
+            "prompt_tokens": 9432,
+            "completion_tokens": 1,
+            "total_tokens": 9433,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            },
+            "completion_tokens_details": {
+              "reasoning_tokens": 0
+            }
+          }
+        },
+        "server": {
+          "prompt_tokens": 9432.0,
+          "cached_tokens": 0.0,
+          "prefill_s": 8.52,
+          "prefill_requests": 1,
+          "ttft_s": 8.812
+        },
+        "wall_measured_s": 8.903
+      },
+      {
+        "label": "warm-1",
+        "at": "2026-11-01T10:04:00+0100",
+        "idle_before": true,
+        "idle_wait_s": 2.0,
+        "live_connections_before": 0,
+        "contaminated": false,
+        "request": {
+          "ttft_client_s": 0.7827198505401611,
+          "wall_s": 0.7827951908111572,
+          "sse_chunks": 3,
+          "finish_reason": "length",
+          "usage": {
+            "prompt_tokens": 9432,
+            "completion_tokens": 1,
+            "total_tokens": 9433,
+            "prompt_tokens_details": {
+              "cached_tokens": 9296
+            },
+            "completion_tokens_details": {
+              "reasoning_tokens": 0
+            }
+          }
+        },
+        "server": {
+          "prompt_tokens": 9432.0,
+          "cached_tokens": 9296.0,
+          "prefill_s": 0.436,
+          "prefill_requests": 1,
+          "ttft_s": 0.712
+        },
+        "wall_measured_s": 0.799
+      },
+      {
+        "label": "warm-2",
+        "at": "2026-11-01T10:04:03+0100",
+        "idle_before": true,
+        "idle_wait_s": 2.0,
+        "live_connections_before": 0,
+        "contaminated": false,
+        "request": {
+          "ttft_client_s": 0.801889181137085,
+          "wall_s": 0.8019568920135498,
+          "sse_chunks": 3,
+          "finish_reason": "length",
+          "usage": {
+            "prompt_tokens": 9432,
+            "completion_tokens": 1,
+            "total_tokens": 9433,
+            "prompt_tokens_details": {
+              "cached_tokens": 9296
+            },
+            "completion_tokens_details": {
+              "reasoning_tokens": 0
+            }
+          }
+        },
+        "server": {
+          "prompt_tokens": 9432.0,
+          "cached_tokens": 9296.0,
+          "prefill_s": 0.457,
+          "prefill_requests": 1,
+          "ttft_s": 0.734
+        },
+        "wall_measured_s": 0.816
+      },
+      {
+        "label": "changed-image",
+        "at": "2026-11-01T10:04:07+0100",
+        "idle_before": true,
+        "idle_wait_s": 2.01,
+        "live_connections_before": 0,
+        "contaminated": false,
+        "request": {
+          "ttft_client_s": 7.930310487747192,
+          "wall_s": 7.930397033691406,
+          "sse_chunks": 3,
+          "finish_reason": "length",
+          "usage": {
+            "prompt_tokens": 9432,
+            "completion_tokens": 1,
+            "total_tokens": 9433,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            },
+            "completion_tokens_details": {
+              "reasoning_tokens": 0
+            }
+          }
+        },
+        "server": {
+          "prompt_tokens": 9432.0,
+          "cached_tokens": 0.0,
+          "prefill_s": 7.592,
+          "prefill_requests": 1,
+          "ttft_s": 7.873
+        },
+        "wall_measured_s": 7.959
+      },
+      {
+        "label": "warm-after-control",
+        "at": "2026-11-01T10:04:18+0100",
+        "idle_before": true,
+        "idle_wait_s": 2.01,
+        "live_connections_before": 0,
+        "contaminated": false,
+        "request": {
+          "ttft_client_s": 0.8127737045288086,
+          "wall_s": 0.8128561973571777,
+          "sse_chunks": 3,
+          "finish_reason": "length",
+          "usage": {
+            "prompt_tokens": 9432,
+            "completion_tokens": 1,
+            "total_tokens": 9433,
+            "prompt_tokens_details": {
+              "cached_tokens": 9296
+            },
+            "completion_tokens_details": {
+              "reasoning_tokens": 0
+            }
+          }
+        },
+        "server": {
+          "prompt_tokens": 9432.0,
+          "cached_tokens": 9296.0,
+          "prefill_s": 0.454,
+          "prefill_requests": 1,
+          "ttft_s": 0.74
+        },
+        "wall_measured_s": 0.839
+      }
+    ]
+  }
+}

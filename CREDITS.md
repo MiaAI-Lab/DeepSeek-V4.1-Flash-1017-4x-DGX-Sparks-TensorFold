@@ -85,6 +85,7 @@ TensorFold, `0039`-`0043`, which are SvangenStudios's, and `0046`, which is shal
 | `0042` | [SvangenStudios](https://github.com/SvangenStudios) | JSON answers stay JSON beside offered tools (no tool-call parsing on the JSON channel) |
 | `0043` | [SvangenStudios](https://github.com/SvangenStudios) | a diagnostic for replies made only of orphan DSML closing tags |
 | `0046` | [shalk3](https://github.com/shalk3) | a rank's weight file read ahead of the loader (`TF_DS_LOAD_PREFETCH`) |
+| `0047` | [Thomas Kempka](https://github.com/thkempka) | a prompt's state kept at the start of its last sliding window, so a warm replay re-encodes no picture before it (`TF_DS_KEEP_AT_WINDOW`) |
 
 The per-patch notes below also credit everyone who helped find or shape a specific fix along the way -- Hector's
 reviewer, Codex and Grok's live-bug diagnosis and design reviews, an outside reviewer's observation -- without

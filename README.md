@@ -477,6 +477,7 @@ measurements and rationale: [`CHANGELOG.md`](CHANGELOG.md); authorship: [`CREDIT
 | `0042` | SvangenStudios | -- (on) | A JSON answer (`response_format`, `guided_json`) stays content when `tools` are offered; it is not parsed as tool calls |
 | `0043` | SvangenStudios | -- (on) | A reply made only of orphan DSML closing tags gets `tensorfold.tool_parse_warning` (diagnostic only; [#14](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/issues/14)) |
 | `0046` | shalk3 | `TF_DS_LOAD_PREFETCH` (on) | The weight loader's file is read ahead by 8 threads (32 MiB chunks, at most 4 GiB past the loader), so its reads come from the page cache: a node's load 83 s -> 27 s from NVMe; the weights are unchanged |
+| `0047` | [Thomas Kempka](https://github.com/thkempka) | `TF_DS_KEEP_AT_WINDOW` | A prompt's state is kept at the start of its last sliding window (128 rows, 16-row aligned) instead of the last 2048-row chunk end, so a warm replay re-prefills the window and re-encodes no picture before it; the pass stands there when it keeps the state and the window runs as its last chunk, so a warm reply is bit-identical to a cold one |
 
 ### Idle RDMA CPU use
 

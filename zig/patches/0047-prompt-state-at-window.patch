@@ -1,0 +1,98 @@
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index 3bdb159c..69e24363 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -370,6 +370,13 @@ pub const Lanes = struct {
+     next: u64 = 0,
+     snaps: std.ArrayList(*Snap) = .empty, // kept prompt states, oldest first
+     next_snap: u64 = 1,
++    // TF_DS_KEEP_AT_WINDOW=1: a prompt pass stops at the start of the prompt's last sliding window (16-row aligned, the
++    // row blocks the kernels capture) and keeps its state there, so a warm replay recomputes the window alone
++    // (128-143 rows) and re-encodes no picture before it. The pass stands at that position when the hook keeps it (the
++    // GPU done with the chunk that ends there), and the window's rows run as the pass's last chunk, anchored as a cold
++    // pass anchors them: a warm replay's rows are then bit-identical to a cold pass's. Off: a state is kept at the last
++    // full chunk end before the replay, as served (no extra chunk, no cold-pass change).
++    keep_at_window: bool = false,
+     // structured output: the prompt's last row of the last stream with a grammar prefilled (its first token may be
+     // drawn again among the grammar's tokens), and a row with the disallowed tokens at -inf
+     first_row: []f32 = &.{},
+@@ -377,7 +384,7 @@ pub const Lanes = struct {
+     masked: []f32 = &.{},
+ 
+     pub fn init(gpa: std.mem.Allocator, m: *Model) Lanes {
+-        var ln: Lanes = .{ .gpa = gpa, .m = m, .peer = if (m.world > 1) m.peer() else null };
++        var ln: Lanes = .{ .gpa = gpa, .m = m, .peer = if (m.world > 1) m.peer() else null, .keep_at_window = keepAtWindowOn() };
+         // the round costs by rows: ROUND_MS[min(rows, len) - 1] (the served table, or TF_DS_ROUND_MS)
+         const t = m.round_ms;
+         for (&ln.wc, 0..) |*c, i| c.* = .{ .width = @intCast(i + 1), .ms = t[@min(i, t.len - 1)] };
+@@ -466,6 +473,28 @@ pub const Lanes = struct {
+         return std.mem.eql(u8, std.mem.span(v), "1");
+     }
+ 
++    /// TF_DS_KEEP_AT_WINDOW=1: a prompt's state is kept at the start of its last sliding window instead of the last
++    /// full chunk end before the replay, so a warm replay re-prefills the window (128-143 rows) and re-encodes no picture
++    /// before it. Unset or any other value: off, the state at the last full chunk end, as served.
++    fn keepAtWindowOn() bool {
++        const v = std.c.getenv("TF_DS_KEEP_AT_WINDOW") orelse return false;
++        return std.mem.eql(u8, std.mem.span(v), "1");
++    }
++
++    /// The last position this prompt pass keeps a state at: the start of the prompt's last sliding window, 16-row
++    /// aligned (the row blocks the kernels capture), so the state covers every row before it; else the last full chunk
++    /// end at or before the replay, as served. Both are `<= replay` (a state may not reach into the window).
++    fn keepEnd(self: *const Lanes, len: usize, replay: usize) usize {
++        if (!self.keep_at_window) return @min(replay, len - 1) / model.chunk_rows * model.chunk_rows;
++        return if (len > self.m.cfg.window) (len - self.m.cfg.window) / 16 * 16 else 0;
++    }
++
++    /// Whether a state at `at` is one a prompt pass stands at: a full chunk end, or with TF_DS_KEEP_AT_WINDOW a 16-row
++    /// aligned window start (the only chunk ends such a pass has before its last chunk).
++    fn chunkEnd(self: *const Lanes, at: usize) bool {
++        return at % (if (self.keep_at_window) @as(usize, 16) else model.chunk_rows) == 0;
++    }
++
+     /// TF_DS_DRAFT_ROW_MS=d: A3, the shared rounds' draft rows priced at d ms each apart from the streams' rows (the
+     /// round table at the streams' count): the lane profiles of 2026-10-25 measured ~2.6-3.1 ms a draft row against
+     /// ~4.4 ms a stream's row at c1-c2. Unset or 0: the table at the round's total rows, as served.
+@@ -693,7 +722,7 @@ pub const Lanes = struct {
+         self.fills[slot] = .{
+             .start = start,
+             .replay = replay,
+-            .last_end = @min(replay, len - 1) / model.chunk_rows * model.chunk_rows,
++            .last_end = self.keepEnd(len, replay),
+             .spans = spans,
+             .rows = rows,
+         };
+@@ -740,7 +769,13 @@ pub const Lanes = struct {
+         const f = &self.fills[lane.slot].?;
+         const seq = &self.seqs[lane.slot];
+         const len = s.prompt_len;
+-        const n = @min(model.chunk_rows, len - f.start);
++        // TF_DS_KEEP_AT_WINDOW: the pass stops at the position it keeps (the start of the last sliding window), so it
++        // stands there when the hook keeps the state; the window's rows are the pass's last chunk, cut as a cold pass
++        // cuts it, which is what keeps a warm replay's rows bit-identical to a cold pass's.
++        const n = if (self.keep_at_window and f.start < f.last_end)
++            @min(model.chunk_rows, f.last_end - f.start)
++        else
++            @min(model.chunk_rows, len - f.start);
+         if (try self.begin(.fill_chunk)) {
+             try self.wire.int(gpa, u64, f.start);
+             try self.wire.int(gpa, u32, @intCast(n));
+@@ -1017,7 +1052,7 @@ pub const Lanes = struct {
+     /// prompt's replay (the rows before it ran the encoder layers alone, as a fresh pass of this prompt runs them).
+     fn usable(self: *const Lanes, sn: *const Snap, len: usize) bool {
+         if (std.mem.indexOfScalar(*Snap, self.snaps.items, @constCast(sn)) == null) return false;
+-        return !sn.stale and sn.at > 0 and sn.at < len and sn.at % model.chunk_rows == 0 and sn.at <= len -| self.m.cfg.window;
++        return !sn.stale and sn.at > 0 and sn.at < len and self.chunkEnd(sn.at) and sn.at <= len -| self.m.cfg.window;
+     }
+ 
+     /// The first extent that fits around the live streams and the kept states. Kept states give their room oldest
+@@ -1088,7 +1123,7 @@ pub const Lanes = struct {
+         const self = of(ptr);
+         const s: *const lanes.Stream = @ptrCast(@alignCast(owner orelse return error.NoStream));
+         const l = self.streams.getPtr(s) orelse return error.UnknownStream;
+-        if (at == 0 or at % model.chunk_rows != 0 or at > s.prompt_len -| self.m.cfg.window) return error.NotAChunkEnd;
++        if (at == 0 or !self.chunkEnd(at) or at > s.prompt_len -| self.m.cfg.window) return error.NotAChunkEnd;
+         const sn = try self.gpa.create(Snap);
+         errdefer self.gpa.destroy(sn);
+         sn.* = .{ .id = self.next_snap, .at = at, .base = l.base, .end = l.end, .buf = try cuda.DeviceBuffer.alloc(self.m.ctx.d, self.m.snapBytes()) };

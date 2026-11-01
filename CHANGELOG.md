@@ -1,5 +1,33 @@
 # Changelog
 
+- **2026-11-01** -- `0047` ([Thomas Kempka](https://github.com/thkempka)), opt-in with `TF_DS_KEEP_AT_WINDOW=1`: a
+  prompt's state is kept at the start of its last sliding window (`text_config.sliding_window` is 128) instead of the
+  last full 2048-row chunk end, so a warm replay re-prefills 128-143 rows and re-encodes no picture before them. A state
+  may not reach into the window, so the smallest tail is the window itself, and the gates that kept one at a chunk end
+  refused anything else: `prefillStep` only ever stopped at `min(chunk_rows, len - start)`, and the family's `usable()`
+  and `snapSaveFn` required `at % chunk_rows == 0` (the log line `keeping N tokens failed (NotAChunkEnd)`). The pass now
+  stops at `floor((prompt_len - window) / 16) * 16` (16 rows is the block the kernels capture) and keeps its state
+  there, standing at `at` when the hook runs, as `Reuse.MarkHook` requires: the chunk that ends there has run, and
+  `snapCopy` copies the live rings, so a keep taken after the final chunk would hold rows from past its own position and
+  a later prompt would compute from the earlier prompt's tail. The window's rows then run as the pass's last chunk, cut
+  at the position a cold pass cuts it, so a warm reply is bit-identical to a cold one: the rows before the keep are
+  copied, not recomputed, and the rows after it are the same rows of the same chunk. `usable()` and `snapSaveFn` accept
+  a 16-row-aligned state, both for the state a pass keeps and for one an earlier turn kept (a refused state is not a
+  miss: it is dropped and its prompt runs from 0, which is what made a chat whose history grew past its newest state
+  prefill cold). Off (the default) a pass keeps its state at the last full chunk end as before and cuts no extra chunk,
+  so cold passes and their replies are unchanged. Measured on this cluster (4x GB10 TP4, switchless ring, 16 streams,
+  `bench-image-prefill.py`, 20 pictures 1024x576 in 9432 tokens): cold 8.88 s and 8.52 s of prefill, warm 0.78-0.80 s
+  with `cached=9296` (11.4x), a replaced picture still misses (`cached=0`, 7.93 s) and the original replays at 0.81 s
+  again; before 0047 the same prompt replayed in 1.87-2.90 s with `cached=8192`. Cold replies did not move: four prompts
+  (783, 2583, 8156 tokens and the 20-picture 18932) answer with the same `token_sha` cold on `0001`-`0036`, cold with
+  0047 off, and cold with 0047 on, and with 0047 on a warm replay answers with its cold reply's `token_sha`
+  ([`tools/validate_keep_at_window.py`](tools/validate_keep_at_window.py), records in
+  [`docs/prompt-cache-window-validation-20261101.json`](docs/prompt-cache-window-validation-20261101.json); the warm
+  passes restored 640, 2448, 8016 and 18800 tokens, each the last
+  window's 16-row-aligned start, where the aligned build restored 0, 2048, 6144 and 18432). The offline light check
+  (`layer_main.zig`, `runLight`) still wants a kept prefix at a 2048-row multiple (`KeptPrefixNotChunked`), so a
+  recording made with the switch on cannot be replayed by it: it is a test tool, not a serving gate (rank 1's
+  `snap_restore` checks no alignment, and `copyExtent` needs only `at % ratio == 0` with ratios 1-2).
 - **2026-11-01** -- README notes from three issues, none of them changing a default: `TF_DS_RDMA_CPUS` and the GB10's
   core layout ([making](https://github.com/making), [#40](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/issues/40));
   what `__vm_enough_memory` in `dmesg` means ([#36](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/issues/36));
