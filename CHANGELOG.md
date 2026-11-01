@@ -1,5 +1,31 @@
 # Changelog
 
+- **2026-11-01** -- `0047`-`0050`: the head node's host memory over days, and two small engine fixes from the same
+  tree. Everything here was measured on a four-GB10 switchless ring running this recipe in production; none of it
+  changes a default, and none of it is about throughput (a build with and without these four measured the same
+  prefill and decode within noise — that is the honest result).
+  * `0047` -- `prepare()` no longer renders the whole history a second time just to compute `history_len`, and
+    `str + str` in the template evaluator resizes the arena's last block in place instead of `std.mem.concat`.
+    The two together are what turned a 500k-token agent session into a 3.4-6.6 GB anonymous block on the head:
+    the second render produced the prompt text twice into a per-request arena, and each `{% set out = out + … %}`
+    reallocated and copied the whole prefix. Long sessions now peak at 231/191/142 MB instead of GBs.
+  * `0048` -- the keep-alive connection arena is capped at 1 MiB (`retain_with_limit` instead of
+    `retain_capacity`), render scratch allocates from the template's own arena, and the tokenizer's
+    encode/decode scratch runs on a 4 KiB stack. Without these, a connection kept the arena of the largest
+    request it had ever seen, and every render/encode left its scratch in it.
+  * `0049` -- host row tables hold 8192 rows (inert at the default `chunk_rows = 2048`), and two opt-in decode
+    switches: `TF_DS_SOLO_OVERHEAD` (fixed head-window overhead instead of a live estimate; **measured -9.3 %
+    single-stream decode when set with `DRAFT_MS=25`, so it defaults off) and `TF_DS_NO_COPIES` (suffix-lookup
+    copy proposals, off = matches the Python reference).
+  * `0050` -- a refused Engram row id no longer leaks the AIO batch's buffers.
+
+  Measured on the ring, 12M-position pool + 6 GiB snapshot store + `--learn`, four nodes: `device_memory`
+  100,679,832,360 B with a peak of 100,686,517,032 B (**6.5 MB of growth since start**), head `AnonPages`
+  flat at 5.0-5.2 GB over hours, `MemAvailable` 12.0-12.4 GB, and the largest anonymous block 231 MB.
+  Before these patches the same stack reached 22.7-23.8 GB anon and died in the kernel's global OOM killer.
+  Apply order: they expect the whole upstream series (0001-0036 + 0039-0046 + 0037) already applied; `0050`
+  is independent, `0049`'s `native.zig` hunk needs the `errdefer st.lanes.deinit()` context `0034` adds.
+
 - **2026-11-01** -- README notes from three issues, none of them changing a default: `TF_DS_RDMA_CPUS` and the GB10's
   core layout ([making](https://github.com/making), [#40](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/issues/40));
   what `__vm_enough_memory` in `dmesg` means ([#36](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/issues/36));

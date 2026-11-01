@@ -1,0 +1,61 @@
+diff --git a/zig/src/core/template/template.zig b/zig/src/core/template/template.zig
+index fe64adb8..d633e8e7 100644
+--- a/zig/src/core/template/template.zig
++++ b/zig/src/core/template/template.zig
+@@ -100,7 +100,7 @@ pub fn compile(gpa: Allocator, source: []const u8, diag: ?*Diag) Error!Compiled
+ 
+ /// Renders with Hugging Face's variables: messages, tools (none when absent), documents, add_generation_prompt, then `context`.
+ pub fn render(gpa: Allocator, t: *const Compiled, messages: std.json.Value, tools: std.json.Value, context: std.json.Value, add_generation_prompt: bool, diag: ?*Diag) Error![]u8 {
+-    var arena = std.heap.ArenaAllocator.init(gpa);
++    var arena = std.heap.ArenaAllocator.init(t.arena.child_allocator);
+     defer arena.deinit();
+     const a = arena.allocator();
+     var out: std.ArrayList(u8) = .empty;
+diff --git a/zig/src/core/tokenizer/tokenizer.zig b/zig/src/core/tokenizer/tokenizer.zig
+index 176d9958..edd31245 100644
+--- a/zig/src/core/tokenizer/tokenizer.zig
++++ b/zig/src/core/tokenizer/tokenizer.zig
+@@ -114,7 +114,9 @@ pub const Tokenizer = struct {
+ 
+     /// Token ids for `text`, without post-processor tokens; invalid UTF-8 reads as U+FFFD. Caller frees with `a`.
+     pub fn encode(t: *const Tokenizer, a: Allocator, text: []const u8) Error![]u32 {
+-        var arena = std.heap.ArenaAllocator.init(a);
++        var stack: [4 * 1024]u8 = undefined;
++        var fallback = std.heap.BufferFirstAllocator.init(&stack, t.allocator);
++        var arena = std.heap.ArenaAllocator.init(fallback.allocator());
+         defer arena.deinit();
+         var ctx = steps.Context{ .a = arena.allocator(), .matcher = .{ .a = arena.allocator() } };
+         var valid = text;
+@@ -181,7 +183,9 @@ pub const Tokenizer = struct {
+ 
+     /// Text for `ids` through the decoder chain; unknown ids are skipped. Caller frees with `a`.
+     pub fn decode(t: *const Tokenizer, a: Allocator, ids: []const u32, skip_special_tokens: bool) Error![]u8 {
+-        var arena = std.heap.ArenaAllocator.init(a);
++        var stack: [4 * 1024]u8 = undefined;
++        var fallback = std.heap.BufferFirstAllocator.init(&stack, t.allocator);
++        var arena = std.heap.ArenaAllocator.init(fallback.allocator());
+         defer arena.deinit();
+         var ctx = steps.Context{ .a = arena.allocator(), .matcher = .{ .a = arena.allocator() } };
+         var tokens = try std.ArrayList([]const u8).initCapacity(ctx.a, ids.len);
+diff --git a/zig/src/server/server.zig b/zig/src/server/server.zig
+index 14445263..2d7f71ab 100644
+--- a/zig/src/server/server.zig
++++ b/zig/src/server/server.zig
+@@ -1,5 +1,8 @@
+ //! The server: one engine and tokenizer behind the HTTP routes, one thread a connection.
+ const std = @import("std");
++
++/// A kept-alive connection keeps at most this much of its request arena between requests.
++pub const connection_arena_limit: usize = 1 << 20;
+ const api = @import("engine_api");
+ const json = @import("json.zig");
+ const errors = @import("errors.zig");
+@@ -291,7 +294,7 @@ pub const Server = struct {
+         var arena: std.heap.ArenaAllocator = .init(srv.gpa);
+         defer arena.deinit();
+         while (true) {
+-            _ = arena.reset(.retain_capacity);
++            _ = arena.reset(.{ .retain_with_limit = connection_arena_limit });
+             const a = arena.allocator();
+             const outcome = conn.readRequest(a, true) catch break;
+             switch (outcome) {

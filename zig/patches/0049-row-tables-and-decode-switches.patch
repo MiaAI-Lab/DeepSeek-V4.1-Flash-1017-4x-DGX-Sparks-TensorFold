@@ -1,0 +1,136 @@
+diff --git a/zig/src/core/lanes/config.zig b/zig/src/core/lanes/config.zig
+index 5161f586..6c59979e 100644
+--- a/zig/src/core/lanes/config.zig
++++ b/zig/src/core/lanes/config.zig
+@@ -12,6 +12,8 @@ pub const default_prior = [_]f64{ 0.85, 0.75, 0.7, 0.65, 0.6, 0.55, 0.5, 0.5, 0.
+ 
+ /// What a backend reports about its loaded model: the attributes the Python engine reads at setup.
+ pub const Model = struct {
++    solo_head_overhead_ms: ?f64 = null, // fixed overhead for a lone head window; null keeps the live estimate
++    copy_proposals: bool = true, // suffix-lookup copy windows; false opts a backend out
+     exact_width: u32 = 1, // the widest window that reproduces one-token steps bit for bit
+     first_copy_rows: u32 = 0, // a lone stream's first copy window (0: the exact width)
+     gpu_tokens: bool = false, // one-token rounds may run a step ahead (pipelined)
+@@ -38,6 +40,8 @@ pub const Model = struct {
+ };
+ 
+ pub const Config = struct {
++    solo_head_overhead_ms: ?f64 = null, // fixed overhead for a lone head window; null keeps the live estimate
++    copy_proposals: bool = true, // suffix-lookup copy windows; false opts a backend out
+     family_width: u32,
+     max_copy: u32,
+     first_copy: u32,
+@@ -125,6 +129,8 @@ pub const Config = struct {
+             .shared_costs = try alloc.extendCosts(gpa, timed.items, batch_rows),
+             .lane_costs = try alloc.extendCosts(gpa, m.lane_costs, 64),
+             .mtp_step_ms = m.mtp_step_ms,
++            .solo_head_overhead_ms = m.solo_head_overhead_ms,
++            .copy_proposals = m.copy_proposals,
+         };
+     }
+ 
+diff --git a/zig/src/core/lanes/windows.zig b/zig/src/core/lanes/windows.zig
+index 940c7192..30b57140 100644
+--- a/zig/src/core/lanes/windows.zig
++++ b/zig/src/core/lanes/windows.zig
+@@ -133,9 +133,20 @@ fn headTrunk(e: *Engine, s: *Stream, p: Plan, levels: usize) !?fill.Trunk {
+ }
+ 
+ /// Copied spans backed by `enter_match` matching tokens (Python `_copy_proposal`); the proposer owns them.
++/// A backend may opt out of suffix-lookup copies; the other gates are unchanged.
++fn copyAllowed(enabled: bool, max_copy: u32, forced: usize) bool {
++    return enabled and max_copy != 0 and forced == 0;
++}
++
++/// A lone head window may cost a fixed allowance instead of the live estimate.
++fn soloHeadOverhead(fixed: ?f64, observed: f64, alone: bool, streams: usize, kind: anytype) f64 {
++    if (alone and streams == 1 and kind == .head) return fixed orelse observed;
++    return observed;
++}
++
+ pub fn copyProposal(e: *Engine, s: *Stream) ![]const u32 {
+     const p = s.proposer orelse return &.{};
+-    if (e.cfg.max_copy == 0 or s.force.items.len > 0) return &.{};
++    if (!copyAllowed(e.cfg.copy_proposals, e.cfg.max_copy, s.force.items.len)) return &.{};
+     const width: u32 = if (e.alone) (s.copy_width orelse e.cfg.first_copy) else e.cfg.first_copy;
+     const copied = p.propose(s.context.items, @min(@as(i64, width), s.draftRoom() - 1)) catch return &.{};
+     if (copied.len < 2 or p.lastMatch() < e.cfg.enter_match) return &.{};
+@@ -175,7 +186,9 @@ pub fn allocate(e: *Engine, plans: []Plan) !void {
+             pr.* = try nodeChances(e, p.stream, n);
+         }
+     }
+-    const counts = try alloc.allocateRows(a, fixed, probs, &e.cfg.shared_costs, e.rule.overheadMs(plans.len), @max(plans.len, e.cfg.batch_rows), e.rule.draft_row_ms, plans.len);
++    const kind: @TypeOf(plans[0].kind) = if (plans.len > 0) plans[0].kind else .none;
++    const overhead = soloHeadOverhead(e.cfg.solo_head_overhead_ms, e.rule.overheadMs(plans.len), e.alone, plans.len, kind);
++    const counts = try alloc.allocateRows(a, fixed, probs, &e.cfg.shared_costs, overhead, @max(plans.len, e.cfg.batch_rows), e.rule.draft_row_ms, plans.len);
+     for (plans, probs, counts) |*p, chances, c| {
+         if (p.kind == .head) {
+             p.stream.granted = c;
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index 61272f0a..936d7844 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -366,6 +366,8 @@ pub const Lanes = struct {
+     // draft ms, the other live streams at their table depth), so a round takes at most those drafts: at any number of
+     // streams (all), or with one stream live (solo: the served one-stream choice; more keep the lane core's allocation)
+     served_k: enum { off, all, solo } = .off,
++    solo_overhead: bool = false, // TF_DS_SOLO_OVERHEAD=1: a lone drafted stream's head windows cost the fixed draft allowance
++    no_copies: bool = false, // TF_DS_NO_COPIES=1: a drafted stream proposes no suffix-lookup copy windows
+     drawn: [ring]u32 = undefined,
+     next: u64 = 0,
+     snaps: std.ArrayList(*Snap) = .empty, // kept prompt states, oldest first
+@@ -445,6 +447,8 @@ pub const Lanes = struct {
+             .drafts = if (self.m.dr) |dr| @intCast(dr.n) else 1,
+             .window_costs = self.wc[0..],
+             .mtp_step_ms = draft.draft_ms,
++            .solo_head_overhead_ms = if (drafting and self.solo_overhead) draft.draft_ms else null,
++            .copy_proposals = !(drafting and self.no_copies),
+             .streams_exact = true,
+             .hidden_rows = true,
+             .batch_rows = @intCast(self.m.eng.round_rows),
+diff --git a/zig/src/families/dsv41/native.zig b/zig/src/families/dsv41/native.zig
+index 0d4cc59b..e2bd36d5 100644
+--- a/zig/src/families/dsv41/native.zig
++++ b/zig/src/families/dsv41/native.zig
+@@ -174,6 +174,8 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+     });
+     errdefer st.m.close();
+     st.lanes = lanes_mod.Lanes.init(gpa, st.m);
++    if (getenv("TF_DS_SOLO_OVERHEAD")) |v| st.lanes.solo_overhead = !std.mem.eql(u8, v, "0");
++    if (getenv("TF_DS_NO_COPIES")) |v| st.lanes.no_copies = !std.mem.eql(u8, v, "0");
+     errdefer st.lanes.deinit();
+     if (getenv("TF_DS_FIX_K")) |t| st.lanes.fix_k = std.fmt.parseInt(usize, t, 10) catch return error.BadFixK;
+     if (getenv("TF_DS_SERVED_K")) |t| st.lanes.served_k = if (std.mem.eql(u8, t, "1") or std.mem.eql(u8, t, "all")) .all else if (std.mem.eql(u8, t, "solo")) .solo else .off;
+diff --git a/zig/src/families/dsv41/prompt.zig b/zig/src/families/dsv41/prompt.zig
+index a3787257..14b62207 100644
+--- a/zig/src/families/dsv41/prompt.zig
++++ b/zig/src/families/dsv41/prompt.zig
+@@ -64,6 +64,8 @@ const pruned_rows: usize = 512;
+ pub const ring_extra = 16;
+ /// model.py's RAW: per-position compressor inputs kept (a ratio-2 group's earlier row for the next chunk).
+ pub const raw_rows = 64;
++/// The longest prompt pass the host-side row tables (vis, the compressor groups) hold.
++pub const max_pass_rows = 8192;
+ 
+ /// Device memory carved in 256-byte aligned pieces from blocks allocated as it grows, all freed together: the first
+ /// block init's size, then blocks of `block` bytes; a piece of `own` bytes or more takes a block of its own (the
+@@ -1061,7 +1063,7 @@ pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
+         const src = sh.kv_layer orelse return error.NoKvSource;
+         const n_comp_end = (start + n) / r;
+         // vis = (pos + 1) // ratio: the compressed entries row i may see (host-made: the same integers)
+-        var vis_host: [4096]i64 = undefined;
++        var vis_host: [max_pass_rows]i64 = undefined;
+         if (n > vis_host.len) return error.ChunkTooLong;
+         for (0..n) |i| vis_host[i] = @intCast((start + i + 1) / r);
+         try upload(e, ch.vis, &vis_host, n * 8);
+@@ -1186,8 +1188,8 @@ fn kvSourceUpdate(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared,
+     }
+     sh.kv_layer = li;
+     // groups first // r .. and their positions group * r (the rotations _rot reads)
+-    var g_host: [4096]i64 = undefined;
+-    var p_host: [4096]i64 = undefined;
++    var g_host: [max_pass_rows]i64 = undefined;
++    var p_host: [max_pass_rows]i64 = undefined;
+     if (full > g_host.len) return error.ChunkTooLong;
+     for (0..full) |j| {
+         g_host[j] = @intCast(start / r + j);

@@ -1,0 +1,69 @@
+diff --git a/zig/src/families/dsv41/engram_aio.zig b/zig/src/families/dsv41/engram_aio.zig
+index 970a062f..dfd87f3b 100644
+--- a/zig/src/families/dsv41/engram_aio.zig
++++ b/zig/src/families/dsv41/engram_aio.zig
+@@ -138,6 +138,7 @@ pub const Aio = struct {
+         const reads = 2 * ids.len;
+         if (reads > a.slots or reads >= 1 << 20) return error.TooManyRows;
+         if (t.row_w + block > slot or t.row_s + block > slot) return error.RowTooWide;
++        for (ids) |x| if (x < 0 or @as(u64, @intCast(x)) >= t.rows) return error.RowOutOfRange; // before the batch allocates
+         const fd_w = if (t.fd_wd >= 0) t.fd_wd else t.fd_w;
+         const fd_s = if (t.fd_sd >= 0) t.fd_sd else t.fd_s;
+         // the ring's slots [head, head + reads) must be free: reap until no live batch of the last lap holds them
+@@ -174,8 +175,7 @@ pub const Aio = struct {
+             const i = j >> 1;
+             const sc = j & 1 == 1;
+             const rb = if (sc) t.row_s else t.row_w;
+-            const row: u64 = @intCast(ids[i]);
+-            if (row >= t.rows) return error.RowOutOfRange;
++            const row: u64 = @intCast(ids[i]); // checked above
+             const off = (if (sc) t.base_s else t.base_w) + row * rb;
+             const lo = std.mem.alignBackward(u64, off, block);
+             b.skew[j] = @intCast(off - lo);
+@@ -387,3 +387,46 @@ test "AIO rows equal the pool's, across a ring that wraps" {
+     const nine: [9]i64 = @splat(0);
+     try std.testing.expectError(error.TooManyRows, aio.start(tab, &nine, &big_w, &big_s));
+ }
++
++test "a refused row id leaves the ring and its allocations as they were" {
++    const a = std.testing.allocator;
++    const io = std.testing.io;
++    var tmp = std.testing.tmpDir(.{ .iterate = true });
++    defer tmp.cleanup();
++    const rows = 40;
++    var json_buf: [256]u8 = undefined;
++    const json = try std.fmt.bufPrint(&json_buf, "{{\"layers.1.engram.embed.weight\":{{\"dtype\":\"U8\",\"shape\":[{d},100],\"data_offsets\":[0,{d}]}},\"layers.1.engram.embed.scale\":{{\"dtype\":\"U8\",\"shape\":[{d},3],\"data_offsets\":[{d},{d}]}}}}", .{ rows, rows * 100, rows, rows * 100, rows * 103 });
++    var file: std.ArrayList(u8) = .empty;
++    defer file.deinit(a);
++    var len: [8]u8 = undefined;
++    std.mem.writeInt(u64, &len, json.len, .little);
++    try file.appendSlice(a, &len);
++    try file.appendSlice(a, json);
++    for (0..rows * 103) |i| try file.append(a, @intCast((i * 7 + 3) % 251));
++    try tmp.dir.writeFile(io, .{ .sub_path = "engram.safetensors", .data = file.items });
++    const dir = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", &tmp.sub_path });
++    defer a.free(dir);
++    var t = try engram_io.Tables.open(a, io, dir);
++    defer t.close();
++    const tab = t.layers.get(1).?;
++    const aio = Aio.init(a, io, 16) catch |e| switch (e) {
++        error.AioUnavailable => return error.SkipZigTest,
++        else => return e,
++    };
++    defer aio.deinit();
++    var w: [2 * 100]u8 = undefined;
++    var sc: [2 * 3]u8 = undefined;
++    // an id past the table after a good one, and a negative id: refused before anything is allocated
++    try std.testing.expectError(error.RowOutOfRange, aio.start(tab, &.{ 3, rows }, &w, &sc));
++    try std.testing.expectError(error.RowOutOfRange, aio.start(tab, &.{-1}, w[0..100], sc[0..3]));
++    // the ring still reads: the same bytes as the pool
++    const pool = try engram_io.Pool.init(a, io, 2);
++    defer pool.deinit(a);
++    var want_w: [2 * 100]u8 = undefined;
++    var want_s: [2 * 3]u8 = undefined;
++    try pool.gather(tab, &.{ 3, rows - 1 }, &want_w, &want_s);
++    const id = try aio.start(tab, &.{ 3, rows - 1 }, &w, &sc);
++    try aio.wait(id);
++    try std.testing.expectEqualSlices(u8, &want_w, &w);
++    try std.testing.expectEqualSlices(u8, &want_s, &sc);
++}

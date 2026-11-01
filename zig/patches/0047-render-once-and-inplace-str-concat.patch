@@ -1,0 +1,53 @@
+diff --git a/zig/src/core/template/eval.zig b/zig/src/core/template/eval.zig
+index 5186d0dd..35be4164 100644
+--- a/zig/src/core/template/eval.zig
++++ b/zig/src/core/template/eval.zig
+@@ -329,6 +329,15 @@ fn binop(c: *Ctx, op: ast.BinOp, l: Value, r: Value) Error!Value {
+         const safe = l.str.safe or r.str.safe;
+         const ls = if (safe and !l.str.safe) try htmlEscape(c, l.str.s) else l.str.s;
+         const rs = if (safe and !r.str.safe) try htmlEscape(c, r.str.s) else r.str.s;
++        // Templates build their output as `set ns.out = ns.out + "..."`: plain concat copies the whole prefix
++        // every time and the arena keeps every old string, so a long conversation costs O(n^2) bytes (GBs on
++        // agent sessions). When the left string is the arena's last block, grow it in place instead.
++        const lsm = @constCast(ls);
++        if (rt.a.resize(lsm, ls.len + rs.len)) {
++            const grown = lsm.ptr[0 .. ls.len + rs.len];
++            @memcpy(grown[ls.len..], rs);
++            return .{ .str = .{ .s = grown, .safe = safe } };
++        }
+         return .{ .str = .{ .s = try std.mem.concat(rt.a, u8, &.{ ls, rs }), .safe = safe } };
+     }
+     if (op == .add and l == .list and r == .list and l.list.seq == r.list.seq and (l.list.seq == .list or l.list.seq == .tuple))
+diff --git a/zig/src/server/prompt.zig b/zig/src/server/prompt.zig
+index 46329fb4..b00504df 100644
+--- a/zig/src/server/prompt.zig
++++ b/zig/src/server/prompt.zig
+@@ -53,10 +53,25 @@ pub fn prepare(srv: *Server, cx: *Cx, input: chat.Input, thinking: bool, effort:
+     };
+     const prompt = try renderIds(srv, cx, input.messages, input.tools, thinking, effort, true);
+     if (input.images.len > 0) return spans(srv, cx, prompt, input.images); // (no kept history: the cache keys tokens)
+-    const history = try renderIds(srv, cx, input.messages, input.tools, thinking, effort, false);
++    // The history is the prompt without its last message's tail: render that one message alone and check it is the
++    // prompt's own suffix, instead of rendering the whole conversation a second time (its JSON tree conversion alone
++    // ran to GBs on long agent sessions).
+     var history_len: usize = 0;
+-    if (history.len > 0 and history.len < prompt.len and std.mem.eql(u32, prompt[0..history.len], history)) history_len = history.len;
+-    if (history_len == 0 and prompt.len > 1 and std.mem.eql(u32, history, prompt)) history_len = prompt.len - 1; // a template with no generation suffix
++    var tried_tail = false;
++    if (input.messages == .array and input.messages.array.len > 0) {
++        const items = input.messages.array;
++        const tail: Value = .{ .array = items[items.len - 1 ..] };
++        if (renderIds(srv, cx, tail, input.tools, thinking, effort, true)) |suffix| {
++            tried_tail = true;
++            if (suffix.len > 0 and suffix.len < prompt.len and std.mem.eql(u32, prompt[prompt.len - suffix.len ..], suffix))
++                history_len = prompt.len - suffix.len;
++        } else |_| {}
++    }
++    if (history_len == 0 and !tried_tail) {
++        const history = try renderIds(srv, cx, input.messages, input.tools, thinking, effort, false);
++        if (history.len > 0 and history.len < prompt.len and std.mem.eql(u32, prompt[0..history.len], history)) history_len = history.len;
++        if (history_len == 0 and prompt.len > 1 and std.mem.eql(u32, history, prompt)) history_len = prompt.len - 1; // a template with no generation suffix
++    }
+     return .{ .ids = prompt, .history_len = history_len };
+ }
+ 
