@@ -1,5 +1,10 @@
 # Changelog
 
+- **2026-11-02** -- (SvangenStudios) With `ABLIT=1`, a new `ABLIT_REVISION` makes `start.sh` run `scripts/prepare.sh`
+  again: the revision names its own `DATA_SUB` (the overlaid checkpoint view and the caches), but the prepared marker
+  held only `ablit=1`, so with the default `RANK_LOCAL=0` the launcher called the new revision's unprepared folders
+  ready and started the ranks on them. The marker now holds the overlay's revision when `ABLIT=1`; with `ABLIT=0` it
+  is unchanged, so a setup without the overlay is not prepared again.
 - **2026-11-02** -- `tools/claims/`: three scripts that check a patch's promise against a running server, written by
   Hector Isaza ([hecisaza](https://github.com/hecisaza)) with the verify step of
   [inference-agent-kit](https://github.com/hecisaza/inference-agent-kit): `0042`'s JSON answers, `0043`'s orphan DSML
