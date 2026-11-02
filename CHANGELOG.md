@@ -1,5 +1,11 @@
 # Changelog
 
+- **2026-11-02** -- `tools/claims/`: three scripts that check a patch's promise against a running server, written by
+  Hector Isaza ([hecisaza](https://github.com/hecisaza)) with the verify step of
+  [inference-agent-kit](https://github.com/hecisaza/inference-agent-kit): `0042`'s JSON answers, `0043`'s orphan DSML
+  closers, and `0044`'s GET and DELETE bodies, which exits 1 here until
+  [PR #37](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/37) lands. Exit 0: the
+  claim holds; 1: it does not; 2: the script could not judge.
 - **2026-11-01** -- README notes from three issues, none of them changing a default: `TF_DS_RDMA_CPUS` and the GB10's
   core layout ([making](https://github.com/making), [#40](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/issues/40));
   what `__vm_enough_memory` in `dmesg` means ([#36](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/issues/36));

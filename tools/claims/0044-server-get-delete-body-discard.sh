@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Written by Hector Isaza (hecisaza, https://github.com/hecisaza) with the verify step of inference-agent-kit
-# (https://github.com/hecisaza/inference-agent-kit). Apache-2.0. Unchanged below this header from
+# (https://github.com/hecisaza/inference-agent-kit). Apache-2.0. Below this header it is
 # https://github.com/hecisaza/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/blob/10c4c7c21679f920aa2780d25a0019989ff284af/claims/MiaAI-Lab-DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold-pr-37.sh
+# unchanged, except that this recipe added the connection check before the controls: a server that is down exits 2, not 1.
 # Usage: tools/claims/0044-server-get-delete-body-discard.sh API MODEL. Exit 0: the claim holds. 1: it does not. 2: the script could not judge.
 # Exits 1 on this recipe until patch 0044 lands (https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/37).
 # claim: patches: 0044 GET and DELETE request bodies are drained, so a kept connection cannot hand one request's bytes
@@ -141,6 +142,11 @@ def run(label, steps):
 
 
 GET_M = ("GET /models", req("GET", "/models"), models_ok)
+
+try:
+    socket.create_connection((host, port), timeout=60).close()
+except OSError as e:
+    print(f"CLAIM: error cannot connect to the server: {e}"); sys.exit(2)
 
 # controls: no body anywhere; if these fail the build cannot be judged on this claim
 c1, reps = run("control GET", [GET_M, GET_M])

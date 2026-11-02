@@ -324,6 +324,19 @@ BertholomusAI's fork ([bertholomus/TensorFold](https://github.com/bertholomus/Te
     `tests/test_prepare_image.py`.
 - Contributed by **Christopher A. Williamson ([cawilliamson](https://github.com/cawilliamson))**: [PR #38](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/38),
   [`docs/engram-zfs-dataset.md`](docs/engram-zfs-dataset.md), with its measurements.
+- Written by **Hector Isaza ([hecisaza](https://github.com/hecisaza))** with the verify step of
+  [inference-agent-kit](https://github.com/hecisaza/inference-agent-kit): the claim scripts in
+  [`tools/claims`](tools/claims), from
+  [hecisaza/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold](https://github.com/hecisaza/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold),
+  unchanged below the header this recipe added except where noted:
+  - `0042-json-answer-channel.sh`, for patch `0042`
+    ([`f698c2f`](https://github.com/hecisaza/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/commit/f698c2fe71b6a9920a5ff7646302265b524231e1));
+  - `0043-orphan-dsml-closer-diagnostic.sh`, for patch `0043`
+    ([`a6395a8`](https://github.com/hecisaza/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/commit/a6395a89a08d1ca6464c32bcc5f4bd9dd8ce1cb6));
+  - `0044-server-get-delete-body-discard.sh`, for patch `0044` of
+    [PR #37](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/37), not yet in this recipe
+    ([`10c4c7c`](https://github.com/hecisaza/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/commit/10c4c7c21679f920aa2780d25a0019989ff284af));
+    Mia's AI Lab added its connection check, so a server that is down exits 2, not 1.
 
 ## Tools and platform
 
