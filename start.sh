@@ -50,6 +50,34 @@ for v in THINKING DRAFTS VISION RDMA GRAPHS SIDE PREFETCH ENGRAM_AIO ENGRAM_PACK
 [[ "$ENGRAM_INSTREAM" == 0 || ( "$ENGRAM_PACKED" == 1 && "$ENGRAM_AIO" == 1 ) ]] || die "ENGRAM_INSTREAM=1 needs ENGRAM_PACKED=1 and ENGRAM_AIO=1"
 check_workers
 
+# The operator's arguments are appended to rank 0's serve line, so they win over the environment: everything that
+# compares against the launch must read the same final value the engine will — the last occurrence, in either form
+# (`--flag value`, `--flag=value`).
+EXTRA=("$@")
+argv_flag() {
+  local name=$1 out="" i=0 arg
+  while (( i < ${#EXTRA[@]} )); do
+    arg=${EXTRA[i]}
+    if [[ "$arg" == "$name" ]] && (( i + 1 < ${#EXTRA[@]} )); then
+      out=${EXTRA[i + 1]}
+    elif [[ "$arg" == "$name="* ]]; then
+      out=${arg#*=}
+    fi
+    i=$((i + 1))
+  done
+  printf '%s' "$out"
+}
+EFF_CONTEXT=$(argv_flag --context); EFF_CONTEXT=${EFF_CONTEXT:-$CONTEXT}
+EFF_PARALLEL=$(argv_flag --parallel); EFF_PARALLEL=${EFF_PARALLEL:-$PARALLEL}
+EFF_CACHE_GIB=$(argv_flag --prompt-cache-gib); EFF_CACHE_GIB=${EFF_CACHE_GIB:-$PROMPT_CACHE_GIB}
+# The engine refuses these only after loading ~75 GiB on every Spark: refuse them before any container starts.
+[[ "$EFF_CONTEXT" =~ ^[0-9]+$ ]] || die "--context $EFF_CONTEXT: a token count, or 0 for the model's window"
+(( EFF_CONTEXT <= 1048576 )) || die "--context $EFF_CONTEXT is past the model's 1,048,576-token window"
+(( EFF_CONTEXT != 0 || POOL >= 1048576 )) || die "--context 0 asks for the model's 1,048,576-token window, past the shared pool (POOL=$POOL)"
+(( EFF_CONTEXT == 0 || EFF_CONTEXT <= POOL )) || die "--context $EFF_CONTEXT is past the shared pool (POOL=$POOL): a request's positions must fit it"
+[[ "$EFF_PARALLEL" == auto || "$EFF_PARALLEL" =~ ^[0-9]+$ ]] || die "--parallel $EFF_PARALLEL: a number, or auto"
+[[ "$EFF_CACHE_GIB" =~ ^(0|[0-9]+([.][0-9]+)?)$ ]] || die "--prompt-cache-gib $EFF_CACHE_GIB: a non-negative number of GiB"
+
 B=$'\033[1m'; M=$'\033[1;35m'; G=$'\033[1;32m'; D=$'\033[2m'; R=$'\033[0m'
 [[ -t 1 ]] || { B=; M=; G=; D=; R=; }
 source ./scripts/banner.sh
@@ -215,47 +243,76 @@ log "Server answered after $((SECONDS - start))s"
 
 # ---------------------------------------------------------------- 4b. effective cache configuration
 # Read-only: the engine's own account of the shared pool, the per-request limit, the streams and the snapshot budget.
-# It makes no inference request, warms nothing and changes nothing. An old engine reports no cache group: that is
-# "unavailable" (documented), not a mismatch. A consistent report that disagrees with this launch is a hard failure;
-# CACHE_ALLOW_CONFIG_MISMATCH=1 continues with a warning instead, never silently.
+# It makes no inference request, warms nothing and changes nothing. The expected values are the ones the engine was
+# actually given (EFF_*: the environment with the operator's arguments applied), and a value the engine resolves
+# itself (`--context 0`: the model's window; `--parallel auto`: what the memory budget fits) is reported, not
+# compared. An old engine reports no cache group: that is "unavailable" (documented), not a mismatch. A consistent
+# report that disagrees with this launch is a hard failure; CACHE_ALLOW_CONFIG_MISMATCH=1 continues with a warning
+# instead, never silently. A /health that is not HTTP 200, or that carries a top-level error, fails the launch the
+# same way step 5 requires of the smoke test (the status is the last line of the body, as in step 5).
+health_raw=$(curl -s --max-time 10 -w '\n%{http_code}' "$URL/health") || health_raw=""
 cache_rc=0
-cache_meta=$(curl -sf --max-time 10 "$URL/health" | POOL="$POOL" CONTEXT="$CONTEXT" PARALLEL="$PARALLEL" PROMPT_CACHE_GIB="$PROMPT_CACHE_GIB" python3 -c '
+cache_meta=$(EXPECT_POOL="$POOL" EXPECT_CONTEXT="$EFF_CONTEXT" EXPECT_PARALLEL="$EFF_PARALLEL" EXPECT_CACHE_GIB="$EFF_CACHE_GIB" \
+  python3 -c '
 import json, os, sys
+raw = sys.stdin.read().rstrip("\n")
+body, _, code = raw.rpartition("\n")
+if not code:
+    body, code = raw, ""
+if code != "200":
+    print("health answered HTTP %s, not 200" % (code or "nothing")); sys.exit(3)
 try:
-    live = (json.load(sys.stdin).get("live") or {})
+    doc = json.loads(body)
 except Exception:
     print("health is unreadable"); sys.exit(3)
-c = live.get("cache")
+if not isinstance(doc, dict):
+    print("health is not a JSON object"); sys.exit(3)
+if doc.get("error"):
+    print("health reported an error: %s" % str(doc["error"])[:160]); sys.exit(3)
+c = (doc.get("live") or {}).get("cache")
 if not isinstance(c, dict):
     print("this engine reports none"); sys.exit(4)
 if c.get("consistent") is not True:
     print("the engine reports inconsistent accounting"); sys.exit(5)
-want_pool, want_ctx = int(os.environ["POOL"]), int(os.environ["CONTEXT"])
-want_streams, want_gib = int(os.environ["PARALLEL"]), float(os.environ["PROMPT_CACHE_GIB"])
 pool = c.get("pool") or {}
 st = c.get("prompt_state") or {}
 cap, ctx, streams = pool.get("capacity_positions"), c.get("context_limit_positions"), c.get("stream_capacity")
 budget, enabled = st.get("budget_bytes"), st.get("enabled")
-problems = []
+want_pool = int(os.environ["EXPECT_POOL"])
+raw_ctx = os.environ["EXPECT_CONTEXT"].strip()
+raw_par = os.environ["EXPECT_PARALLEL"].strip()
+want_ctx = None if raw_ctx in ("", "0") else int(raw_ctx)
+want_streams = None if raw_par.lower() in ("", "auto") else int(raw_par)
+want_gib = float(os.environ["EXPECT_CACHE_GIB"])
+problems, chosen = [], []
 if cap != want_pool: problems.append("pool %s != %s" % (cap, want_pool))
-if ctx != want_ctx: problems.append("context %s != %s" % (ctx, want_ctx))
-if streams != want_streams: problems.append("streams %s != %s" % (streams, want_streams))
-want_bytes = int(want_gib * (1 << 30))
+if want_ctx is None:
+    chosen.append("context {:,} (the model'"'"'s window)".format(ctx or 0))
+elif ctx != want_ctx:
+    problems.append("context %s != %s" % (ctx, want_ctx))
+if want_streams is None:
+    chosen.append("%s streams (what the budget fits)" % streams)
+elif streams != want_streams:
+    problems.append("streams %s != %s" % (streams, want_streams))
+want_bytes = int(round(want_gib * (1 << 30)))
 if want_gib > 0 and enabled is not True: problems.append("the prompt-state store is disabled")
 elif want_gib > 0 and budget != want_bytes: problems.append("snapshot budget %s != %s" % (budget, want_bytes))
 elif want_gib == 0 and enabled is True: problems.append("the prompt-state store is enabled, not 0 GiB")
 summary = "shared pool {:,} positions · per request {:,} · {:d} streams · snapshots {:.0f} MiB (held {:.1f} MiB, {:d} entries)".format(
     cap or 0, ctx or 0, streams or 0, (budget or 0) / 1048576, (st.get("held_bytes") or 0) / 1048576, st.get("entries") or 0)
+if chosen:
+    summary += " · " + ", ".join(chosen)
 print((summary if not problems else summary + "; MISMATCH: " + " ".join(problems)))
 sys.exit(0 if not problems else 6)
-' 2>/dev/null) || cache_rc=$?
+' <<<"$health_raw" 2>/dev/null) || cache_rc=$?
 case $cache_rc in
   0) log "Cache telemetry: $cache_meta" ;;
   4) log "Cache telemetry: unavailable ($cache_meta); showing no pool or snapshot figures" ;;
+  3) die "health check failed: $cache_meta. The engine must answer HTTP 200 with no error object before its cache account is read." ;;
   *) if [[ "${CACHE_ALLOW_CONFIG_MISMATCH:-0}" == 1 ]]; then
        warn "Cache telemetry: $cache_meta (CACHE_ALLOW_CONFIG_MISMATCH=1: continuing with an unverified configuration)"
      else
-       die "cache telemetry check failed: $cache_meta. The engine's effective configuration disagrees with POOL/CONTEXT/PARALLEL/PROMPT_CACHE_GIB (CACHE_ALLOW_CONFIG_MISMATCH=1 continues anyway)."
+       die "cache telemetry check failed: $cache_meta. The engine's effective configuration disagrees with the values this launch gave it (CACHE_ALLOW_CONFIG_MISMATCH=1 continues anyway)."
      fi ;;
 esac
 

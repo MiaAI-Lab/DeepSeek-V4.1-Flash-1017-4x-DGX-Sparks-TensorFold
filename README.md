@@ -536,11 +536,17 @@ where it was: `prompt_tokens_cached_total` over `prompt_tokens_total` of finishe
 normal; a pool invalidation means a later resume of that prefix must reprocess it; neither is a failed request.
 
 After the API answers, `start.sh` reads `/health` once (no inference request) and prints the effective pool, per-request
-limit, streams and snapshot budget. A consistent report that disagrees with `POOL`/`CONTEXT`/`PARALLEL`/
-`PROMPT_CACHE_GIB` stops the launcher; set `CACHE_ALLOW_CONFIG_MISMATCH=1` to continue with a warning instead. An
-engine without the cache group (older image) prints `Cache telemetry: unavailable` and keeps going: absence is not a
-measured zero, and nothing is fabricated to fill it in. Host memory and the old per-stream ratios are separate signals;
-do not add them to the pool figures.
+limit, streams and snapshot budget. The expected values are the ones the engine was actually given: extra arguments
+are appended to rank 0's serve line, so `./start.sh --prompt-cache-gib 1` is compared against 1 GiB, not the 0.5 GiB
+default (the last occurrence wins, `--flag value` or `--flag=value`), and a value the engine resolves itself
+(`--context 0`: the model's window, `--parallel auto`: what the memory budget fits) is reported instead of compared.
+An override the engine would refuse — a context past the model's window or past `POOL` — is refused before any
+container starts, instead of after four 75 GiB loads. A consistent report that disagrees with the launch stops it; set
+`CACHE_ALLOW_CONFIG_MISMATCH=1` to continue with a warning instead. A `/health` that is not HTTP 200, or that carries a
+top-level `error`, fails the launch — the same requirement step 5 puts on the smoke test. An engine without the cache
+group (older image) prints `Cache telemetry: unavailable` and keeps going: absence is not a measured zero, and nothing
+is fabricated to fill it in. Host memory and the old per-stream ratios are separate signals; do not add them to the
+pool figures.
 
 ## Cached-image and late-request latency
 
