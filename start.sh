@@ -43,6 +43,7 @@ for v in CONTEXT POOL PARALLEL ROUND_ROWS MAX_TOKENS; do [[ "${!v}" =~ ^[1-9][0-
 (( CONTEXT <= 1048576 )) || die "CONTEXT is at most 1048576 (the model's window), not $CONTEXT"
 (( POOL >= CONTEXT )) || die "POOL ($POOL) holds every stream's positions together: at least CONTEXT ($CONTEXT)"
 (( PARALLEL <= 16 )) || die "PARALLEL is 1 to 16, not $PARALLEL"
+[[ "$PROMPT_CACHE_GIB" =~ ^(0|[0-9]+([.][0-9]+)?)$ ]] || die "PROMPT_CACHE_GIB is a non-negative number of GiB, not $PROMPT_CACHE_GIB"
 [[ "$SERVED_K" =~ ^(solo|all|off)$ ]] || die "SERVED_K is solo, all or off, not $SERVED_K"
 for v in THINKING DRAFTS VISION RDMA GRAPHS SIDE PREFETCH ENGRAM_AIO ENGRAM_PACKED ENGRAM_OWNED ENGRAM_INSTREAM RANK_LOCAL; do [[ "${!v}" =~ ^[01]$ ]] || die "$v is 0 or 1, not ${!v}"; done
 [[ "$ENGRAM_CACHE_MIB" =~ ^[0-9]+$ ]] || die "ENGRAM_CACHE_MIB is a count of MiB, not $ENGRAM_CACHE_MIB"
@@ -170,7 +171,7 @@ LISTEN="${LINK_HEAD_ADDR[1]:-$MASTER_ADDR},${LINK_HEAD_ADDR[2]:-$MASTER_ADDR},${
 ENV0=(TF_TP_WORLD=4 "TF_TP_MASTER=$MASTER_ADDR" "TF_TP_LISTEN=$LISTEN" "TF_TP_PORT=$MASTER_PORT" "TF_DS_RANK_CACHE=$DATA/rank-cache" "TF_DS_KIT=$KIT"
       "TENSORFOLD_CUDA_KERNELS=$KIT/aot" "TF_DS_ENGRAM=$MODEL_ARG" "TF_DS_TOKEN_MAP=$DATA/dsv41_token_map.json")
 SERVE=(tensorfold-native serve "$(served_in_container)" --backend cuda --host "$HOST" --port "$PORT" --name "$SERVED_NAME"
-       --context "$CONTEXT" --parallel "$PARALLEL" --max-tokens "$MAX_TOKENS" --temperature "$TEMPERATURE" --top-p "$TOP_P" --top-k "$TOP_K")
+       --context "$CONTEXT" --parallel "$PARALLEL" --prompt-cache-gib "$PROMPT_CACHE_GIB" --max-tokens "$MAX_TOKENS" --temperature "$TEMPERATURE" --top-p "$TOP_P" --top-k "$TOP_K")
 if [[ "$THINKING" == 1 ]]; then SERVE+=(--thinking); else SERVE+=(--no-thinking); fi
 [[ -z "$REASONING_EFFORT" ]] || SERVE+=(--reasoning-effort "$REASONING_EFFORT")
 # drafts off on rank 0 as on the followers (a follower without the drafter refuses a drafted round)
@@ -212,6 +213,52 @@ done
 kill $LOGS_PID 2>/dev/null || true
 log "Server answered after $((SECONDS - start))s"
 
+# ---------------------------------------------------------------- 4b. effective cache configuration
+# Read-only: the engine's own account of the shared pool, the per-request limit, the streams and the snapshot budget.
+# It makes no inference request, warms nothing and changes nothing. An old engine reports no cache group: that is
+# "unavailable" (documented), not a mismatch. A consistent report that disagrees with this launch is a hard failure;
+# CACHE_ALLOW_CONFIG_MISMATCH=1 continues with a warning instead, never silently.
+cache_rc=0
+cache_meta=$(curl -sf --max-time 10 "$URL/health" | POOL="$POOL" CONTEXT="$CONTEXT" PARALLEL="$PARALLEL" PROMPT_CACHE_GIB="$PROMPT_CACHE_GIB" python3 -c '
+import json, os, sys
+try:
+    live = (json.load(sys.stdin).get("live") or {})
+except Exception:
+    print("health is unreadable"); sys.exit(3)
+c = live.get("cache")
+if not isinstance(c, dict):
+    print("this engine reports none"); sys.exit(4)
+if c.get("consistent") is not True:
+    print("the engine reports inconsistent accounting"); sys.exit(5)
+want_pool, want_ctx = int(os.environ["POOL"]), int(os.environ["CONTEXT"])
+want_streams, want_gib = int(os.environ["PARALLEL"]), float(os.environ["PROMPT_CACHE_GIB"])
+pool = c.get("pool") or {}
+st = c.get("prompt_state") or {}
+cap, ctx, streams = pool.get("capacity_positions"), c.get("context_limit_positions"), c.get("stream_capacity")
+budget, enabled = st.get("budget_bytes"), st.get("enabled")
+problems = []
+if cap != want_pool: problems.append("pool %s != %s" % (cap, want_pool))
+if ctx != want_ctx: problems.append("context %s != %s" % (ctx, want_ctx))
+if streams != want_streams: problems.append("streams %s != %s" % (streams, want_streams))
+want_bytes = int(want_gib * (1 << 30))
+if want_gib > 0 and enabled is not True: problems.append("the prompt-state store is disabled")
+elif want_gib > 0 and budget != want_bytes: problems.append("snapshot budget %s != %s" % (budget, want_bytes))
+elif want_gib == 0 and enabled is True: problems.append("the prompt-state store is enabled, not 0 GiB")
+summary = "shared pool {:,} positions · per request {:,} · {:d} streams · snapshots {:.0f} MiB (held {:.1f} MiB, {:d} entries)".format(
+    cap or 0, ctx or 0, streams or 0, (budget or 0) / 1048576, (st.get("held_bytes") or 0) / 1048576, st.get("entries") or 0)
+print((summary if not problems else summary + "; MISMATCH: " + " ".join(problems)))
+sys.exit(0 if not problems else 6)
+' 2>/dev/null) || cache_rc=$?
+case $cache_rc in
+  0) log "Cache telemetry: $cache_meta" ;;
+  4) log "Cache telemetry: unavailable ($cache_meta); showing no pool or snapshot figures" ;;
+  *) if [[ "${CACHE_ALLOW_CONFIG_MISMATCH:-0}" == 1 ]]; then
+       warn "Cache telemetry: $cache_meta (CACHE_ALLOW_CONFIG_MISMATCH=1: continuing with an unverified configuration)"
+     else
+       die "cache telemetry check failed: $cache_meta. The engine's effective configuration disagrees with POOL/CONTEXT/PARALLEL/PROMPT_CACHE_GIB (CACHE_ALLOW_CONFIG_MISMATCH=1 continues anyway)."
+     fi ;;
+esac
+
 # ---------------------------------------------------------------- 5. smoke test
 step 5 "Smoke test: one chat completion through all 4 ranks"
 # a pass needs HTTP 200, no error object and the assistant's reply text (curl -w adds the status as the last line)
@@ -242,6 +289,7 @@ printf '\n%s  ✔ %s is now LIVE! on port %s%s\n\n' "$G" "$SERVED_NAME" "$PORT" 
 cat <<EOF
     API      http://${IP:-<spark-address>}:$PORT/v1   (model: $SERVED_NAME)
     Window   $CONTEXT tokens · $PARALLEL at once · $MODEL_FORMAT · drafts $( [[ "$DRAFTS" == 1 ]] && echo on || echo off) · images $( [[ "$VISION" == 1 ]] && echo on || echo off)
+    Pool     $POOL shared positions · $PROMPT_CACHE_GIB GiB of prompt-state snapshots (separate from the pool)
     Logs     docker logs -f $CONTAINER_NAME$(for i in 1 2 3; do printf '   (rank %s: ssh %s docker logs -f %s)' "$i" "$(worker_host "$i")" "$CONTAINER_NAME"; done)
     Restart  $(launcher "$FABRIC_EXPECT") restart
     Stop     ./stop.sh

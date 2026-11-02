@@ -117,7 +117,7 @@ class StartURLs(unittest.TestCase):
             )
             self.assertEqual(code, 0, out)
             self.assertIn("is now LIVE", out)
-            self.assertEqual(hits, [("GET", "/v1/models"), ("POST", "/v1/chat/completions")], out)
+            self.assertEqual(hits, [("GET", "/v1/models"), ("GET", "/health"), ("POST", "/v1/chat/completions")], out)
             case.assertNoTraceback(out)
             self.assertEqual(sorted(case.launched()), ["head", "w1", "w2", "w3"], out)
             for node in ["head", "w1", "w2", "w3"]:

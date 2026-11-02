@@ -413,6 +413,7 @@ Settings come from the environment, then `scripts/local.sh`, then `./.env`, then
 | `CONTEXT` | 1048576 | a request's positions at most (the model's window) |
 | `POOL` | 2097152 | the positions all requests share |
 | `PARALLEL` | 16 | requests at once |
+| `PROMPT_CACHE_GIB` | 0.5 | the prompt-state snapshot budget in GiB (`--prompt-cache-gib`), separate from `POOL`; 0 disables the store |
 | `THINKING` | 1 | think first unless a request sends `enable_thinking: false` |
 | `REASONING_EFFORT` | max | the effort when a request names none (`low` 50, `high` 75, `max` 100) |
 | `TEMPERATURE` / `TOP_P` / `TOP_K` | 1.0 / 1.0 / 20 | the server's sampling defaults; a request's own win |
@@ -477,6 +478,7 @@ measurements and rationale: [`CHANGELOG.md`](CHANGELOG.md); authorship: [`CREDIT
 | `0042` | SvangenStudios | -- (on) | A JSON answer (`response_format`, `guided_json`) stays content when `tools` are offered; it is not parsed as tool calls |
 | `0043` | SvangenStudios | -- (on) | A reply made only of orphan DSML closing tags gets `tensorfold.tool_parse_warning` (diagnostic only; [#14](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/issues/14)) |
 | `0046` | shalk3 | `TF_DS_LOAD_PREFETCH` (on) | The weight loader's file is read ahead by 8 threads (32 MiB chunks, at most 4 GiB past the loader), so its reads come from the page cache: a node's load 83 s -> 27 s from NVMe; the weights are unchanged |
+| `0051` | Mia's AI Lab | -- (on) | `/health.live.cache` and additive `/metrics` families for the shared pool's disjoint categories and the prompt-state store's storage, evictions, refusals and classified failures; `start.sh` checks the effective values against `POOL`/`CONTEXT`/`PARALLEL`/`PROMPT_CACHE_GIB` after readiness ([below](#cache-telemetry)) |
 | `0052` | **Hector** | -- (on) | The block's own closer or opener inside a DSML parameter value (a file about DSML) no longer ends or splits the block: the call stays a call and the block's closers stay out of the reply's text, whole or streamed; any other block closes at its first closer, as before. With a template that writes DSML calls, the live streamer sends no `<tool_call>` markup as a call, so streaming clients get the parsed calls ([#14](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/issues/14)) |
 | `0053` | **Hector** | -- (on) | A `<tool_call>` block (or `<\|tool_call>`, `<x:tool_call>`) whose payload holds only the start of a DSML block, shorter than the block's opener and closer together, is handled as any tool-call block that is not a call (no call; a whole reply keeps it as text, a one-call reply drops it): the parser no longer slices past the payload's start. Every payload long enough parses as before |
 
@@ -509,6 +511,36 @@ message. `taskset -pc <tid>` on the proxy threads shows the result.
 phase) 59-67 °C with `0,10,11` against 70-81 °C unpinned, with no throughput change outside the drift from the growing
 context ([#40](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/issues/40)). Only that one
 layout was tried and this repository has not measured it, so the default stays unpinned.
+
+## Cache telemetry
+
+`POOL` is one shared pool of positions for every stream; `CONTEXT` is one request's at most; the prompt-state snapshot
+store is a separate byte budget. The engine reports all three separately under `/health.live.cache` (and additive
+families under `/metrics`), because a full pool and a healthy amount of reusable state look the same to
+`kv_cache_usage_ratio`, which only says how much of *one stream's* window that stream's tokens fill.
+
+| Field | Meaning |
+| --- | --- |
+| `pool.capacity_positions` | the allocator's effective limit (`TF_DS_WINDOW`); never multiplied by the four ranks |
+| `pool.active_reserved_positions` | live reservations, including reserved output and alignment space |
+| `pool.retained_prefix_positions` | valid kept prefixes outside those reservations |
+| `pool.retained_growth_positions` | preserved tails of kept extents: reclaimable without invalidating a prefix |
+| `pool.unclaimed_positions` | the remainder; the four categories always sum to the capacity |
+| `pool.valid_states` / `pool.invalidations_total` | valid kept states; valid -> stale transitions because a placement reused their rows (counted once) |
+| `prompt_state.{budget,held,spare}_bytes`, `entries` | the snapshot store's budget, charged storage, reusable backend storage and entries |
+| `prompt_state.{hits,misses,evictions,refusals}_total` | restores, lookup misses, budget/policy replacements, states too large to keep |
+| `prompt_state.failures_total` and `..._keep/restore/peer_forget` | every counted failure, then its stage (the legacy aggregate is unchanged; the stages sum to it) |
+
+`/metrics` carries the same numbers as `tensorfold:kv_pool_*` and `tensorfold:prompt_state_cache_*`. Token reuse stays
+where it was: `prompt_tokens_cached_total` over `prompt_tokens_total` of finished requests. A snapshot being replaced is
+normal; a pool invalidation means a later resume of that prefix must reprocess it; neither is a failed request.
+
+After the API answers, `start.sh` reads `/health` once (no inference request) and prints the effective pool, per-request
+limit, streams and snapshot budget. A consistent report that disagrees with `POOL`/`CONTEXT`/`PARALLEL`/
+`PROMPT_CACHE_GIB` stops the launcher; set `CACHE_ALLOW_CONFIG_MISMATCH=1` to continue with a warning instead. An
+engine without the cache group (older image) prints `Cache telemetry: unavailable` and keeps going: absence is not a
+measured zero, and nothing is fabricated to fill it in. Host memory and the old per-stream ratios are separate signals;
+do not add them to the pool figures.
 
 ## Cached-image and late-request latency
 

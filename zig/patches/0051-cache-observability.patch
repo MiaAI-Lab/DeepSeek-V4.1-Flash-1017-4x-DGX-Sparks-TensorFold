@@ -1,0 +1,1031 @@
+diff --git a/zig/src/core/engine_api.zig b/zig/src/core/engine_api.zig
+index 18da06a0..a6ef536e 100644
+--- a/zig/src/core/engine_api.zig
++++ b/zig/src/core/engine_api.zig
+@@ -188,6 +188,13 @@ pub const MemorySource = struct {
+     read: *const fn (ctx: ?*anyopaque, reset_peak: bool) ?Memory,
+ };
+ 
++/// The cache-observability contract (core/lanes/cache.zig), re-exported: the pool's four disjoint categories, the
++/// prompt-state store's storage and counters, the additive status group and the backend's observe hook.
++pub const CachePool = lanes.cache.Pool;
++pub const CacheStore = lanes.cache.Store;
++pub const CacheStatus = lanes.cache.Status;
++pub const Observe = lanes.cache.Observe;
++
+ pub const Status = struct {
+     /// Requests in prefill or decode, and those waiting for a lane.
+     running: u32 = 0,
+@@ -201,6 +208,8 @@ pub const Status = struct {
+     streams: usize = 0,
+     /// Generated tokens held by live streams, excluding their prompts.
+     generation_tokens: u64 = 0,
++    /// The cache account, when the engine exposes one (null: absent, not zero).
++    cache: ?CacheStatus = null,
+ };
+ 
+ pub const SubmitError = error{ Closed, Busy };
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index c7ef6942..620df216 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -41,6 +41,12 @@ pub const LaneHost = struct {
+     cache: ?*pc.Store = null, // kept prompt states (engine thread only); the backend restores and saves them
+     memory: ?api.MemorySource = null, // the backend's memory counts; null: Engine.memory reports none
+     explain: ?api.Explain = null, // the backend's words for a request it refuses; null: the error's name
++    /// The backend's cache account; null: no cache group. Published copies live under `obs` for scrapes.
++    observe: ?api.Observe = null,
++    obs_mutex: std.Io.Mutex = .init,
++    obs: ?api.CacheStatus = null,
++    obs_ns: i96 = 0, // monotonic time of the last published copy
++    cache_epoch: u64 = 1, // this engine start's opaque counter-domain identity
+     // the request at the queue's front waits for room in the backend's pool (its prompt pass refused ContextFull while
+     // other streams ran): admitted again once fewer than this many streams are active, or at full_retry (a backend
+     // may refuse for a while to keep its kept states, waiting for one stream, and then place it)
+@@ -62,6 +68,7 @@ pub const LaneHost = struct {
+     const finish_ns: i96 = 5 * std.time.ns_per_s;
+     const finish_left: i64 = 256;
+     const window_ns: i96 = 2 * std.time.ns_per_s;
++    const obs_interval_ns: i96 = 100 * std.time.ns_per_ms;
+ 
+     const Job = struct {
+         host: *LaneHost,
+@@ -116,13 +123,35 @@ pub const LaneHost = struct {
+     pub fn init(gpa: Allocator, io: std.Io, core: *lanes.Engine, info_: Info) LaneHost {
+         var enforced = info_;
+         enforced.loop_guard = true;
+-        return .{ .gpa = gpa, .io = io, .core = core, .info_ = enforced };
++        const epoch_ns = @max(0, std.Io.Clock.real.now(io).toNanoseconds());
++        return .{ .gpa = gpa, .io = io, .core = core, .info_ = enforced, .cache_epoch = @intCast(epoch_ns) };
+     }
+ 
+     pub fn start(h: *LaneHost) !void {
+         h.thread = try std.Thread.spawn(.{ .stack_size = 16 << 20 }, run, .{h});
+     }
+ 
++    /// Copies the backend's cache account at a stable mutation boundary (the engine thread owns the arrays it reads).
++    /// Forced copies happen on every allocator mutation; loop copies are rate-limited, so an idle engine's unchanged
++    /// state stays freshly observed while a long prompt pass shows its reservation.
++    pub fn publishCache(h: *LaneHost, force: bool) void {
++        const ob = h.observe orelse return;
++        const now = std.Io.Clock.awake.now(h.io).toNanoseconds();
++        if (!force and now - h.obs_ns < obs_interval_ns) return;
++        var out: api.CacheStatus = .{
++            .engine_epoch = h.cache_epoch,
++            .context_limit_positions = h.info_.context_window,
++            .stream_capacity = h.info_.lanes,
++        };
++        const ok = ob.read(ob.ctx, &out);
++        out.consistent = out.consistent and ok;
++        out.observed_unix_ns = @intCast(@max(0, std.Io.Clock.real.now(h.io).toNanoseconds()));
++        h.obs_mutex.lockUncancelable(h.io);
++        defer h.obs_mutex.unlock(h.io);
++        h.obs = out;
++        h.obs_ns = now;
++    }
++
+     /// Stops admitting, cancels what is left and joins the engine thread.
+     pub fn stop(h: *LaneHost) void {
+         h.mutex.lockUncancelable(h.io);
+@@ -205,6 +234,10 @@ pub const LaneHost = struct {
+             .streams = n,
+             .generation_tokens = h.live_generated,
+         };
++        // The cache copy is the lane thread's, never this thread's reading of the family's arrays.
++        h.obs_mutex.lockUncancelable(h.io);
++        if (h.obs) |c| out.cache = c;
++        h.obs_mutex.unlock(h.io);
+     }
+ 
+     fn memoryFn(ctx: *anyopaque, reset_peak: bool) ?Memory {
+@@ -678,6 +711,7 @@ pub const LaneHost = struct {
+             while (h.admitOne()) {}
+             h.fillOne();
+             h.noteLive();
++            h.publishCache(false);
+             h.lock();
+             if (h.closing) {
+                 const left = h.queued.items.len + h.admitted.items.len;
+diff --git a/zig/src/core/lane_host_test.zig b/zig/src/core/lane_host_test.zig
+index 061a8711..4661b7e8 100644
+--- a/zig/src/core/lane_host_test.zig
++++ b/zig/src/core/lane_host_test.zig
+@@ -213,3 +213,94 @@ test "after a long prompt pass, a stream near its max_tokens ends before the nex
+     // the first request (64 tokens: within finish_left) ended before the second's first token
+     try std.testing.expect(seq.a_done.? < seq.b_first.?);
+ }
++
++test "the cache group is a copied observation: absent without a backend, published by the engine thread, consistent to scrapes" {
++    const gpa = std.testing.allocator;
++    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
++    defer cfg.deinit(gpa);
++    var target: lanes.fake.Fake = .{ .gpa = gpa };
++    defer target.deinit();
++    var clock: lanes.fake.FixedClock = .{};
++    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
++    defer core.deinit();
++    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2, .context_window = 4096 });
++    const e = host.engine();
++    var before: api.Status = .{};
++    e.status(&before, &.{});
++    try std.testing.expect(before.cache == null); // no backend account: the group is absent, not zero
++    const Obs = struct {
++        reads: std.atomic.Value(u32) = .init(0),
++        bad: bool = false,
++        fn read(ctx: ?*anyopaque, out: *api.CacheStatus) bool {
++            const o: *@This() = @ptrCast(@alignCast(ctx.?));
++            _ = o.reads.fetchAdd(1, .monotonic);
++            out.pool = .{ .capacity_positions = 8388608, .active_reserved_positions = 10, .retained_prefix_positions = 20, .retained_growth_positions = 30, .unclaimed_positions = 8388608 - 60, .valid_states = 1, .invalidations_total = 2, .placement_blocks_total = 0 };
++            out.prompt_state = .{ .enabled = true, .budget_bytes = 1 << 29, .held_bytes = 1 << 28, .entries = 1, .failures_total = 3, .failures_keep_total = 2, .failures_restore_total = 1 };
++            return !o.bad;
++        }
++    };
++    var obs: Obs = .{};
++    host.observe = .{ .ctx = &obs, .read = Obs.read };
++    try host.start();
++    defer host.stop();
++    const Box = struct {
++        mutex: std.Io.Mutex = .init,
++        done: ?Reason = null,
++        tokens: usize = 0,
++        fn event(ctx: *anyopaque, _: Id, ev: *const Event) void {
++            const b: *@This() = @ptrCast(@alignCast(ctx));
++            b.mutex.lockUncancelable(std.testing.io);
++            defer b.mutex.unlock(std.testing.io);
++            switch (ev.*) {
++                .tokens => |t| b.tokens += t.len,
++                .finished => |f| b.done = f.reason,
++                else => {},
++            }
++        }
++        fn finished(b: *@This()) bool {
++            b.mutex.lockUncancelable(std.testing.io);
++            defer b.mutex.unlock(std.testing.io);
++            return b.done != null;
++        }
++    };
++    const Scrape = struct {
++        host: *LaneHost,
++        seen: u32 = 0,
++        fn run(s: *@This()) void {
++            for (0..500) |_| {
++                var st: api.Status = .{};
++                s.host.engine().status(&st, &.{});
++                if (st.cache) |c| {
++                    std.testing.expect(c.consistent) catch return;
++                    std.testing.expectEqual(@as(u64, 8388608), c.pool.?.capacity_positions) catch return;
++                    std.testing.expectEqual(@as(u64, 8388608 - 60), c.pool.?.unclaimed_positions) catch return;
++                    s.seen += 1;
++                }
++                std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
++            }
++        }
++    };
++    // a fake admission/completion runs on the engine thread while another thread scrapes status: no deadlock, no
++    // family traversal by the scraper, and every copy is internally consistent
++    const prompt = [_]u32{ 2, 7, 1, 8 };
++    var box: Box = .{};
++    try e.submit(1, &.{ .prompt = &prompt, .max_tokens = 4 }, .{ .ctx = &box, .event = Box.event });
++    var scrape = Scrape{ .host = &host };
++    const th = try std.Thread.spawn(.{}, Scrape.run, .{&scrape});
++    th.join();
++    try std.testing.expect(box.finished());
++    try std.testing.expect(scrape.seen > 0);
++    try std.testing.expect(obs.reads.load(.monotonic) > 0);
++    var st: api.Status = .{};
++    e.status(&st, &.{});
++    try std.testing.expectEqual(@as(u64, 4096), st.cache.?.context_limit_positions);
++    try std.testing.expectEqual(@as(u32, 2), st.cache.?.stream_capacity);
++    try std.testing.expect(st.cache.?.engine_epoch != 0);
++    try std.testing.expect(st.cache.?.observed_unix_ns != 0);
++    try std.testing.expectEqual(@as(u64, 3), st.cache.?.prompt_state.?.failures_total);
++    // an inconsistent account is copied as inconsistent, never clamped to a healthy one
++    obs.bad = true;
++    host.publishCache(true);
++    e.status(&st, &.{});
++    try std.testing.expect(!st.cache.?.consistent);
++}
+diff --git a/zig/src/core/lanes/cache.zig b/zig/src/core/lanes/cache.zig
+new file mode 100644
+index 00000000..3dd195d8
+--- /dev/null
++++ b/zig/src/core/lanes/cache.zig
+@@ -0,0 +1,197 @@
++//! The cache-observability contract: a family's shared position pool as four disjoint categories, and a prompt-state
++//! store's storage and counters. Optional everywhere. An absent group means unsupported, a disabled store says so
++//! instead of reporting healthy zeroes, and an inconsistent account is exported as such rather than clamped.
++//!
++//! The pool categories come from the allocator's own spans. They are not the per-stream `kv_cache_usage_ratio`
++//! (each stream's tokens over that stream's context window), and they are not device or host memory.
++const std = @import("std");
++
++/// A half-open position interval of the pool's compressed plane.
++pub const Iv = struct { lo: usize, hi: usize };
++
++/// A kept state's allocator span: its rows [base, base + at) and the extent end it also holds back.
++pub const KeptIv = struct { base: usize, at: usize, end: usize };
++
++/// The shared pool's disjoint category sums. capacity = active + prefix + growth + unclaimed.
++pub const Pool = struct {
++    /// The effective allocator limit (the family's pool cap), not a configured or guessed capacity.
++    capacity_positions: u64 = 0,
++    /// Union of live reservations, including reserved output and alignment space.
++    active_reserved_positions: u64 = 0,
++    /// Valid, non-stale kept prefixes, excluding the live reservations they overlap.
++    retained_prefix_positions: u64 = 0,
++    /// Preserved growth tails of kept extents, excluding both categories above: reclaimable without staling.
++    retained_growth_positions: u64 = 0,
++    /// The remainder of the pool.
++    unclaimed_positions: u64 = 0,
++    /// Valid family-level kept states (not prompt-store entries, whose several marks may share a prefix).
++    valid_states: u64 = 0,
++    /// Valid -> stale transitions because a placement reused the rows; each counted once.
++    invalidations_total: u64 = 0,
++    /// Placement attempts refused for want of a fitting extent (attempts, not unique requests); null: not counted.
++    placement_blocks_total: ?u64 = null,
++};
++
++/// A prompt-state store's storage and operation counters. `enabled` is false when the store is configured off: the
++/// group is then present and empty, distinct from a backend that cannot report one at all (an absent group).
++pub const Store = struct {
++    enabled: bool = false,
++    budget_bytes: u64 = 0,
++    held_bytes: u64 = 0,
++    spare_bytes: u64 = 0,
++    entries: u64 = 0,
++    hits_total: u64 = 0,
++    misses_total: u64 = 0,
++    evictions_total: u64 = 0,
++    refusals_total: u64 = 0,
++    /// The legacy aggregate (keep, restore and peer-forget failures together) and its classified stages.
++    failures_total: u64 = 0,
++    failures_keep_total: u64 = 0,
++    failures_restore_total: u64 = 0,
++    failures_peer_forget_total: u64 = 0,
++};
++
++/// /health.live.cache: an additive, optional group. Absent when the engine cannot account for its cache, so old
++/// engines and other backends stay valid.
++pub const Status = struct {
++    schema_version: u16 = 1,
++    /// Opaque instance identity of the counter domain: one value per engine start, never a request or a prompt.
++    engine_epoch: u64 = 0,
++    /// When this copy was produced (wall clock), so a reader can tell a fresh idle sample from a stale one.
++    observed_unix_ns: u64 = 0,
++    consistent: bool = true,
++    /// The enforced per-request limit and the concurrency limit, not independent full-context windows.
++    context_limit_positions: u64 = 0,
++    stream_capacity: u32 = 0,
++    pool: ?Pool = null,
++    prompt_state: ?Store = null,
++};
++
++/// A backend's cache account for the lane host. Called on the engine thread at stable mutation boundaries, so the copy
++/// it reads is coherent: it must not synchronize the GPU, scan the pool, or mutate anything.
++pub const Observe = struct {
++    ctx: ?*anyopaque = null,
++    /// Fills `out` with the current account; false when the accounting is inconsistent and must be exported as such.
++    read: *const fn (ctx: ?*anyopaque, out: *Status) bool,
++};
++
++fn lessIv(_: void, a: Iv, b: Iv) bool {
++    return a.lo < b.lo or (a.lo == b.lo and a.hi < b.hi);
++}
++
++/// `list` sorted and merged into `out` (touching intervals joined; empty and inverted ones dropped).
++fn mergeIvs(gpa: std.mem.Allocator, list: []Iv, out: *std.ArrayList(Iv)) !void {
++    std.mem.sort(Iv, list, {}, lessIv);
++    for (list) |iv| {
++        if (iv.hi <= iv.lo) continue;
++        if (out.items.len > 0) {
++            const last = &out.items[out.items.len - 1];
++            if (iv.lo <= last.hi) {
++                if (iv.hi > last.hi) last.hi = iv.hi;
++                continue;
++            }
++        }
++        try out.append(gpa, iv);
++    }
++}
++
++/// `src` minus `cut` (both sorted, merged) into `out`: the pieces of `src` the intervals in `cut` do not cover.
++fn subtractIvs(gpa: std.mem.Allocator, src: []const Iv, cut: []const Iv, out: *std.ArrayList(Iv)) !void {
++    var ci: usize = 0;
++    for (src) |s| {
++        var lo = s.lo;
++        const hi = s.hi;
++        while (ci < cut.len and cut[ci].hi <= lo) ci += 1;
++        var k = ci;
++        while (k < cut.len and cut[k].lo < hi) : (k += 1) {
++            if (cut[k].lo > lo) try out.append(gpa, .{ .lo = lo, .hi = cut[k].lo });
++            if (cut[k].hi > lo) lo = cut[k].hi;
++            if (lo >= hi) break;
++        }
++        if (lo < hi) try out.append(gpa, .{ .lo = lo, .hi = hi });
++    }
++}
++
++fn sumIvs(spans: []const Iv) u64 {
++    var n: u64 = 0;
++    for (spans) |iv| n += iv.hi - iv.lo;
++    return n;
++}
++
++/// The four disjoint categories from the allocator's own spans (pure): active reservations win over kept prefixes,
++/// which win over growth tails, and the rest is unclaimed. Out-of-capacity spans make it inconsistent.
++pub fn accountIvs(gpa: std.mem.Allocator, cap: usize, live: []Iv, kept: []const KeptIv, out: *Pool) !void {
++    var active: std.ArrayList(Iv) = .empty;
++    defer active.deinit(gpa);
++    var pref: std.ArrayList(Iv) = .empty;
++    defer pref.deinit(gpa);
++    var grow: std.ArrayList(Iv) = .empty;
++    defer grow.deinit(gpa);
++    var pref_kept: std.ArrayList(Iv) = .empty;
++    defer pref_kept.deinit(gpa);
++    var grow_kept: std.ArrayList(Iv) = .empty;
++    defer grow_kept.deinit(gpa);
++    var rest: std.ArrayList(Iv) = .empty;
++    defer rest.deinit(gpa);
++    for (live) |iv| if (iv.hi > cap) return error.Inconsistent;
++    for (kept) |k| if (k.base + k.at > cap) return error.Inconsistent;
++    try mergeIvs(gpa, live, &active);
++    for (kept) |k| {
++        try pref_kept.append(gpa, .{ .lo = k.base, .hi = k.base + k.at });
++        if (k.end > k.base + k.at) try grow_kept.append(gpa, .{ .lo = k.base + k.at, .hi = @min(k.end, cap) });
++    }
++    try mergeIvs(gpa, pref_kept.items, &pref);
++    try mergeIvs(gpa, grow_kept.items, &grow);
++    try subtractIvs(gpa, pref.items, active.items, &rest);
++    pref.clearRetainingCapacity();
++    try mergeIvs(gpa, rest.items, &pref);
++    rest.clearRetainingCapacity();
++    try subtractIvs(gpa, grow.items, active.items, &rest);
++    grow.clearRetainingCapacity();
++    try subtractIvs(gpa, rest.items, pref.items, &grow);
++    const a = sumIvs(active.items);
++    const p = sumIvs(pref.items);
++    const g = sumIvs(grow.items);
++    out.capacity_positions = cap;
++    out.active_reserved_positions = a;
++    out.retained_prefix_positions = p;
++    out.retained_growth_positions = g;
++    if (a + p + g > cap) return error.Inconsistent;
++    out.unclaimed_positions = cap - a - p - g;
++}
++
++/// The four categories as one assertion, for tests: they must sum to the capacity exactly.
++pub fn expectCats(out: Pool, a: u64, p: u64, g: u64, u: u64) !void {
++    try std.testing.expectEqual(a, out.active_reserved_positions);
++    try std.testing.expectEqual(p, out.retained_prefix_positions);
++    try std.testing.expectEqual(g, out.retained_growth_positions);
++    try std.testing.expectEqual(u, out.unclaimed_positions);
++    try std.testing.expectEqual(out.capacity_positions, a + p + g + u);
++}
++
++test "the pool's categories partition the allocator's spans without double counting overlapping state" {
++    const gpa = std.testing.allocator;
++    var out: Pool = .{};
++    // an empty pool is all unclaimed, not unavailable
++    try accountIvs(gpa, 1000, &.{}, &.{}, &out);
++    try expectCats(out, 0, 0, 0, 1000);
++    // a live stream resumed in place: its kept prefix is inside the reservation and counts once
++    var live = [_]Iv{.{ .lo = 0, .hi = 300 }};
++    var kept = [_]KeptIv{ .{ .base = 0, .at = 200, .end = 400 }, .{ .base = 500, .at = 100, .end = 700 } };
++    try accountIvs(gpa, 1000, &live, &kept, &out);
++    try expectCats(out, 300, 100, 200, 400);
++    // two marks of one state share a base: the prefix is counted once, its preserved tail once
++    var shared = [_]KeptIv{ .{ .base = 100, .at = 100, .end = 300 }, .{ .base = 100, .at = 50, .end = 300 } };
++    try accountIvs(gpa, 1000, &.{}, &shared, &out);
++    try expectCats(out, 0, 100, 100, 800);
++    // growth behind a live reservation belongs to the reservation, not to growth
++    var tail = [_]KeptIv{.{ .base = 200, .at = 100, .end = 600 }};
++    var over = [_]Iv{.{ .lo = 300, .hi = 500 }};
++    try accountIvs(gpa, 1000, &over, &tail, &out);
++    try expectCats(out, 200, 100, 100, 600);
++    // a state whose span runs past the allocator's limit is inconsistent, never a clamped healthy percentage
++    var beyond = [_]Iv{.{ .lo = 900, .hi = 1200 }};
++    try std.testing.expectError(error.Inconsistent, accountIvs(gpa, 1000, &beyond, &.{}, &out));
++    var past = [_]KeptIv{.{ .base = 950, .at = 100, .end = 1000 }};
++    try std.testing.expectError(error.Inconsistent, accountIvs(gpa, 1000, &.{}, &past, &out));
++}
+diff --git a/zig/src/core/lanes/lanes.zig b/zig/src/core/lanes/lanes.zig
+index 0b51fdef..1ced043e 100644
+--- a/zig/src/core/lanes/lanes.zig
++++ b/zig/src/core/lanes/lanes.zig
+@@ -21,6 +21,7 @@ pub const trail = @import("trail.zig");
+ pub const engine = @import("engine.zig");
+ pub const fake = @import("fake.zig");
+ pub const grammar = @import("grammar.zig");
++pub const cache = @import("cache.zig");
+ 
+ pub const Engine = engine.Engine;
+ pub const Config = config.Config;
+@@ -33,4 +34,5 @@ test {
+     std.testing.refAllDecls(@This());
+     _ = @import("engine_test.zig");
+     _ = @import("gpu_full_test.zig");
++    _ = @import("cache.zig");
+ }
+diff --git a/zig/src/core/prompt_cache.zig b/zig/src/core/prompt_cache.zig
+index 7ba65cc2..a36b0d46 100644
+--- a/zig/src/core/prompt_cache.zig
++++ b/zig/src/core/prompt_cache.zig
+@@ -79,7 +79,22 @@ pub const Images = struct {
+     }
+ };
+ 
+-pub const Counts = struct { hits: u64 = 0, misses: u64 = 0, kept: u64 = 0, evicted: u64 = 0, refused: u64 = 0, failed: u64 = 0 };
++pub const Counts = struct {
++    hits: u64 = 0,
++    misses: u64 = 0,
++    kept: u64 = 0,
++    evicted: u64 = 0,
++    refused: u64 = 0,
++    /// Every failure the store counts, by no particular stage: the legacy aggregate. Historical values cannot be
++    /// attributed to one stage after the fact; the three classified counters below sum to it from now on.
++    failed: u64 = 0,
++    /// A state could not be kept (allocation, backend save, keeping it).
++    failed_keep: u64 = 0,
++    /// A kept state could not be restored (the pass then prefills from 0: a correct cold fallback, not a GPU fault).
++    failed_restore: u64 = 0,
++    /// A peer could not resume a state, so it was forgotten here.
++    failed_peer_forget: u64 = 0,
++};
+ 
+ /// Where a prompt pass starts and where it stops to keep its state (marks sorted, in `a`).
+ pub const Plan = struct { from: u32 = 0, marks: []const u32 = &.{} };
+@@ -206,6 +221,7 @@ pub const Store = struct {
+     pub fn forget(s: *Store, prompt: []const u32, at: u32) void {
+         for (s.entries.items, 0..) |e, i| if (e.at == at and e.tokens.len <= prompt.len and std.mem.eql(u32, e.tokens, prompt[0..e.tokens.len])) {
+             s.counts.failed += 1;
++            s.counts.failed_peer_forget += 1;
+             return s.remove(i);
+         };
+     }
+@@ -240,6 +256,7 @@ pub const Store = struct {
+         const i = std.mem.indexOfScalar(*Entry, s.entries.items, e) orelse return;
+         if (!ok) {
+             s.counts.failed += 1;
++            s.counts.failed_restore += 1;
+             return s.remove(i);
+         }
+         s.clock += 1;
+@@ -401,11 +418,14 @@ pub const Store = struct {
+     /// One log line after a prompt pass: where it resumed, how many states it kept, and what the store holds.
+     pub fn report(s: *const Store, prompt: usize, from: u32, kept: u64) void {
+         if (@import("builtin").is_test) return;
+-        std.log.info("prompt cache: {d} tokens, resumed at {d}, kept {d}; {d} states, {d} MiB and {d} MiB spare of {d} MiB (hits {d}, misses {d}, evicted {d}, refused {d}, failed {d})", .{ prompt, from, kept, s.entries.items.len, s.held >> 20, s.spare() >> 20, s.budget >> 20, s.counts.hits, s.counts.misses, s.counts.evicted, s.counts.refused, s.counts.failed });
++        std.log.info("prompt cache: {d} tokens, resumed at {d}, kept {d}; {d} states, {d} MiB and {d} MiB spare of {d} MiB (hits {d}, misses {d}, evicted {d}, refused {d}, failed {d}: keep {d}, restore {d}, peer {d})", .{ prompt, from, kept, s.entries.items.len, s.held >> 20, s.spare() >> 20, s.budget >> 20, s.counts.hits, s.counts.misses, s.counts.evicted, s.counts.refused, s.counts.failed, s.counts.failed_keep, s.counts.failed_restore, s.counts.failed_peer_forget });
+     }
+ 
+     fn fail(s: *Store, at: u32, err: anyerror) bool {
+-        defer s.counts.failed += 1;
++        defer {
++            s.counts.failed += 1;
++            s.counts.failed_keep += 1;
++        }
+         note("keeping {d} tokens failed ({s}); a later turn prefills them", .{ at, @errorName(err) });
+         return false;
+     }
+diff --git a/zig/src/core/prompt_cache_test.zig b/zig/src/core/prompt_cache_test.zig
+index dd3561b6..3cdcead8 100644
+--- a/zig/src/core/prompt_cache_test.zig
++++ b/zig/src/core/prompt_cache_test.zig
+@@ -281,6 +281,8 @@ test "a failed copy keeps nothing and a failed restore prefills from the start"
+     _ = f.pass(&s, &t1, try s.begin(a, &t1, 4, &.{}, &.{}, null));
+     try std.testing.expectEqual(@as(usize, 0), s.entries.items.len);
+     try std.testing.expectEqual(@as(u64, 1), s.counts.failed);
++    try std.testing.expectEqual(@as(u64, 1), s.counts.failed_keep); // the legacy aggregate's stage: keeping it failed
++    try std.testing.expectEqual(@as(u64, 0), s.counts.failed_restore);
+     f.fail_save = false;
+     _ = f.pass(&s, &t1, try s.begin(a, &t1, 4, &.{}, &.{}, null));
+     try std.testing.expectEqual(@as(usize, 1), s.entries.items.len);
+@@ -289,6 +291,9 @@ test "a failed copy keeps nothing and a failed restore prefills from the start"
+     const p = try s.begin(a, &t2, 6, &.{}, &.{}, null);
+     try std.testing.expectEqual(@as(u32, 0), p.from);
+     try std.testing.expectEqual(@as(usize, 0), s.entries.items.len); // the entry that failed is gone
++    try std.testing.expectEqual(@as(u64, 2), s.counts.failed);
++    try std.testing.expectEqual(@as(u64, 1), s.counts.failed_restore);
++    try std.testing.expectEqual(@as(u64, 1), s.counts.failed_keep);
+     try std.testing.expectEqual(fresh(&t2), f.pass(&s, &t2, p));
+ }
+ 
+@@ -425,6 +430,8 @@ test "a state a peer cannot resume is forgotten: the next prompt misses instead
+     try std.testing.expectEqual(@as(u32, 4), plan.from);
+     s.forget(&t2, plan.from); // the peer's answer: it lacks that state
+     try std.testing.expectEqual(@as(u64, 1), s.counts.failed);
++    try std.testing.expectEqual(@as(u64, 1), s.counts.failed_peer_forget);
++    try std.testing.expectEqual(@as(u64, 0), s.counts.failed_keep + s.counts.failed_restore);
+     try std.testing.expectEqual(@as(?*pc.Entry, null), s.find(&t2, &.{}));
+     try std.testing.expectEqual(s.entries.items.len, f.live);
+ }
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index 3bdb159c..f9cb9484 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -26,6 +26,7 @@ const link = @import("link.zig");
+ const cuda = @import("cuda");
+ 
+ const be = lanes.backend;
++const cache = lanes.cache;
+ const Model = model.Model;
+ const max_streams = model.max_streams;
+ const max_rows = round.max_rows;
+@@ -201,6 +202,9 @@ test "a copy that fills the pool leaves no room for another request of its size"
+     try std.testing.expect(try roomAfter(gpa, used[0..2], b2, 4 * c, 16 * c));
+ }
+ 
++/// Where a mutation publishes a copied account of the pool (the native host's lane thread); null: nowhere.
++pub const Mutate = struct { ctx: ?*anyopaque = null, publish: *const fn (?*anyopaque) void };
++
+ pub fn place(used: []const [2]usize, size: usize, cap: usize) ?usize {
+     var base: usize = 0;
+     while (base + size <= cap) {
+@@ -370,6 +374,10 @@ pub const Lanes = struct {
+     next: u64 = 0,
+     snaps: std.ArrayList(*Snap) = .empty, // kept prompt states, oldest first
+     next_snap: u64 = 1,
++    // the pool's account, published at allocator mutations (never from an HTTP thread)
++    invalidations: u64 = 0, // valid -> stale transitions (each counted once)
++    placement_blocks: u64 = 0, // placement attempts refused for want of a fitting extent
++    mutate: ?Mutate = null,
+     // structured output: the prompt's last row of the last stream with a grammar prefilled (its first token may be
+     // drawn again among the grammar's tokens), and a row with the disallowed tokens at -inf
+     first_row: []f32 = &.{},
+@@ -628,6 +636,7 @@ pub const Lanes = struct {
+         self.staleOver(if (kept != null and !moved) base + kept.?.at else base, base + size, kept);
+         try self.streams.put(gpa, s, .{ .slot = slot, .base = base, .end = base + size });
+         self.used[slot] = true;
++        self.mutated(); // the reservation is visible now, not only when a long pass ends
+         errdefer {
+             _ = self.streams.remove(s);
+             self.used[slot] = false;
+@@ -1046,14 +1055,14 @@ pub const Lanes = struct {
+             };
+             const got = try placeSoft(gpa, live, kept.items, size, self.m.pool_cap);
+             if (held and self.patient(source.?)) {
+-                const b = got orelse return error.ContextFull;
+-                return if (try roomAfter(gpa, rows.items, b, size, self.m.pool_cap)) b else error.ContextFull;
++                const b = got orelse return self.noRoom();
++                return if (try roomAfter(gpa, rows.items, b, size, self.m.pool_cap)) b else self.noRoom();
+             }
+             if (got) |b| return b;
+             const victim = for (self.snaps.items) |sn| {
+                 if (!sn.stale and sn != source and !clashes(live, sn.base, sn.base + sn.at)) break sn;
+-            } else if (source) |sn| (if (!sn.stale and !clashes(live, sn.base, sn.base + sn.at)) sn else return error.ContextFull) else return error.ContextFull;
+-            victim.stale = true;
++            } else if (source) |sn| (if (!sn.stale and !clashes(live, sn.base, sn.base + sn.at)) sn else return self.noRoom()) else return self.noRoom();
++            self.markStale(victim);
+         }
+     }
+ 
+@@ -1073,8 +1082,54 @@ pub const Lanes = struct {
+     /// Kept states with rows in [lo, hi) go stale (a stream writes there), `except` aside.
+     fn staleOver(self: *Lanes, lo: usize, hi: usize, except: ?*Snap) void {
+         for (self.snaps.items) |sn| if (sn != except and sn.base < hi and lo < sn.base + sn.at) {
+-            sn.stale = true;
++            self.markStale(sn);
+         };
++        self.mutated();
++    }
++
++    /// A valid state becomes stale (its rows are reused): the transition is counted once, never per retry or scrape.
++    fn markStale(self: *Lanes, sn: *Snap) void {
++        if (sn.stale) return;
++        sn.stale = true;
++        self.invalidations += 1;
++    }
++
++    /// A placement refused for want of a fitting extent: an attempt, not a request, and not a stale transition.
++    fn noRoom(self: *Lanes) error{ContextFull} {
++        self.placement_blocks += 1;
++        return error.ContextFull;
++    }
++
++    /// A copied account of the shared pool from the allocator's own spans: CPU metadata only, no device read, no
++    /// pool-capacity scan. Called on the engine thread, so the arrays it reads are the ones it owns.
++    pub fn accountPool(self: *const Lanes, out: *cache.Pool) bool {
++        const gpa = self.gpa;
++        var live: std.ArrayList(cache.Iv) = .empty;
++        defer live.deinit(gpa);
++        var kept: std.ArrayList(cache.KeptIv) = .empty;
++        defer kept.deinit(gpa);
++        var valid: u64 = 0;
++        var it = self.streams.valueIterator();
++        while (it.next()) |l| {
++            if (l.base > l.end) return false;
++            live.append(gpa, .{ .lo = l.base, .hi = l.end }) catch return false;
++        }
++        for (self.snaps.items) |sn| {
++            if (sn.stale) continue; // its rows are no one's to restore
++            valid += 1;
++            kept.append(gpa, .{ .base = sn.base, .at = sn.at, .end = sn.end }) catch return false;
++        }
++        out.* = .{ .valid_states = valid, .invalidations_total = self.invalidations, .placement_blocks_total = self.placement_blocks };
++        cache.accountIvs(gpa, self.m.pool_cap, live.items, kept.items, out) catch return false;
++        return true;
++    }
++
++    pub fn accountPoolFn(ptr: *anyopaque, out: *cache.Pool) bool {
++        return of(ptr).accountPool(out);
++    }
++
++    fn mutated(self: *Lanes) void {
++        if (self.mutate) |m| m.publish(m.ctx);
+     }
+ 
+     /// The prompt cache's Snapshots functions (native.zig hands them to the CUDA host).
+@@ -1095,6 +1150,7 @@ pub const Lanes = struct {
+         errdefer sn.buf.free();
+         try self.snaps.append(self.gpa, sn);
+         self.next_snap += 1;
++        self.mutated();
+         if (try self.begin(.snap_save)) {
+             try self.wire.int(self.gpa, u64, sn.id);
+             try self.wire.int(self.gpa, u32, @intCast(l.slot));
+@@ -1119,6 +1175,7 @@ pub const Lanes = struct {
+         }
+         sn.buf.free();
+         self.gpa.destroy(sn);
++        self.mutated();
+     }
+ 
+     fn releaseFn(ptr: *anyopaque, s: *lanes.Stream) void {
+@@ -1137,6 +1194,7 @@ pub const Lanes = struct {
+             if (self.filling_slot == slot) self.filling_slot = null;
+             self.used[slot] = false;
+         }
++        self.mutated();
+         self.idleRdma() catch |err| std.debug.panic("RDMA idle transition failed: {s}", .{@errorName(err)});
+     }
+ };
+@@ -1151,12 +1209,16 @@ fn usesRdma(kind: Kind) bool {
+     };
+ }
+ 
+-fn hasRdma(m: *const Model) bool { return m.ring != null or m.rdma_rings != null; }
++fn hasRdma(m: *const Model) bool {
++    return m.ring != null or m.rdma_rings != null;
++}
+ 
+ fn setRdmaIdle(m: *Model, idle: bool) void {
+-    if (m.ring) |r| { if (idle) r.park() else r.wake(); }
++    if (m.ring) |r| {
++        if (idle) r.park() else r.wake();
++    }
+     if (m.rdma_rings) |rs| {
+-        for ([_]*@import("rdma.zig").Ring{rs.all4, rs.col, rs.pair}) |r| {
++        for ([_]*@import("rdma.zig").Ring{ rs.all4, rs.col, rs.pair }) |r| {
+             if (idle) r.park() else r.wake();
+         }
+     }
+@@ -1520,3 +1582,27 @@ test "a window's masks are none or every row's bits" {
+     with.masks = bits[0 .. 2 * words];
+     try std.testing.expect(!masksFit(with, words));
+ }
++
++test "a valid-to-stale transition is counted once, however often placement retries inspect it" {
++    const gpa = std.testing.allocator;
++    var ln: Lanes = .{ .gpa = gpa, .m = undefined, .peer = null, .rdma_idle = true };
++    const a = try gpa.create(Snap);
++    a.* = .{ .id = 1, .at = 10, .base = 0, .buf = undefined, .end = 20 };
++    const b = try gpa.create(Snap);
++    b.* = .{ .id = 2, .at = 5, .base = 0, .buf = undefined, .end = 5 };
++    try ln.snaps.append(gpa, a);
++    try ln.snaps.append(gpa, b);
++    ln.markStale(a);
++    ln.markStale(a); // the same placement retried, or a scrape: no second state was lost
++    try std.testing.expectEqual(@as(u64, 1), ln.invalidations);
++    ln.staleOver(0, 5, null); // b's rows are reused: one more transition, a already stale
++    try std.testing.expectEqual(@as(u64, 2), ln.invalidations);
++    ln.noRoom() catch {};
++    ln.noRoom() catch {};
++    try std.testing.expectEqual(@as(u64, 2), ln.placement_blocks);
++    try std.testing.expectEqual(@as(u64, 2), ln.invalidations); // a refusal is not an invalidation
++    ln.snaps.clearRetainingCapacity();
++    ln.snaps.deinit(gpa);
++    gpa.destroy(a);
++    gpa.destroy(b);
++}
+diff --git a/zig/src/families/dsv41/native.zig b/zig/src/families/dsv41/native.zig
+index b88ae94e..21df7ad3 100644
+--- a/zig/src/families/dsv41/native.zig
++++ b/zig/src/families/dsv41/native.zig
+@@ -71,6 +71,10 @@ pub const Loaded = struct {
+     lone: ?LoneRun = null,
+     /// Kept prompt states for the host's prompt cache (core/prompt_cache Snapshots: `ptr` and its functions).
+     snaps: ?Snaps = null,
++    /// A copied account of the shared position pool (the host's /health.live.cache pool group), CPU metadata only.
++    observe: ?*const fn (*anyopaque, *lanes.cache.Pool) bool = null,
++    /// Where the family publishes that account at allocator mutations; the host passes its own publish hook.
++    attach: ?*const fn (*anyopaque, ?*const fn (?*anyopaque) void, ?*anyopaque) void = null,
+     /// Images in requests (the server renders their placeholders; the tower runs on this rank).
+     vision: ?lanes.stream.Vision = null,
+ };
+@@ -175,7 +179,18 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+     const L = lanes_mod.Lanes;
+     const snaps: Snaps = .{ .ptr = &st.lanes, .bytes = L.snapBytesFn, .save = L.snapSaveFn, .restore = L.snapRestoreFn, .drop = L.snapDropFn };
+     try st.lanes.idleRdma(); // park even before the first API request
+-    return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .vision = if (st.vision) |v| v.hook() else null };
++    return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .observe = observePoolFn, .attach = attachPoolFn, .vision = if (st.vision) |v| v.hook() else null };
++}
++
++/// The family's pool account, in the shared cache contract (the interval math is core/lanes/cache.zig).
++fn observePoolFn(ctx: *anyopaque, out: *lanes.cache.Pool) bool {
++    const st: *State = @ptrCast(@alignCast(ctx));
++    return st.lanes.accountPool(out);
++}
++
++fn attachPoolFn(ctx: *anyopaque, publish: ?*const fn (?*anyopaque) void, host: ?*anyopaque) void {
++    const st: *State = @ptrCast(@alignCast(ctx));
++    st.lanes.mutate = if (publish) |p| .{ .ctx = host, .publish = p } else null;
+ }
+ 
+ fn deinitFn(ptr: *anyopaque) void {
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index 17a3ed79..450e1d5e 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -133,6 +133,42 @@ fn readMemory(_: ?*anyopaque, reset_peak: bool) ?api.Memory {
+     return .{ .active = u.device, .cache = 0, .peak = u.peak };
+ }
+ 
++/// The family's pool account and the prompt-state store's counts, as one coherent copy for the engine thread.
++fn readCache(ptr: ?*anyopaque, out: *api.CacheStatus) bool {
++    const h: *Host = @ptrCast(@alignCast(ptr orelse return false));
++    var ok = true;
++    if (h.pool_observe) |f| {
++        var account: api.CachePool = .{};
++        const good = f(h.family, &account);
++        out.pool = account;
++        ok = ok and good;
++    }
++    if (h.cache) |*store| {
++        out.prompt_state = .{
++            .enabled = true,
++            .budget_bytes = store.budget,
++            .held_bytes = store.held,
++            .spare_bytes = store.spare(),
++            .entries = store.entries.items.len,
++            .hits_total = store.counts.hits,
++            .misses_total = store.counts.misses,
++            .evictions_total = store.counts.evicted,
++            .refusals_total = store.counts.refused,
++            .failures_total = store.counts.failed,
++            .failures_keep_total = store.counts.failed_keep,
++            .failures_restore_total = store.counts.failed_restore,
++            .failures_peer_forget_total = store.counts.failed_peer_forget,
++        };
++    } else out.prompt_state = .{ .enabled = false };
++    return ok;
++}
++
++/// The family's publish hook: a copied account at an allocator mutation, on the engine thread.
++fn publishCache(p: ?*anyopaque) void {
++    const x: *Host = @ptrCast(@alignCast(p orelse return));
++    x.host.publishCache(true);
++}
++
+ /// A lone driver returns false at completion or true when yield hands it to the lane core.
+ const LoneRun = *const fn (ctx: *anyopaque, s: *lanes.Stream, hooks: *anyopaque, committed: *const fn (*anyopaque) void, yield: *const fn (*anyopaque) bool) anyerror!bool;
+ 
+@@ -157,6 +193,8 @@ const Host = struct {
+     lone: ?LoneRun = null, // the family's driver for a lone drafted stream, called with `family`
+     cache: ?api.prompt_cache.Store = null, // kept prompt states, when the family keeps them
+     snap_vt: api.prompt_cache.Snapshots.VTable = undefined,
++    pool_observe: ?*const fn (*anyopaque, *api.CachePool) bool = null, // the family's pool account (null: none)
++    pool_attach: ?*const fn (*anyopaque, ?*const fn (?*anyopaque) void, ?*anyopaque) void = null,
+ 
+     fn close(p: *anyopaque) void {
+         const h: *Host = @ptrCast(@alignCast(p));
+@@ -195,6 +233,8 @@ const Host = struct {
+         h.host.memory = if (h.gpu != null) .{ .read = readMemory } else null;
+         h.host.explain = explain;
+         if (h.cache) |*store| h.host.cache = store;
++        if (h.pool_observe != null) h.host.observe = .{ .ctx = h, .read = readCache };
++        if (h.pool_attach) |f| f(h.family, publishCache, h); // before the lane thread starts mutating
+         if (h.lone != null) h.host.lone = .{ .ctx = h, .run = loneRun, .sampled = true };
+         try h.host.start();
+     }
+@@ -381,6 +421,8 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+     const h = try gpa.create(Host);
+     errdefer gpa.destroy(h);
+     h.* = .{ .gpa = gpa, .gpu = g, .family = loaded.ctx, .release = loaded.deinit, .inner = loaded.backend, .vtable = undefined, .cfg = undefined, .clock = undefined, .core = undefined, .host = undefined, .lone = loaded.lone };
++    if (@hasField(@TypeOf(loaded), "observe")) h.pool_observe = loaded.observe;
++    if (@hasField(@TypeOf(loaded), "attach")) h.pool_attach = loaded.attach;
+     h.startup = try std.fmt.allocPrint(gpa, "CUDA sm_{d} device {d} ({s}{s}): model {d:.2} GiB; {d} stream{s} at once, {d:.2} GiB each at a {d}-token window, of {d:.1} GiB left after a {d:.1} GiB reserve; prompts in {d}-row chunks{s}", .{
+         capability, device, name, if (after.unified) ", memory shared with the host" else "", toGib(model), streams, if (streams == 1) "" else "s", toGib(loaded.stream_bytes), window, toGib(room), toGib(after.reserve), F.prompt_rows, if (segments > 1) try std.fmt.allocPrint(a, ", {d} staggered segments a call", .{segments}) else "",
+     });
+diff --git a/zig/src/server/live.zig b/zig/src/server/live.zig
+index d3942f31..24f1e424 100644
+--- a/zig/src/server/live.zig
++++ b/zig/src/server/live.zig
+@@ -12,7 +12,8 @@ fn round1(x: f64) f64 {
+     return std.fmt.parseFloat(f64, text) catch x;
+ }
+ 
+-/// /health's ``live``: open requests, how many wait, decode and prefill tokens a second.
++/// /health's ``live``: open requests, how many wait, decode and prefill tokens a second, and the optional cache
++/// account (absent when the engine cannot report one).
+ pub fn snapshot(a: Allocator, engine: api.Engine) Allocator.Error!json.Value {
+     var status: api.Status = .{};
+     engine.status(&status, &.{});
+@@ -21,6 +22,49 @@ pub fn snapshot(a: Allocator, engine: api.Engine) Allocator.Error!json.Value {
+     try o.put(a, "waiting", try json.intValue(a, status.waiting));
+     try o.put(a, "decode_tokens_per_second", .{ .float = round1(status.decode_tokens_per_second) });
+     try o.put(a, "prefill_tokens_per_second", .{ .float = round1(status.prefill_tokens_per_second) });
++    if (status.cache) |c| try o.put(a, "cache", try cacheValue(a, c));
++    return .{ .object = o };
++}
++
++/// The additive ``live.cache`` group: the shared pool's disjoint categories, then the prompt-state store's storage and
++/// counters. Missing groups stay absent; a disabled store says so instead of reporting healthy zeroes.
++fn cacheValue(a: Allocator, c: api.CacheStatus) Allocator.Error!json.Value {
++    const o = try json.newObject(a);
++    try o.put(a, "schema_version", try json.intValue(a, c.schema_version));
++    try o.put(a, "engine_epoch", try json.intValue(a, c.engine_epoch));
++    try o.put(a, "observed_unix_ns", try json.intValue(a, c.observed_unix_ns));
++    try o.put(a, "consistent", .{ .bool = c.consistent });
++    try o.put(a, "context_limit_positions", try json.intValue(a, c.context_limit_positions));
++    try o.put(a, "stream_capacity", try json.intValue(a, c.stream_capacity));
++    if (c.pool) |p| {
++        const po = try json.newObject(a);
++        try po.put(a, "capacity_positions", try json.intValue(a, p.capacity_positions));
++        try po.put(a, "active_reserved_positions", try json.intValue(a, p.active_reserved_positions));
++        try po.put(a, "retained_prefix_positions", try json.intValue(a, p.retained_prefix_positions));
++        try po.put(a, "retained_growth_positions", try json.intValue(a, p.retained_growth_positions));
++        try po.put(a, "unclaimed_positions", try json.intValue(a, p.unclaimed_positions));
++        try po.put(a, "valid_states", try json.intValue(a, p.valid_states));
++        try po.put(a, "invalidations_total", try json.intValue(a, p.invalidations_total));
++        if (p.placement_blocks_total) |v| try po.put(a, "placement_blocks_total", try json.intValue(a, v));
++        try o.put(a, "pool", .{ .object = po });
++    }
++    if (c.prompt_state) |s| {
++        const so = try json.newObject(a);
++        try so.put(a, "enabled", .{ .bool = s.enabled });
++        try so.put(a, "budget_bytes", try json.intValue(a, s.budget_bytes));
++        try so.put(a, "held_bytes", try json.intValue(a, s.held_bytes));
++        try so.put(a, "spare_bytes", try json.intValue(a, s.spare_bytes));
++        try so.put(a, "entries", try json.intValue(a, s.entries));
++        try so.put(a, "hits_total", try json.intValue(a, s.hits_total));
++        try so.put(a, "misses_total", try json.intValue(a, s.misses_total));
++        try so.put(a, "evictions_total", try json.intValue(a, s.evictions_total));
++        try so.put(a, "refusals_total", try json.intValue(a, s.refusals_total));
++        try so.put(a, "failures_total", try json.intValue(a, s.failures_total));
++        try so.put(a, "failures_keep_total", try json.intValue(a, s.failures_keep_total));
++        try so.put(a, "failures_restore_total", try json.intValue(a, s.failures_restore_total));
++        try so.put(a, "failures_peer_forget_total", try json.intValue(a, s.failures_peer_forget_total));
++        try o.put(a, "prompt_state", .{ .object = so });
++    }
+     return .{ .object = o };
+ }
+ 
+@@ -104,3 +148,25 @@ test "status line" {
+     var buf: [256]u8 = undefined;
+     try std.testing.expectEqualStrings("[tensorfold] 3 connections (1 waiting) \u{b7} decode 142 tok/s \u{b7} prefill 1,210 tok/s", line(&buf, .{ .running = 2, .waiting = 1, .decode_tokens_per_second = 142.2, .prefill_tokens_per_second = 1210.4 }));
+ }
++
++test "the cache group is additive, keeps missing groups absent and names a disabled store" {
++    const gpa = std.testing.allocator;
++    var arena: std.heap.ArenaAllocator = .init(gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const v = try cacheValue(a, .{
++        .consistent = true,
++        .engine_epoch = 1793692800000000000,
++        .observed_unix_ns = 1793692801000000000,
++        .context_limit_positions = 1048576,
++        .stream_capacity = 16,
++        .pool = .{ .capacity_positions = 8388608, .active_reserved_positions = 0, .retained_prefix_positions = 0, .retained_growth_positions = 0, .unclaimed_positions = 8388608, .valid_states = 0, .invalidations_total = 0, .placement_blocks_total = null },
++        .prompt_state = .{ .enabled = false },
++    });
++    const text = try json.stringify(a, v, .{ .compact = true });
++    try std.testing.expect(std.mem.indexOf(u8, text, "\"capacity_positions\":8388608") != null);
++    try std.testing.expect(std.mem.indexOf(u8, text, "\"unclaimed_positions\":8388608") != null);
++    try std.testing.expect(std.mem.indexOf(u8, text, "\"enabled\":false") != null);
++    try std.testing.expect(std.mem.indexOf(u8, text, "placement_blocks_total") == null); // unknown stays absent
++    try std.testing.expect(std.mem.indexOf(u8, text, "\"pool\"") != null);
++}
+diff --git a/zig/src/server/metrics.zig b/zig/src/server/metrics.zig
+index b32f1fbf..57bee277 100644
+--- a/zig/src/server/metrics.zig
++++ b/zig/src/server/metrics.zig
+@@ -4,8 +4,9 @@ const builtin = @import("builtin");
+ const api = @import("engine_api");
+ 
+ const prefix = "tensorfold:";
+-/// Upper edges shared by the request and time-to-first-token histograms; +Inf is added when rendered.
+-pub const buckets = [_]f64{ 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0 };
++/// Upper edges shared by the request and time-to-first-token histograms; +Inf is added when rendered. The 300 s edge
++/// was the last finite one; cold fills of a million-token prompt pass 2,000 s, so longer fixed edges follow it.
++pub const buckets = [_]f64{ 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1200.0, 1800.0, 2400.0, 3600.0 };
+ pub const tpot_buckets = [_]f64{ 0.0025, 0.005, 0.0075, 0.01, 0.015, 0.02, 0.025, 0.03, 0.04, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.5, 1.0 };
+ 
+ fn HistogramType(comptime edges: []const f64) type {
+@@ -118,6 +119,7 @@ pub const Metrics = struct {
+         const keeps = engine.info().prompt_cache;
+         if (keeps) try gauge(w, "prompt_tokens_cached_total", "counter", "Prompt tokens of finished requests restored from kept prompt states.", snap.cached);
+         try gauge(w, "generation_tokens_total", "counter", "Generated tokens of finished requests.", snap.generation);
++        if (status.cache) |c| if (c.consistent) try cacheFamilies(w, c);
+         const live = streams[0..@min(status.streams, streams.len)];
+         try family(w, "kv_cache_usage_ratio", "gauge", "Tokens in a stream cache divided by that stream's context window.");
+         try pools(w, "kv_cache_usage_ratio", "pool", live, window);
+@@ -156,6 +158,36 @@ fn family(w: *std.Io.Writer, name: []const u8, kind: []const u8, help: []const u
+     try w.print("# HELP {s}{s} {s}\n# TYPE {s}{s} {s}\n", .{ prefix, name, help, prefix, name, kind });
+ }
+ 
++/// The additive cache families: the shared position pool's disjoint categories, then the prompt-state store. An
++/// absent or inconsistent group emits nothing (no fabricated zero); a disabled store keeps it absent here.
++fn cacheFamilies(w: *std.Io.Writer, c: api.CacheStatus) !void {
++    if (c.pool) |p| {
++        try gauge(w, "kv_pool_capacity_positions", "gauge", "The shared context pool's effective capacity in positions (one logical pool, not per rank or per stream).", p.capacity_positions);
++        try gauge(w, "kv_pool_active_reserved_positions", "gauge", "Positions in live reservations, including reserved output and alignment space.", p.active_reserved_positions);
++        try gauge(w, "kv_pool_retained_prefix_positions", "gauge", "Positions of valid kept prefixes that live reservations do not overlap.", p.retained_prefix_positions);
++        try gauge(w, "kv_pool_retained_growth_positions", "gauge", "Preserved growth tails of kept extents, reclaimable without invalidating a prefix.", p.retained_growth_positions);
++        try gauge(w, "kv_pool_unclaimed_positions", "gauge", "Positions of the shared pool in no live or retained interval.", p.unclaimed_positions);
++        try gauge(w, "kv_pool_valid_states", "gauge", "Valid kept prompt states held by the allocator (not prompt-store entries).", p.valid_states);
++        try gauge(w, "kv_pool_invalidations_total", "counter", "Valid kept states whose backing a placement reused (each transition counted once).", p.invalidations_total);
++        if (p.placement_blocks_total) |v| try gauge(w, "kv_pool_placement_blocks_total", "counter", "Placement attempts refused for want of a fitting extent; attempts, not unique requests.", v);
++    }
++    if (c.prompt_state) |s| if (s.enabled) {
++        try gauge(w, "prompt_state_cache_budget_bytes", "gauge", "The configured prompt-state store budget in bytes.", s.budget_bytes);
++        try gauge(w, "prompt_state_cache_held_bytes", "gauge", "Storage charged to the store's entries.", s.held_bytes);
++        try gauge(w, "prompt_state_cache_spare_bytes", "gauge", "Reusable backend storage the store keeps inside its budget.", s.spare_bytes);
++        try gauge(w, "prompt_state_cache_entries", "gauge", "Current prompt-store entries.", s.entries);
++        try gauge(w, "prompt_state_cache_hits_total", "counter", "Successful restores of kept prompt states.", s.hits_total);
++        try gauge(w, "prompt_state_cache_misses_total", "counter", "Prompt lookups that found no usable state.", s.misses_total);
++        try gauge(w, "prompt_state_cache_evictions_total", "counter", "Store entries removed for its budget or policy.", s.evictions_total);
++        try gauge(w, "prompt_state_cache_refusals_total", "counter", "States declined for retention because they exceed the budget.", s.refusals_total);
++        try gauge(w, "prompt_state_cache_failures_total", "counter", "All counted store failures (the legacy aggregate; the stages below sum to it from now on).", s.failures_total);
++        try family(w, "prompt_state_cache_failures_by_stage_total", "counter", "Store failures by the stage that failed.");
++        try w.print("{s}prompt_state_cache_failures_by_stage_total{{stage=\"keep\"}} {d}\n", .{ prefix, s.failures_keep_total });
++        try w.print("{s}prompt_state_cache_failures_by_stage_total{{stage=\"restore\"}} {d}\n", .{ prefix, s.failures_restore_total });
++        try w.print("{s}prompt_state_cache_failures_by_stage_total{{stage=\"peer_forget\"}} {d}\n", .{ prefix, s.failures_peer_forget_total });
++    };
++}
++
+ fn gauge(w: *std.Io.Writer, name: []const u8, kind: []const u8, help: []const u8, value: u64) !void {
+     try family(w, name, kind, help);
+     try w.print("{s}{s} {d}\n", .{ prefix, name, value });
+@@ -350,3 +382,61 @@ test "request counter append failure frees its label" {
+     try std.testing.expectEqual(@as(u64, 2), m.requests.items[0].count);
+     try std.testing.expectEqual(allocations, failing.allocations);
+ }
++
++test "long latency edges extend the old ones and keep cumulative buckets honest" {
++    const gpa = std.testing.allocator;
++    var m: Metrics = .{ .gpa = gpa };
++    m.latency.observe(2000);
++    var stub: RenderStub = .{};
++    var out: std.Io.Writer.Allocating = .init(gpa);
++    defer out.deinit();
++    try m.render(std.testing.io, &out.writer, stub.engine(), 4096);
++    const body = out.written();
++    try std.testing.expect(std.mem.indexOf(u8, body, "request_latency_seconds_bucket{le=\"300\"} 0") != null);
++    try std.testing.expect(std.mem.indexOf(u8, body, "request_latency_seconds_bucket{le=\"1800\"} 0") != null);
++    try std.testing.expect(std.mem.indexOf(u8, body, "request_latency_seconds_bucket{le=\"2400\"} 1") != null);
++    try std.testing.expect(std.mem.indexOf(u8, body, "request_latency_seconds_bucket{le=\"3600\"} 1") != null);
++}
++
++test "cache families render only a consistent account, with the store's classified stages" {
++    const gpa = std.testing.allocator;
++    var m: Metrics = .{ .gpa = gpa };
++    var stub: RenderStub = .{};
++    stub.status_value = .{
++        .running = 1,
++        .cache = .{
++            .consistent = true,
++            .engine_epoch = 7,
++            .observed_unix_ns = 99,
++            .context_limit_positions = 1048576,
++            .stream_capacity = 16,
++            .pool = .{ .capacity_positions = 8388608, .active_reserved_positions = 2048, .retained_prefix_positions = 4096, .retained_growth_positions = 1024, .unclaimed_positions = 8381440, .valid_states = 2, .invalidations_total = 3, .placement_blocks_total = 4 },
++            .prompt_state = .{ .enabled = true, .budget_bytes = 536870912, .held_bytes = 268435456, .spare_bytes = 1024, .entries = 2, .hits_total = 5, .misses_total = 6, .evictions_total = 1, .refusals_total = 1, .failures_total = 3, .failures_keep_total = 1, .failures_restore_total = 1, .failures_peer_forget_total = 1 },
++        },
++    };
++    var out: std.Io.Writer.Allocating = .init(gpa);
++    defer out.deinit();
++    try m.render(std.testing.io, &out.writer, stub.engine(), 4096);
++    const body = out.written();
++    try std.testing.expect(std.mem.indexOf(u8, body, "tensorfold:kv_pool_capacity_positions 8388608\n") != null);
++    try std.testing.expect(std.mem.indexOf(u8, body, "tensorfold:kv_pool_unclaimed_positions 8381440\n") != null);
++    try std.testing.expect(std.mem.indexOf(u8, body, "tensorfold:kv_pool_placement_blocks_total 4\n") != null);
++    try std.testing.expect(std.mem.indexOf(u8, body, "tensorfold:prompt_state_cache_budget_bytes 536870912\n") != null);
++    try std.testing.expect(std.mem.indexOf(u8, body, "prompt_state_cache_failures_by_stage_total{stage=\"keep\"} 1") != null);
++    try std.testing.expect(std.mem.indexOf(u8, body, "prompt_state_cache_failures_by_stage_total{stage=\"restore\"} 1") != null);
++    try std.testing.expect(std.mem.indexOf(u8, body, "prompt_state_cache_failures_by_stage_total{stage=\"peer_forget\"} 1") != null);
++    // inconsistent accounting is exported as nothing, never as a healthy zero
++    stub.status_value.cache.?.consistent = false;
++    var bad: std.Io.Writer.Allocating = .init(gpa);
++    defer bad.deinit();
++    try m.render(std.testing.io, &bad.writer, stub.engine(), 4096);
++    try std.testing.expect(std.mem.indexOf(u8, bad.written(), "kv_pool_capacity_positions") == null);
++    // a disabled store keeps its families absent while the pool still reports
++    stub.status_value.cache.?.consistent = true;
++    stub.status_value.cache.?.prompt_state = .{ .enabled = false };
++    var off: std.Io.Writer.Allocating = .init(gpa);
++    defer off.deinit();
++    try m.render(std.testing.io, &off.writer, stub.engine(), 4096);
++    try std.testing.expect(std.mem.indexOf(u8, off.written(), "tensorfold:kv_pool_capacity_positions 8388608\n") != null);
++    try std.testing.expect(std.mem.indexOf(u8, off.written(), "prompt_state_cache_entries") == null);
++}

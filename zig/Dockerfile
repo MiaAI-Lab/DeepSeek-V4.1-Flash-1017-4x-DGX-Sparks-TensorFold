@@ -30,6 +30,10 @@ RUN cd /tensorfold && \
 RUN timeout 120s /opt/zig/zig test /tensorfold/zig/src/families/dsv41/idle_gate.zig -O ReleaseSafe -lc -j1
 # CPU-only rendezvous tests over loopback (0035): workers that are ready first wait in their ports' backlogs.
 RUN timeout 120s /opt/zig/zig test /tensorfold/zig/src/families/dsv41/link.zig -O ReleaseSafe -lc -j1
+# CPU-only cache-observability tests (0051): the pool's disjoint interval accounting, the prompt-state store's
+# classified counters, and the engine API's copied observation scraped while a fake request runs. No GPU, no weights.
+RUN timeout 180s /opt/zig/zig test --dep lanes -Mroot=/tensorfold/zig/src/core/engine_api.zig \
+      -Mlanes=/tensorfold/zig/src/core/lanes/lanes.zig -lc -j1
 # Structured output (0036): libtfgrammar, TensorFold's C ABI over xgrammar (Apache-2.0), built by `zig build grammar`
 # from xgrammar's v0.2.8 release (the one tf_grammar.cc is written against) with its submodules; the server loads it at
 # the first structured request (TENSORFOLD_GRAMMAR_LIB). The checkout is deleted after the build; its licenses stay.

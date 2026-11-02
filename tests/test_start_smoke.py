@@ -35,6 +35,8 @@ class StartSmoke(unittest.TestCase):
         self.fixture.setUp()
         self.status = 200
         self.body = json.dumps(_COMPLETION).encode()
+        # /health: the launcher reads the engine's effective cache account from it (absent here, as an old engine's)
+        self.health = {"status": "ok", "live": {"connections": 0, "waiting": 0}}
         self.abort_post = False
         self.hits = []
         test = self
@@ -49,7 +51,10 @@ class StartSmoke(unittest.TestCase):
 
             def do_GET(self):
                 test.hits.append(("GET", self.path))
-                self.respond(200, b'{"object":"list","data":[]}')
+                if self.path == "/health":
+                    self.respond(200, json.dumps(test.health).encode())
+                else:
+                    self.respond(200, b'{"object":"list","data":[]}')
 
             def do_POST(self):
                 self.rfile.read(int(self.headers.get("Content-Length", "0")))
@@ -103,7 +108,7 @@ class StartSmoke(unittest.TestCase):
         self.server.server_close()
         self.thread.join(timeout=2)
 
-    def launch(self, extra_env=None):
+    def launch(self, extra_env=None, infer=True):
         code, out = self.fixture.run_script(
             ["start.sh"],
             {"PREPARE": "0", "HOST": "127.0.0.1", "PORT": str(self.port),
@@ -114,7 +119,9 @@ class StartSmoke(unittest.TestCase):
         for host in ["head", "w1", "w2", "w3"]:
             self.assertEqual(self.fixture.left(host), [_NAME], out)
         self.assertIn(("GET", "/v1/models"), self.hits)
-        self.assertIn(("POST", "/v1/chat/completions"), self.hits)
+        self.assertIn(("GET", "/health"), self.hits)
+        if infer:  # a refusal before the smoke test makes no inference request
+            self.assertIn(("POST", "/v1/chat/completions"), self.hits)
         self.fixture.assertNoTraceback(out)
         self.assertNotIn("Traceback (most recent call last)", out)
         return code, out
@@ -129,6 +136,38 @@ class StartSmoke(unittest.TestCase):
         reply = copy.deepcopy(_COMPLETION)
         reply["choices"][0]["message"]["content"] = content
         self.body = json.dumps(reply).encode()
+
+
+    def cache_health(self, **cache):
+        """The engine's effective cache account, as the instrumented engine reports it for this launcher's settings."""
+        body = {
+            "schema_version": 1,
+            "engine_epoch": 1793692800000000000,
+            "observed_unix_ns": 1793692801000000000,
+            "consistent": True,
+            "context_limit_positions": 1048576,
+            "stream_capacity": 16,
+            "pool": {
+                "capacity_positions": 2097152,
+                "active_reserved_positions": 0,
+                "retained_prefix_positions": 0,
+                "retained_growth_positions": 0,
+                "unclaimed_positions": 2097152,
+                "valid_states": 0,
+                "invalidations_total": 0,
+                "placement_blocks_total": 0,
+            },
+            "prompt_state": {
+                "enabled": True,
+                "budget_bytes": 536870912,
+                "held_bytes": 0,
+                "spare_bytes": 0,
+                "entries": 0,
+            },
+        }
+        body.update(cache)
+        self.health = {"status": "ok", "live": {"connections": 0, "waiting": 0, "cache": body}}
+        return body
 
     def test_valid_assistant_completion_is_live(self):
         code, out = self.launch()
@@ -205,6 +244,53 @@ class StartSmoke(unittest.TestCase):
     def test_long_single_character_reply_remains_rejected(self):
         self.set_content("A" * 8)
         self.assertRejected()
+
+    def test_cache_telemetry_reports_the_effective_configuration(self):
+        self.cache_health()
+        code, out = self.launch()
+        self.assertEqual(code, 0, out)
+        self.assertIn("Cache telemetry: shared pool 2,097,152 positions", out)
+        self.assertIn("per request 1,048,576", out)
+        self.assertIn("snapshots 512 MiB", out)
+        self.assertIn("is now LIVE", out)
+
+    def test_an_old_engine_reports_unavailable_not_a_mismatch(self):
+        code, out = self.launch()
+        self.assertEqual(code, 0, out)
+        self.assertIn("Cache telemetry: unavailable", out)
+        self.assertIn("is now LIVE", out)
+
+    def test_a_pool_mismatch_stops_the_launcher(self):
+        self.cache_health()
+        self.health["live"]["cache"]["pool"]["capacity_positions"] = 8388608
+        code, out = self.launch(infer=False)
+        self.assertEqual(code, 1, out)
+        self.assertIn("cache telemetry check failed", out)
+        self.assertIn("pool 8388608 != 2097152", out)
+        self.assertNotIn("is now LIVE", out)
+
+    def test_an_inconsistent_account_stops_the_launcher(self):
+        self.cache_health(consistent=False)
+        code, out = self.launch(infer=False)
+        self.assertEqual(code, 1, out)
+        self.assertIn("inconsistent accounting", out)
+        self.assertNotIn("is now LIVE", out)
+
+    def test_a_disabled_store_with_a_configured_budget_stops_the_launcher(self):
+        self.cache_health()
+        self.health["live"]["cache"]["prompt_state"] = {"enabled": False, "budget_bytes": 0}
+        code, out = self.launch(infer=False)
+        self.assertEqual(code, 1, out)
+        self.assertIn("the prompt-state store is disabled", out)
+        self.assertNotIn("is now LIVE", out)
+
+    def test_an_unverified_configuration_needs_an_explicit_opt_in(self):
+        self.cache_health()
+        self.health["live"]["cache"]["stream_capacity"] = 8
+        code, out = self.launch({"CACHE_ALLOW_CONFIG_MISMATCH": "1"})
+        self.assertEqual(code, 0, out)
+        self.assertIn("CACHE_ALLOW_CONFIG_MISMATCH=1", out)
+        self.assertIn("is now LIVE", out)
 
     def test_short_single_character_reply_remains_accepted(self):
         self.set_content("A" * 7)
