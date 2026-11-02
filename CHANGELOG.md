@@ -1,11 +1,13 @@
 # Changelog
 
-- **2026-11-02** -- (SvangenStudios) `tools/claims/` `0042` and `0043` no longer report a claim as holding on missing
+- **2026-11-02** -- (SvangenStudios) `tools/claims/` `0042`, `0043` and `0044` no longer report a claim as holding on missing
   evidence: in `0043` a reply without `token_sha` or `completion_tokens` (equal by absence), or with an `error`
   object, is one the script cannot judge (exit 2), and the stream's `tensorfold` object is read from its final event
   (the one with the finish reason), not from whichever event carried one last; in `0042` a reply or stream event with
-  an `error` object fails its case, as an HTTP error does. `tests/test_claims.py` runs both against a loopback
-  stand-in for the server.
+  an `error` object fails its case, as an HTTP error does; in `0044` an HTTP 200 that should succeed (the model list,
+  `deleted: true`, the stored response's creation) is not good with an `error` object beside its data: exit 2 on a
+  bodyless control or the create, exit 1 on a body case, while the expected 404s still pass. `tests/test_claims.py`
+  runs all three against a loopback stand-in for the server.
 - **2026-11-02** -- `tools/claims/`: three scripts that check a patch's promise against a running server, written by
   Hector Isaza ([hecisaza](https://github.com/hecisaza)) with the verify step of
   [inference-agent-kit](https://github.com/hecisaza/inference-agent-kit): `0042`'s JSON answers, `0043`'s orphan DSML
