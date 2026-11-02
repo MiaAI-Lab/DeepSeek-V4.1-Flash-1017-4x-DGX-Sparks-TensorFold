@@ -2,6 +2,8 @@
 # Written by Hector Isaza (hecisaza, https://github.com/hecisaza) with the verify step of inference-agent-kit
 # (https://github.com/hecisaza/inference-agent-kit). Apache-2.0. Unchanged below this header from
 # https://github.com/hecisaza/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/blob/f698c2fe71b6a9920a5ff7646302265b524231e1/claims/MiaAI-Lab-DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold-pr-31.sh
+# except (SvangenStudios, 2026-11-02): a reply or stream event with an error object fails its case, as an HTTP error
+#   does, however its choices read (HTTP 200 alone is not a good reply).
 # Usage: tools/claims/0042-json-answer-channel.sh API MODEL. Exit 0: the claim holds. 1: it does not. 2: the script could not judge.
 # claim: patches: 0042 a JSON answer stays JSON — a response_format json_schema / guided_json reply that parses as a
 #   bare tool call ({"name": ..., "arguments": ...}) is returned as the message content with finish_reason "stop",
@@ -40,18 +42,23 @@ def send(extra, messages, stream):
         with urllib.request.urlopen(req, timeout=180) as r:
             status = r.status
             if not stream:
-                o = json.load(r); ch = (o.get("choices") or [{}])[0]; m = ch.get("message") or {}
+                o = json.load(r)
+                if o.get("error") is not None: return f"{status} with an error", json.dumps(o["error"])[:200], [], None
+                ch = (o.get("choices") or [{}])[0]; m = ch.get("message") or {}
                 return status, m.get("content"), m.get("tool_calls") or [], ch.get("finish_reason")
-            content, calls, finish, done = "", [], None, False
+            content, calls, finish, done, error = "", [], None, False, None
             for line in r:
                 if not line.startswith(b"data: "): continue
                 if line.strip() == b"data: [DONE]": done = True; break
-                for c in json.loads(line[6:]).get("choices", []):
+                o = json.loads(line[6:])
+                if o.get("error") is not None: error = error or json.dumps(o["error"])[:200]
+                for c in o.get("choices", []):
                     d = c.get("delta") or {}
                     content += d.get("content") or ""
                     calls += d.get("tool_calls") or []
                     finish = c.get("finish_reason") or finish
             if not done: err("stream ended without [DONE]")
+            if error is not None: return f"{status} with an error", error, [], None
             return status, content, calls, finish
     except urllib.error.HTTPError as e:
         return e.code, e.read()[:200].decode(errors="ignore"), [], None

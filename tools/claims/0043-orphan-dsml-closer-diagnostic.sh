@@ -2,6 +2,9 @@
 # Written by Hector Isaza (hecisaza, https://github.com/hecisaza) with the verify step of inference-agent-kit
 # (https://github.com/hecisaza/inference-agent-kit). Apache-2.0. Unchanged below this header from
 # https://github.com/hecisaza/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/blob/a6395a89a08d1ca6464c32bcc5f4bd9dd8ce1cb6/claims/MiaAI-Lab-DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold-pr-32.sh
+# except (SvangenStudios, 2026-11-02): a reply without token_sha or completion_tokens, or with an error object, is one
+#   the script cannot judge (exit 2); the stream's tensorfold object is read from its final event (the one with the
+#   finish reason), as the claim says, not from whichever event carried one last.
 # Usage: tools/claims/0043-orphan-dsml-closer-diagnostic.sh API MODEL [LOGCMD]. Exit 0: the claim holds. 1: it does not. 2: the script could not judge.
 # claim: patches: 0043 a reply made only of orphan DSML closing tags is flagged (tool_parse_warning), not repaired.
 # Tested: with tools offered, an answer made only of DSML closing tags (V4 and V4.1 spellings) gets
@@ -39,7 +42,9 @@ def ask(text, tools, stream=False):
         with urllib.request.urlopen(req, timeout=300) as r:
             status = r.status
             if not stream:
-                o = json.load(r); c = o["choices"][0]
+                o = json.load(r)
+                if o.get("error") is not None: fail(f"the reply carries an error: {json.dumps(o['error'])[:160]}")
+                c = o["choices"][0]
                 return dict(status=status, id=o.get("id"), content=c["message"].get("content") or "",
                             tool_calls=c["message"].get("tool_calls"), finish=c.get("finish_reason"),
                             tf=o.get("tensorfold") or {}, usage=o.get("usage") or {})
@@ -48,12 +53,14 @@ def ask(text, tools, stream=False):
                 if not line.startswith(b"data: "): continue
                 if line.strip() == b"data: [DONE]": done = True; break
                 o = json.loads(line[6:]); rid = rid or o.get("id")
-                if o.get("tensorfold"): tf = o["tensorfold"]
+                if o.get("error") is not None: fail(f"the stream carries an error: {json.dumps(o['error'])[:160]}")
                 usage = o.get("usage") or usage
                 for c in o.get("choices", []):
                     d = c.get("delta", {}); content += d.get("content") or ""
-                    calls = calls or d.get("tool_calls"); finish = c.get("finish_reason") or finish
+                    calls = calls or d.get("tool_calls")
+                    if c.get("finish_reason"): finish = c["finish_reason"]; tf = o.get("tensorfold") or {}
             if not done: fail("stream ended without [DONE]")
+            if finish is None: fail("stream ended without a final event (no finish_reason)")
             return dict(status=status, id=rid, content=content, tool_calls=calls, finish=finish, tf=tf, usage=usage)
     except urllib.error.HTTPError as e:
         fail(f"HTTP {e.code}: {e.read()[:200].decode(errors='ignore')}")
@@ -73,6 +80,12 @@ def check(cond, what):
 def plain(r, text):  # what the PR promises is unchanged: the content, finish reason, no invented call
     return r["status"] == 200 and r["content"] == text and r["finish"] == "stop" and not r["tool_calls"]
 
+def stats(r, label):  # what the whole-vs-stream comparison needs: missing, the claim cannot be judged either way
+    sha, n = r["tf"].get("token_sha"), r["usage"].get("completion_tokens")
+    if not isinstance(sha, str) or not sha or not isinstance(n, int) or isinstance(n, bool):
+        fail(f"{label}: the reply has no token_sha or completion_tokens to compare")
+    return sha, n
+
 ids = []
 for label, closers in (("V4", V4), ("V4.1", V41)):
     text = "".join(closers)
@@ -82,8 +95,7 @@ for label, closers in (("V4", V4), ("V4.1", V41)):
     s = ask(text, True, stream=True); show(f"{label} closers, tools, stream", s)
     check(plain(s, text), f"{label} stream: content is exactly the closers, finish stop, no tool_calls")
     check(s["tf"].get("tool_parse_warning") == WARN, f"{label} stream: final event tool_parse_warning == {WARN}")
-    check(s["tf"].get("token_sha") == w["tf"].get("token_sha") and
-          s["usage"].get("completion_tokens") == w["usage"].get("completion_tokens"),
+    check(stats(s, f"{label} stream") == stats(w, f"{label} whole"),
           f"{label}: same token_sha and completion_tokens whole vs stream")
     ids += [w["id"], s["id"]]
 
