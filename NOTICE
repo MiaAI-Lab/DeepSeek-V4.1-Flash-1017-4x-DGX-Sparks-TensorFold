@@ -48,6 +48,13 @@ GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold
   start.sh, stop.sh and scripts/banner.sh are adapted from it, including code by webzone, Alexbob0 and john (see
   CREDITS.md).
 
+Claim scripts (tools/claims)
+  https://github.com/hecisaza/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold (claims/ at commits f698c2f, a6395a8
+  and 10c4c7c)
+  Written by Hector Isaza (@hecisaza) with the verify step of https://github.com/hecisaza/inference-agent-kit. Apache
+  License, Version 2.0. Each file is unchanged below the header this project added, except for a connection check this
+  project added to 0044-server-get-delete-body-discard.sh.
+
 PyAV
   https://github.com/PyAV-Org/PyAV
   Copyright the PyAV contributors. BSD 3-Clause License. Installed into the image (pip, av==18.1.0) for video input;
