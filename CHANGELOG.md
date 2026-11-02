@@ -1,5 +1,12 @@
 # Changelog
 
+- **2026-11-02** -- (SvangenStudios) `scripts/prepare.sh` stops when a worker's Engram folder (`WORKER_ENGRAM_DIR`)
+  holds a `*.safetensors` file the checkpoint's index does not name, and names it, leaving it in place: the engine opens
+  every such file there and stopped that rank with `BadSafetensors`, although the expected files' sizes added up. With
+  `ENGRAM_PACKED=1` the packer reads a folder of links to the index's Engram files alone, not the whole snapshot. The
+  prepared marker carries the version of these checks (`checks=2`), so a setup prepared before them runs
+  `scripts/prepare.sh` once more on its next start; packed shards and copies already there are kept. No hashing
+  ([#35](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/issues/35)).
 - **2026-11-02** -- `tools/claims/`: three scripts that check a patch's promise against a running server, written by
   Hector Isaza ([hecisaza](https://github.com/hecisaza)) with the verify step of
   [inference-agent-kit](https://github.com/hecisaza/inference-agent-kit): `0042`'s JSON answers, `0043`'s orphan DSML

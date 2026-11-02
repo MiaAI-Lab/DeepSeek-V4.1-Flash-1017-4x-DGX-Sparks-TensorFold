@@ -185,6 +185,13 @@ read -r -a shards <<<"$(engram_shards)"
 (( ${#shards[@]} )) || die "the checkpoint's index names no Engram tables"
 need=0; for f in "${shards[@]}"; do need=$(( need + $(stat -L -c %s "$SNAP/$f") )); done
 if [[ "$ENGRAM_PACKED" == 1 ]]; then
+  # the packer's input: the index's Engram files alone, linked like the served folder (Tables.open reads every
+  # *.safetensors in the folder it is given, so the snapshot itself would hand it any other file there too)
+  TABLES="$DATA_DIR/engram-tables"
+  rm -rf "$TABLES.new" && mkdir -p "$TABLES.new"
+  for f in "${shards[@]}"; do ln -s "../../../$SNAP_REL/$f" "$TABLES.new/$f"; done
+  rm -rf "$TABLES" && mv "$TABLES.new" "$TABLES"
+  TABLES_C="/hf/$DATA_SUB/engram-tables"
   # ENGRAM_PACKED=1: packed shards on every Spark's own disk instead (zig/patches/0003), cut for the node rank r serves
   # (TF_DS_2D_ORDER) or whole; tf-dsv41-engram-pack keeps a shard that checks out, so a re-run writes only what is missing
   IFS=, read -r -a ord <<<"$(node_order)"
@@ -199,12 +206,12 @@ if [[ "$ENGRAM_PACKED" == 1 ]]; then
       have=0; for f in "$dir"/engram-l*-n"${node}of${nodes}".tfe; do [[ -f "$f" ]] && have=$(( have + $(stat -c %s "$f") )); done
       free=$(df -B1 --output=avail "$dir" | tail -1)
       where="this Spark"
-      run() { bash -c "$pack -v '$HF_CACHE:/hf:ro' -v '$dir:/out' --entrypoint tf-dsv41-engram-pack '$IMAGE' '$SNAP_C' /out $node $nodes"; }
+      run() { bash -c "$pack -v '$HF_CACHE:/hf:ro' -v '$dir:/out' --entrypoint tf-dsv41-engram-pack '$IMAGE' '$TABLES_C' /out $node $nodes"; }
     else
       have=$(worker "$r" "s=0; for f in $ENGRAM_PACKED_DIR/engram-l*-n${node}of${nodes}.tfe; do [[ -f \$f ]] && s=\$(( s + \$(stat -c %s \$f) )); done; echo \$s")
       free=$(worker "$r" "mkdir -p $ENGRAM_PACKED_DIR && df -B1 --output=avail $ENGRAM_PACKED_DIR | tail -1")
       where=$(worker_host "$r")
-      run() { worker "$r" "$pack -v '$NFS_VOLUME:/hf:ro' -v $ENGRAM_PACKED_DIR:/out --entrypoint tf-dsv41-engram-pack '$IMAGE' '$SNAP_C' /out $node $nodes"; }
+      run() { worker "$r" "$pack -v '$NFS_VOLUME:/hf:ro' -v $ENGRAM_PACKED_DIR:/out --entrypoint tf-dsv41-engram-pack '$IMAGE' '$TABLES_C' /out $node $nodes"; }
     fi
     if (( have >= pneed )); then log "Rank $r ($where): Engram's packed shards of node $node of $nodes on its disk"; continue; fi
     (( free + have > pneed + 10 * 1024 ** 3 )) || die "$where has $(( free / 1024 ** 3 )) GiB free: Engram's packed shards need $(( pneed / 1024 ** 3 )) GiB (ENGRAM_PACKED_DIR) and 10 GiB to spare"
@@ -214,6 +221,19 @@ if [[ "$ENGRAM_PACKED" == 1 ]]; then
 fi
 for i in 1 2 3; do
   [[ "$ENGRAM_PACKED" != 1 ]] || break
+  # the engine opens every *.safetensors in this folder (Tables.open), so a file the index does not name stops the
+  # rank (BadSafetensors) however the sizes add up: name them and stop, leaving them for you to move or remove. Each
+  # name is compared whole with the index's; a folder that is there but cannot be listed fails (a missing one is
+  # made by the copy below).
+  extra=$(worker "$i" "d=$WORKER_ENGRAM_DIR; want=($(printf '%q ' "${shards[@]}"))
+    [[ -e \$d || -L \$d ]] || exit 0
+    [[ -d \$d ]] && ls -A -- \"\$d\" >/dev/null || exit 3
+    shopt -s nullglob dotglob
+    for p in \"\$d\"/*.safetensors; do f=\${p##*/}; k=0; for w in \"\${want[@]}\"; do [[ \"\$f\" == \"\$w\" ]] && k=1; done; (( k )) || printf '%s\\n' \"\$f\"; done") ||
+    die "cannot list Engram's folder $WORKER_ENGRAM_DIR on $(worker_host "$i") (is it a folder this user can read?)"
+  [[ -z "$extra" ]] || die "$(worker_host "$i")'s $WORKER_ENGRAM_DIR holds *.safetensors files the checkpoint's index does" \
+    "not name: $(tr '\n' ' ' <<<"$extra")-- the engine opens every one there and stops at a file that is not one of" \
+    "Engram's tables. Move or remove them (nothing was deleted), then run this again"
   have=$(worker "$i" "d=$WORKER_ENGRAM_DIR; s=0; for f in ${shards[*]}; do [[ -f \$d/\$f ]] && s=\$(( s + \$(stat -c %s \$d/\$f) )); done; echo \$s")
   if [[ "$have" == "$need" ]]; then log "Worker $i ($(worker_host "$i")): Engram tables on its disk"; continue; fi
   free=$(worker "$i" "mkdir -p $WORKER_ENGRAM_DIR && df -B1 --output=avail $WORKER_ENGRAM_DIR | tail -1")

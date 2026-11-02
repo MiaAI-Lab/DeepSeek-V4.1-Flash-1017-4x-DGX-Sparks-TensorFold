@@ -1,5 +1,5 @@
 """Regression tests for stop.sh (and its /health warning), ./start.sh restart and its smoke test, the ring's NCCL graph
-files under DRY_RUN=1, the prepared marker and prepare.sh's weight-file loop.
+files under DRY_RUN=1, the prepared marker, prepare.sh's weight-file loop and its Engram step.
 
 Offline: no Spark, GPU, Docker or network. Each test copies the scripts into a temporary folder and puts fake `ssh`,
 `docker`, `curl` and `getent` first on PATH. The fake ssh runs a worker's command locally with that worker's own HOME
@@ -536,6 +536,58 @@ node_order() { echo 0,1,2,3; }
         self.assertTrue(self.prepared(), out)
         self.assertIn("Not ready yet", out)
 
+    def marker_before_checks(self):
+        """The marker a setup prepared before PREPARE_CHECKS has: today's line without its checks field."""
+        code, out = self.run_script(["-c", f"cd {self.repo}\nsource ./scripts/config.sh\nsource ./scripts/nodes.sh\n"
+                                           "prepared_state"], self.env)
+        self.assertEqual(code, 0, out)
+        line = out.rstrip("\n").splitlines()[-1]   # (its trailing space is part of the line start.sh compares)
+        state = self.home / ".local/state/dsv41-tensorfold"
+        state.mkdir(parents=True, exist_ok=True)
+        (state / "prepared").write_text(line.removeprefix("checks=2 ") + "\n")
+        return line
+
+    def test_marker_from_before_the_engram_checks_runs_prepare_once(self):
+        self.marker_before_checks()
+        code, out = self.run_script(["start.sh"])
+        self.assertEqual(code, 0, out)
+        self.assertTrue(self.prepared(), out)
+        self.assertIn("Not ready yet", out)
+
+    def test_current_marker_does_not_run_prepare(self):
+        line = self.marker_before_checks()
+        (self.home / ".local/state/dsv41-tensorfold/prepared").write_text(line + "\n")
+        code, out = self.run_script(["start.sh"])
+        self.assertEqual(code, 0, out)
+        self.assertFalse(self.prepared(), out)
+        self.assertIn("Ready:", out)
+
+    def test_prepare_0_skips_prepare_with_an_old_marker(self):
+        # PREPARE=0 is the operator's word that the setup is ready: no prepare.sh, so none of its checks either
+        self.marker_before_checks()
+        code, out = self.run_script(["start.sh"], {"PREPARE": "0"})
+        self.assertEqual(code, 0, out)
+        self.assertFalse(self.prepared(), out)
+        self.assertEqual(sorted(self.launched()), ["head", "w1", "w2", "w3"], out)
+
+    def test_dry_run_with_an_old_marker_prepares_nothing(self):
+        self.marker_before_checks()
+        code, out = self.run_script(["start.sh"], {"DRY_RUN": "1"})
+        self.assertEqual(code, 0, out)
+        self.assertIn("would run now", out)
+        self.assertFalse(self.prepared(), out)
+        self.assertEqual(self.launched(), [], out)
+
+    def test_running_service_with_an_old_marker_is_left_alone(self):
+        self.marker_before_checks()
+        for h in ["head", "w1", "w2", "w3"]:
+            self.containers(h, NAME)
+        code, out = self.run_script(["start.sh"])
+        self.assertEqual(code, 0, out)
+        self.assertIn("nothing to do", out)
+        self.assertFalse(self.prepared(), out)
+        self.assertEqual(self.launched(), [], out)
+
 
 class MasterAddr(ScriptTest):
     """The rendezvous address config.sh derives: a Tailscale address only when the node has no other (issue #21)."""
@@ -717,6 +769,9 @@ class PreparedState(ScriptTest):
         self.assertNotEqual(code, 0, out)
         self.assertEqual(marker.read_text(), "model=valid-before\n")
 
+    def test_marker_carries_the_version_of_prepares_checks(self):
+        self.assertTrue(self.state().startswith("checks=2 "), self.state())
+
     def test_existing_fields_still_change_marker(self):
         for var, value in [("ORDER", "0,1,2,3"), ("ABLIT", "1"), ("WORKER2", "w9")]:
             with self.subTest(var=var):
@@ -859,6 +914,273 @@ class PrepareWeightFiles(ScriptTest):
                 self.assertIn(f"node {rank}'s weight-file index", out)
                 self.assertEqual(self.rank_files(), before, out)
         self.assertEqual(self.built(), ["0", "1", "2", "3"], "a weight file was rebuilt after a failed index")
+
+
+# Stand-ins for the image's Engram readers, by the rule they share (engram_io.zig, Tables.open): every name ending in
+# ".safetensors" in the folder, hidden ones too, is opened by its header. Here a file whose bytes begin "table" is one of
+# Engram's tables, "shard" another checkpoint shard (a good header, no Engram tensor: skipped), anything else a header
+# that does not parse (BadSafetensors). The packer writes each node's shard with the size prepare.sh wants.
+FAKE_ENGRAM_DOCKER = r"""#!BASH
+echo "$*" >> "$SIM/docker-args"
+out=""; for a in "$@"; do [[ "$a" == *:/out ]] && out=${a%:/out}; out=${out#\'}; out=${out%\'}; done
+out=${out/#\$HOME/$HOME}
+if [[ " $* " == *" --entrypoint tf-dsv41-engram-pack "* ]]; then
+  n=$#; src=${@:n-3:1}; node=${@:n-1:1}; nodes=${@:n:1}; src=${src/#\/hf/$HF_CACHE}
+  echo "pack $node $nodes" >> "$SIM/packed"
+  shopt -s nullglob dotglob
+  for p in "$src"/*; do echo "${p##*/}" >> "$SIM/pack-input"; done
+  for p in "$src"/*.safetensors; do case "$(head -c 5 "$p" 2>/dev/null)" in table|shard) ;; *) echo "error: BadSafetensors" >&2; exit 1 ;; esac; done
+  mkdir -p "$out"; head -c "$PNEED" /dev/zero > "$out/engram-l0-n${node}of${nodes}.tfe"; exit 0
+fi
+script=${!#}; script=${script//\/hf/$HF_CACHE}; script=${script//\/out/$out}
+exec BASH -c "$script"
+"""
+
+
+@unittest.skipIf(BASH is None, "needs bash 4 or later")
+class PrepareEngramTables(ScriptTest):
+    """Step 7 of prepare.sh: each worker's copy of Engram's tables, or with ENGRAM_PACKED=1 the packer's input. The
+    oracle is the engine's reader: a folder prepare.sh passes must be one Tables.open opens."""
+
+    SHARDS = {"model-00047-of-00048.safetensors": b"table-a" * 3, "model-00048-of-00048.safetensors": b"table-b" * 5}
+
+    def setUp(self):
+        super().setUp()
+        (self.tmp / "bin" / "docker").write_text(FAKE_ENGRAM_DOCKER.replace("BASH", BASH))
+        (self.tmp / "bin" / "docker").chmod(0o755)
+        (self.tmp / "bin" / "df").write_text("#!/bin/sh\necho Avail\necho 999999999999999\n")
+        (self.tmp / "bin" / "df").chmod(0o755)
+        self.env["HF_CACHE"] = str(self.tmp / "hf")
+        source = (self.repo / "scripts" / "prepare.sh").read_text()
+        self.step = source[source.index("# ---------------------------------------------------------------- 7."):
+                           source.index("# ---------------------------------------------------------------- 8.")]
+
+    def snapshot(self, extra_env=None):
+        """The checkpoint's snapshot under HF_CACHE: Engram's two shards, one other shard, the index."""
+        code, out = self.bash('echo "@$(model_cache_dir)/snapshots/$(snapshot_rev)|$WORKER_ENGRAM_DIR|$DATA_DIR"', extra_env)
+        self.assertEqual(code, 0, out)
+        snap, engram_dir, data_dir = out.split("@")[-1].strip().split("|")
+        snap = Path(snap)
+        snap.mkdir(parents=True, exist_ok=True)
+        for name, data in self.SHARDS.items():
+            (snap / name).write_bytes(data)
+        (snap / "model-00001-of-00048.safetensors").write_bytes(b"shard-weights")
+        names = list(self.SHARDS)
+        (snap / "model.safetensors.index.json").write_text(
+            '{"weight_map": {"layers.0.engram.embed.weight": "%s", "layers.0.engram.embed.scale": "%s",'
+            ' "layers.1.engram.embed.weight": "%s", "layers.0.attn.wq_a.weight": "model-00001-of-00048.safetensors"}}'
+            % (names[0], names[0], names[1]))
+        self.snap, self.data_dir = snap, Path(data_dir)
+        self.engram = {h: Path(engram_dir.replace("$HOME", str(self.sim / "home" / h))) for h in ("w1", "w2", "w3")}
+        return snap
+
+    def run_step(self, extra_env=None):
+        env = {"IMAGE": "runtime-only", **(extra_env or {})}
+        need = sum(len(d) for d in self.SHARDS.values())
+        env.setdefault("PNEED", str(need // 4 + 8192 if env.get("ENGRAM_OWNED", "1") == "1" else need + 8192))
+        body = ('die() { echo "DIED: $*" >&2; exit 1; }\nnode_order() { echo 0,1,3,2; }\n'
+                'SNAP="$(model_cache_dir)/snapshots/$(snapshot_rev)"; SNAP_C=$(model_in_container)\n' + self.step)
+        return self.bash(body, env)
+
+    def reader_opens(self, folder):
+        """Tables.open's rule over a worker's folder: every *.safetensors there, hidden ones too, is a table."""
+        files = list(folder.glob("*.safetensors")) + list(folder.glob(".*.safetensors"))
+        return all(p.read_bytes()[:5] in (b"table", b"shard") for p in files)
+
+    def ssh_commands(self):
+        f = self.sim / "ssh.log"
+        return f.read_text() if f.exists() else ""
+
+    # ---- the workers' copies (ENGRAM_PACKED=0)
+
+    def test_a_clean_setup_copies_once_and_the_reader_opens_it(self):
+        self.snapshot()
+        code, out = self.run_step()
+        self.assertEqual(code, 0, out)
+        for h, d in self.engram.items():
+            self.assertEqual(sorted(p.name for p in d.iterdir()), sorted(self.SHARDS), h)
+            self.assertTrue(self.reader_opens(d), h)
+        (self.sim / "docker-args").unlink()
+        code, out = self.run_step()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(out.count("Engram tables on its disk"), 3, out)
+        self.assertFalse((self.sim / "docker-args").exists(), "a worker's complete tables were copied again")
+
+    def test_an_extra_safetensors_file_stops_prepare_and_is_kept(self):
+        # the sizes of the expected files add up, so before this check prepare.sh passed and the rank then stopped
+        self.snapshot()
+        code, out = self.run_step()
+        self.assertEqual(code, 0, out)
+        for name in ["stray.safetensors", ".hidden.safetensors"]:
+            with self.subTest(name=name):
+                d = self.engram["w2"]
+                (d / name).write_bytes(b"bad")
+                self.assertFalse(self.reader_opens(d))
+                code, out = self.run_step()
+                self.assertNotEqual(code, 0, out)
+                self.assertIn("DIED:", out)
+                self.assertIn(name, out)
+                self.assertIn("w2", out)
+                self.assertEqual((d / name).read_bytes(), b"bad", "the extra file was changed or removed")
+                (d / name).unlink()
+
+    def test_an_extra_file_is_reported_before_a_missing_table_is_copied(self):
+        self.snapshot()
+        d = self.engram["w3"]
+        d.mkdir(parents=True)
+        (d / "old-revision.safetensors").write_bytes(b"tab")
+        code, out = self.run_step()
+        self.assertNotEqual(code, 0, out)
+        self.assertIn("old-revision.safetensors", out)
+        self.assertEqual(sorted(p.name for p in d.iterdir()), ["old-revision.safetensors"], "copied beside a stray file")
+
+    def test_a_name_made_of_two_tables_names_is_not_one_of_them(self):
+        # each name is compared whole: two allowed names with a space between is a third file, which the reader opens
+        self.snapshot()
+        code, out = self.run_step()
+        self.assertEqual(code, 0, out)
+        d = self.engram["w1"]
+        joined = d / " ".join(self.SHARDS)
+        joined.write_bytes(b"bad")
+        self.assertFalse(self.reader_opens(d))
+        (self.sim / "docker-args").unlink()
+        code, out = self.run_step()
+        self.assertNotEqual(code, 0, out)
+        self.assertIn("does not name", out)
+        self.assertEqual(joined.read_bytes(), b"bad")
+        self.assertFalse((self.sim / "docker-args").exists(), "copied beside the extra file")
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root lists a folder whatever its mode")
+    def test_a_folder_that_cannot_be_listed_fails(self):
+        # mode 0300: the tables can still be stat'ed (their sizes add up), but the folder cannot be listed, so neither
+        # this check nor the engine (AccessDenied) can see what else is there
+        self.snapshot()
+        code, out = self.run_step()
+        self.assertEqual(code, 0, out)
+        d = self.engram["w2"]
+        (d / "stray.safetensors").write_bytes(b"bad")
+        d.chmod(0o300)
+        self.addCleanup(d.chmod, 0o755)
+        code, out = self.run_step()
+        self.assertNotEqual(code, 0, out)
+        self.assertIn("cannot list Engram's folder", out)
+        self.assertIn("w2", out)
+        d.chmod(0o755)
+        self.assertEqual(sorted(p.name for p in d.iterdir()), sorted([*self.SHARDS, "stray.safetensors"]))
+
+    def test_a_file_where_the_folder_should_be_fails(self):
+        self.snapshot()
+        d = self.engram["w3"]
+        d.parent.mkdir(parents=True)
+        d.write_text("not a folder")
+        code, out = self.run_step()
+        self.assertNotEqual(code, 0, out)
+        self.assertIn("cannot list Engram's folder", out)
+        self.assertEqual(d.read_text(), "not a folder")
+
+    def test_a_missing_folder_is_made_by_the_first_copy(self):
+        self.snapshot()
+        for d in self.engram.values():
+            self.assertFalse(d.exists())
+        code, out = self.run_step()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(out.count("copying Engram's tables"), 3, out)
+
+    def test_a_missing_table_is_copied_again(self):
+        self.snapshot()
+        code, out = self.run_step()
+        self.assertEqual(code, 0, out)
+        gone = self.engram["w1"] / next(iter(self.SHARDS))
+        gone.unlink()
+        code, out = self.run_step()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(gone.read_bytes(), self.SHARDS[gone.name])
+
+    def test_other_files_beside_the_tables_are_not_flagged(self):
+        # the reader opens only names ending in .safetensors: a partial copy or a note is not its business
+        self.snapshot()
+        code, out = self.run_step()
+        self.assertEqual(code, 0, out)
+        d = self.engram["w1"]
+        (d / (next(iter(self.SHARDS)) + ".part")).write_bytes(b"x")
+        (d / "notes.txt").write_text("mine")
+        code, out = self.run_step()
+        self.assertEqual(code, 0, out)
+
+    def test_the_check_reads_no_table(self):
+        # a listing of names, no hashing and no read of the tables' bytes on the workers
+        self.snapshot()
+        self.run_step()
+        log = self.ssh_commands()
+        for word in ["sha256sum", "md5sum", "cmp ", "b3sum"]:
+            self.assertNotIn(word, log)
+
+    def test_nvfp4_checkpoint_gets_the_same_check(self):
+        env = {"NVFP4": "1"}
+        self.snapshot(env)
+        code, out = self.run_step(env)
+        self.assertEqual(code, 0, out)
+        d = self.engram["w1"]
+        self.assertIn("480550d3", str(d))
+        (d / "stray.safetensors").write_bytes(b"bad")
+        code, out = self.run_step(env)
+        self.assertNotEqual(code, 0, out)
+        self.assertIn("stray.safetensors", out)
+
+    # ---- the packer's input (ENGRAM_PACKED=1)
+
+    def pack_input(self):
+        f = self.sim / "pack-input"
+        return sorted(set(f.read_text().split())) if f.exists() else []
+
+    def test_the_packer_reads_only_the_indexs_engram_files(self):
+        snap = self.snapshot()
+        (snap / "stray.safetensors").write_bytes(b"bad")
+        code, out = self.run_step({"ENGRAM_PACKED": "1"})
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.pack_input(), sorted(self.SHARDS), out)
+        self.assertEqual(len((self.sim / "packed").read_text().splitlines()), 4, out)
+        self.assertEqual((snap / "stray.safetensors").read_bytes(), b"bad", "the snapshot was changed")
+
+    def test_the_packers_view_links_the_snapshots_files(self):
+        self.snapshot()
+        code, out = self.run_step({"ENGRAM_PACKED": "1"})
+        self.assertEqual(code, 0, out)
+        view = self.data_dir / "engram-tables"
+        for name, data in self.SHARDS.items():
+            link = view / name
+            self.assertTrue(link.is_symlink(), name)
+            self.assertFalse(os.path.isabs(os.readlink(link)), "an absolute link does not resolve under /hf")
+            self.assertEqual(link.read_bytes(), data)
+        self.assertIn("/hf/" + str(view.relative_to(self.tmp / "hf")) + " /out", (self.sim / "docker-args").read_text())
+
+    def test_packed_shards_already_there_are_not_packed_again(self):
+        self.snapshot()
+        code, out = self.run_step({"ENGRAM_PACKED": "1"})
+        self.assertEqual(code, 0, out)
+        (self.sim / "packed").unlink()
+        code, out = self.run_step({"ENGRAM_PACKED": "1"})
+        self.assertEqual(code, 0, out)
+        self.assertFalse((self.sim / "packed").exists(), "packed shards that were there were packed again")
+
+    def test_whole_tables_take_the_same_input(self):
+        self.snapshot()
+        code, out = self.run_step({"ENGRAM_PACKED": "1", "ENGRAM_OWNED": "0"})
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.pack_input(), sorted(self.SHARDS))
+        self.assertEqual(set((self.sim / "packed").read_text().split("\n")) - {""}, {"pack 0 1"})
+
+    def test_ablit_packs_the_stock_tables(self):
+        # the overlay changes attn.wo_b only: the tables the packer reads are the stock checkpoint's, in ABLIT's folder
+        env = {"ENGRAM_PACKED": "1", "ABLIT": "1"}
+        self.snapshot(env)
+        code, out = self.run_step(env)
+        self.assertEqual(code, 0, out)
+        self.assertIn("-ablit-", str(self.data_dir))
+        view = self.data_dir / "engram-tables"
+        for name, data in self.SHARDS.items():
+            self.assertEqual((view / name).resolve(), (self.snap / name).resolve())
+        self.assertEqual(self.pack_input(), sorted(self.SHARDS))
 
 
 if __name__ == "__main__":
