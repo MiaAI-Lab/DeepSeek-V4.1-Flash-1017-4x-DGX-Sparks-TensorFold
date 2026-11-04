@@ -318,23 +318,6 @@ class StartSmoke(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertNotIn("MISMATCH", out)
 
-    def test_a_fractional_budget_is_the_bytes_the_engine_truncates_to(self):
-        """0.2 GiB is 214748364 bytes to the engine's truncation, not the 214748365 a round would expect."""
-        self.cache_health()
-        self.health["live"]["cache"]["prompt_state"]["budget_bytes"] = 214748364
-        code, out = self.launch(args=["--prompt-cache-gib", "0.2"])
-        self.assertEqual(code, 0, out)
-        self.assertNotIn("MISMATCH", out)
-        self.assertIn("is now LIVE", out)
-
-    def test_a_rounded_fractional_budget_is_a_mismatch(self):
-        self.cache_health()
-        self.health["live"]["cache"]["prompt_state"]["budget_bytes"] = 214748365
-        code, out = self.launch(infer=False, args=["--prompt-cache-gib", "0.2"])
-        self.assertEqual(code, 1, out)
-        self.assertIn("snapshot budget 214748365 != 214748364", out)
-        self.assertNotIn("is now LIVE", out)
-
     def test_a_context_override_is_the_expected_window(self):
         self.cache_health()
         self.health["live"]["cache"]["context_limit_positions"] = 262144
@@ -387,6 +370,123 @@ class StartSmoke(unittest.TestCase):
         self.assertEqual(code, 1, out)
         self.assertIn("past the shared pool", out)
         self.assertEqual(self.fixture.launched(), [], out)
+
+    def test_a_fractional_budget_is_the_bytes_the_engine_truncates_to(self):
+        """0.2 GiB is 214748364 bytes to the engine's truncation, not the 214748365 a round would expect."""
+        self.cache_health()
+        self.health["live"]["cache"]["prompt_state"]["budget_bytes"] = 214748364
+        code, out = self.launch(args=["--prompt-cache-gib", "0.2"])
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("MISMATCH", out)
+        self.assertIn("is now LIVE", out)
+
+    def test_a_rounded_fractional_budget_is_a_mismatch(self):
+        self.cache_health()
+        self.health["live"]["cache"]["prompt_state"]["budget_bytes"] = 214748365
+        code, out = self.launch(infer=False, args=["--prompt-cache-gib", "0.2"])
+        self.assertEqual(code, 1, out)
+        self.assertIn("snapshot budget 214748365 != 214748364", out)
+        self.assertNotIn("is now LIVE", out)
+
+    def test_a_parallel_override_of_zero_is_refused_before_any_container(self):
+        """The engine normalizes 0 to one stream, so a launch expecting 0 could never match its report."""
+        code, out = self.fixture.run_script(
+            ["start.sh", "--parallel", "0"],
+            {"PREPARE": "0", "HOST": "127.0.0.1", "PORT": str(self.port)},
+            timeout=15,
+        )
+        self.assertEqual(code, 1, out)
+        self.assertIn("--parallel 0", out)
+        self.assertIn("the engine reads 0 as 1", out)
+        self.assertEqual(self.fixture.launched(), [], out)
+        self.assertNotIn(("GET", "/health"), self.hits)
+
+    def test_a_parallel_override_above_the_launch_count_is_refused_before_any_container(self):
+        code, out = self.fixture.run_script(
+            ["start.sh", "--parallel", "8"],
+            {"PREPARE": "0", "HOST": "127.0.0.1", "PORT": str(self.port), "PARALLEL": "4"},
+            timeout=15,
+        )
+        self.assertEqual(code, 1, out)
+        self.assertIn("is above PARALLEL (4)", out)
+        self.assertEqual(self.fixture.launched(), [], out)
+
+    def test_a_flag_without_a_value_is_refused_before_any_container(self):
+        for flag in ["--context=", "--parallel=", "--prompt-cache-gib="]:
+            with self.subTest(flag=flag):
+                code, out = self.fixture.run_script(
+                    ["start.sh", flag],
+                    {"PREPARE": "0", "HOST": "127.0.0.1", "PORT": str(self.port)},
+                    timeout=15,
+                )
+                self.assertEqual(code, 1, out)
+                self.assertIn("needs a value", out)
+                self.assertEqual(self.fixture.launched(), [], out)
+        for flag in ["--context", "--parallel", "--prompt-cache-gib"]:  # a trailing flag has no value either
+            with self.subTest(flag=flag):
+                code, out = self.fixture.run_script(
+                    ["start.sh", flag],
+                    {"PREPARE": "0", "HOST": "127.0.0.1", "PORT": str(self.port)},
+                    timeout=15,
+                )
+                self.assertEqual(code, 1, out)
+                self.assertIn("needs a value", out)
+                self.assertEqual(self.fixture.launched(), [], out)
+
+    def test_a_non_decimal_count_is_refused_before_any_container(self):
+        """0100 is octal 64 to Bash and 100 to the engine; both readings are wrong to launch with either way."""
+        for value in ["0100", "99999999999999999999999", "-1", "1 00"]:
+            with self.subTest(value=value):
+                code, out = self.fixture.run_script(
+                    ["start.sh", f"--context={value}"],
+                    {"PREPARE": "0", "HOST": "127.0.0.1", "PORT": str(self.port)},
+                    timeout=15,
+                )
+                self.assertEqual(code, 1, out)
+                self.assertIn("a plain decimal token count", out)
+                self.assertEqual(self.fixture.launched(), [], out)
+
+    def test_a_dotted_count_is_refused_before_any_container(self):
+        for value in ["010000", "1e6"]:
+            with self.subTest(value=value):
+                code, out = self.fixture.run_script(
+                    ["start.sh", f"--parallel={value}"],
+                    {"PREPARE": "0", "HOST": "127.0.0.1", "PORT": str(self.port)},
+                    timeout=15,
+                )
+                self.assertEqual(code, 1, out)
+                self.assertIn("a plain decimal stream count", out)
+                self.assertEqual(self.fixture.launched(), [], out)
+
+    def assertHealthErrorRejected(self, error):
+        """The launcher's test is `is not None`, as step 5's is: a falsey error object is still an error."""
+        self.cache_health()
+        self.health["error"] = error
+        code, out = self.launch(infer=False)
+        self.assertEqual(code, 1, out)
+        self.assertIn("health reported an error", out)
+        self.assertNotIn("is now LIVE", out)
+
+    def test_a_falsey_health_error_object_still_fails(self):
+        self.assertHealthErrorRejected({})
+
+    def test_an_empty_health_error_string_still_fails(self):
+        self.assertHealthErrorRejected("")
+
+    def test_a_false_health_error_still_fails(self):
+        self.assertHealthErrorRejected(False)
+
+    def test_a_budget_past_the_engines_ceiling_is_refused_before_any_container(self):
+        for value in ["17179869184", "99999999999999"]:
+            with self.subTest(value=value):
+                code, out = self.fixture.run_script(
+                    ["start.sh", f"--prompt-cache-gib={value}"],
+                    {"PREPARE": "0", "HOST": "127.0.0.1", "PORT": str(self.port)},
+                    timeout=15,
+                )
+                self.assertEqual(code, 1, out)
+                self.assertIn("past the engine's 2^34 GiB ceiling", out)
+                self.assertEqual(self.fixture.launched(), [], out)
 
     def test_a_health_redirect_is_not_a_cache_report(self):
         self.cache_health()

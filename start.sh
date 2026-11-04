@@ -52,31 +52,54 @@ check_workers
 
 # The operator's arguments are appended to rank 0's serve line, so they win over the environment: everything that
 # compares against the launch must read the same final value the engine will — the last occurrence, in either form
-# (`--flag value`, `--flag=value`).
+# (`--flag value`, `--flag=value`). A flag given no value at all (`--context=`, a trailing `--context`) is the operator's
+# mistake and is refused here, not by the engine once the ranks are launched.
 EXTRA=("$@")
-argv_flag() {
-  local name=$1 out="" i=0 arg
+argv_flag() {  # sets ARGV_SEEN (the flag was given) and ARGV_VALUE (its last value: empty when it was given none)
+  local name=$1 i=0 arg
+  ARGV_SEEN=0; ARGV_VALUE=
   while (( i < ${#EXTRA[@]} )); do
     arg=${EXTRA[i]}
-    if [[ "$arg" == "$name" ]] && (( i + 1 < ${#EXTRA[@]} )); then
-      out=${EXTRA[i + 1]}
+    if [[ "$arg" == "$name" ]]; then
+      ARGV_SEEN=1; ARGV_VALUE=
+      if (( i + 1 < ${#EXTRA[@]} )); then ARGV_VALUE=${EXTRA[i + 1]}; fi
     elif [[ "$arg" == "$name="* ]]; then
-      out=${arg#*=}
+      ARGV_SEEN=1; ARGV_VALUE=${arg#*=}
     fi
     i=$((i + 1))
   done
-  printf '%s' "$out"
+  return 0
 }
-EFF_CONTEXT=$(argv_flag --context); EFF_CONTEXT=${EFF_CONTEXT:-$CONTEXT}
-EFF_PARALLEL=$(argv_flag --parallel); EFF_PARALLEL=${EFF_PARALLEL:-$PARALLEL}
-EFF_CACHE_GIB=$(argv_flag --prompt-cache-gib); EFF_CACHE_GIB=${EFF_CACHE_GIB:-$PROMPT_CACHE_GIB}
-# The engine refuses these only after loading ~75 GiB on every Spark: refuse them before any container starts.
-[[ "$EFF_CONTEXT" =~ ^[0-9]+$ ]] || die "--context $EFF_CONTEXT: a token count, or 0 for the model's window"
+eff_flag() {  # the operator's last --flag, else the environment's value; `what` completes "needs a value: ..."
+  local name=$1 env=$2 what=$3
+  argv_flag "$name"
+  if (( ARGV_SEEN )); then
+    [[ -n "$ARGV_VALUE" ]] || die "$name needs a value: $what"
+    printf '%s' "$ARGV_VALUE"
+  else
+    printf '%s' "$env"
+  fi
+}
+EFF_CONTEXT=$(eff_flag --context "$CONTEXT" "a token count, or 0 for the model's window")
+EFF_PARALLEL=$(eff_flag --parallel "$PARALLEL" "a stream count, or auto")
+EFF_CACHE_GIB=$(eff_flag --prompt-cache-gib "$PROMPT_CACHE_GIB" "a non-negative number of GiB")
+# The engine refuses these only after loading ~75 GiB on every Spark: refuse them before any container starts. A count is
+# a plain decimal: digits only, no sign and no leading zero (Bash would read 0100 as octal 64), at most a few digits so no
+# comparison here can wrap.
+[[ "$EFF_CONTEXT" =~ ^(0|[1-9][0-9]{0,6})$ ]] || die "--context $EFF_CONTEXT: a plain decimal token count, or 0 for the model's window"
 (( EFF_CONTEXT <= 1048576 )) || die "--context $EFF_CONTEXT is past the model's 1,048,576-token window"
 (( EFF_CONTEXT != 0 || POOL >= 1048576 )) || die "--context 0 asks for the model's 1,048,576-token window, past the shared pool (POOL=$POOL)"
 (( EFF_CONTEXT == 0 || EFF_CONTEXT <= POOL )) || die "--context $EFF_CONTEXT is past the shared pool (POOL=$POOL): a request's positions must fit it"
-[[ "$EFF_PARALLEL" == auto || "$EFF_PARALLEL" =~ ^[0-9]+$ ]] || die "--parallel $EFF_PARALLEL: a number, or auto"
+if [[ "$EFF_PARALLEL" != auto ]]; then
+  # the engine clamps 0 up to 1 and 4096 down at the top; 0 would also make the check expect 0 streams where the engine
+  # reports 1. A count above PARALLEL is past what this launch and the shared pool were sized for: NoFreeSlot later.
+  [[ "$EFF_PARALLEL" =~ ^[1-9][0-9]{0,3}$ ]] || die "--parallel $EFF_PARALLEL: a plain decimal stream count from 1, or auto (the engine reads 0 as 1)"
+  (( EFF_PARALLEL <= PARALLEL )) || die "--parallel $EFF_PARALLEL is above PARALLEL ($PARALLEL), what this launch and the shared pool were sized for: raise PARALLEL (in the environment or scripts/local.sh) to run more streams"
+fi
 [[ "$EFF_CACHE_GIB" =~ ^(0|[0-9]+([.][0-9]+)?)$ ]] || die "--prompt-cache-gib $EFF_CACHE_GIB: a non-negative number of GiB"
+cache_whole=${EFF_CACHE_GIB%%.*}  # the engine refuses a budget at or past 2^34 GiB: refuse it before any container starts
+[[ ${#cache_whole} -le 11 ]] || die "--prompt-cache-gib $EFF_CACHE_GIB is past the engine's 2^34 GiB ceiling"
+(( cache_whole < 17179869184 )) || die "--prompt-cache-gib $EFF_CACHE_GIB is past the engine's 2^34 GiB ceiling"
 
 B=$'\033[1m'; M=$'\033[1;35m'; G=$'\033[1;32m'; D=$'\033[2m'; R=$'\033[0m'
 [[ -t 1 ]] || { B=; M=; G=; D=; R=; }
@@ -267,7 +290,7 @@ except Exception:
     print("health is unreadable"); sys.exit(3)
 if not isinstance(doc, dict):
     print("health is not a JSON object"); sys.exit(3)
-if doc.get("error"):
+if doc.get("error") is not None:  # the same test step 5 applies: {} or a blank string is an error, not absence
     print("health reported an error: %s" % str(doc["error"])[:160]); sys.exit(3)
 c = (doc.get("live") or {}).get("cache")
 if not isinstance(c, dict):
