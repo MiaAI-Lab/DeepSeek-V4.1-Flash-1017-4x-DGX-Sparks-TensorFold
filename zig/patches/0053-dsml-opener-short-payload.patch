@@ -39,10 +39,18 @@ index daec4e64..d0eb23a1 100644
                      error.OutOfMemory => return error.OutOfMemory,
                      error.Invalid => null,
 diff --git a/zig/src/server/tool_parse_test.zig b/zig/src/server/tool_parse_test.zig
-index 78f5d8ea..db66502f 100644
+index 78f5d8ea..0607d1a6 100644
 --- a/zig/src/server/tool_parse_test.zig
 +++ b/zig/src/server/tool_parse_test.zig
-@@ -285,3 +285,59 @@ test "around a DSML block: prose that quotes its closer, several blocks, both sp
+@@ -4,6 +4,7 @@ const json = @import("json.zig");
+ const tool_parse = @import("tool_parse.zig");
+ const parse = tool_parse.parse;
+ const closeCall = tool_parse.closeCall;
++const tool_stream = @import("tool_stream.zig");
+ 
+ test "families" {
+     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+@@ -285,3 +286,70 @@ test "around a DSML block: prose that quotes its closer, several blocks, both sp
      try std.testing.expectEqualStrings("and", rm.content);
      try expectStreamAgrees(a, mixed, "and");
  }
@@ -64,7 +72,11 @@ index 78f5d8ea..db66502f 100644
 +        "<ns:tool_call><" ++ D ++ "tool_calls></ns:tool_call>",
 +        "<tool_call><" ++ D ++ " calls></" ++ D ++ " calls</tool_call>", // one byte short
 +    };
-+    for (short) |text| {
++    // the stream filter's text at the end of each reply: it hides an unclosed DSML block from its opener on (the
++    // route sends the whole content at the end when the filter showed nothing, so only the replies with text before
++    // the opener reach a streaming client shorter than they reach a non-streaming one)
++    const streamed_text = [_][]const u8{ "", "", "Sure:", "<TOOL_CALL>", "", "<ns:tool_call>", "" };
++    for (short, streamed_text) |text, shown| {
 +        // with no limit the block stays the reply's text; a one-call reply drops it and keeps the prose before it
 +        const r = try parse(a, text, tools, null);
 +        try std.testing.expect(r.calls == null);
@@ -72,11 +84,18 @@ index 78f5d8ea..db66502f 100644
 +        const one = try parse(a, text, tools, 1);
 +        try std.testing.expect(one.calls == null);
 +        try std.testing.expectEqualStrings(if (std.mem.startsWith(u8, text, "Sure:")) "Sure:" else "", one.content);
-+        // the stream shows no more than the whole reply: the stream filter hides the block from its DSML opener on
 +        const reply_text = @import("reply_text.zig");
-+        const streamed = std.mem.trim(u8, try reply_text.hideToolCalls(a, text, true), " \t\r\n");
-+        try std.testing.expect(std.mem.startsWith(u8, r.content, streamed));
++        try std.testing.expectEqualStrings(shown, std.mem.trim(u8, try reply_text.hideToolCalls(a, text, true), " \t\r\n"));
 +        try expectNoRetraction(a, text);
++        // the live tool-call streamer, fed byte by byte, sends no call, with a <tool_call> template or a DSML one
++        for ([_]bool{ false, true }) |dsml_template| {
++            var st = try tool_stream.Streamer.init(a, tools);
++            st.calls_off = dsml_template;
++            var out: std.ArrayList(json.Value) = .empty;
++            for (1..text.len + 1) |n| try st.feed(text[0..n], &out);
++            try std.testing.expect(!st.streamed);
++            try std.testing.expectEqual(@as(usize, 0), out.items.len);
++        }
 +    }
 +    // after an offered call, either spelling, each limit: a V4 block is read after the limit is checked, a V4.1 block
 +    // before it, so before the guard a V4.1 block crashed the parser at any limit and a V4 block only with no limit
