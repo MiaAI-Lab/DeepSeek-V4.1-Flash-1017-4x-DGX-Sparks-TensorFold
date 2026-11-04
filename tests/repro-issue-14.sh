@@ -5,7 +5,9 @@
 # The parser cut the block at that first closer, dropped the call, and a streamed reply showed only the closers left
 # after it. The reply's form is forced with guided_regex (structured output, patch 0036), greedy, thinking off, so the
 # run is deterministic; the parser reads the forced text exactly as it would read a sampled one. A control call with a
-# plain value must parse in both modes, or the script cannot judge.
+# plain value must parse in both modes, or the script cannot judge. A second case puts the closer and <tool_call> markup in
+# the first of two values: streamed and whole replies must both return the two calls (the streamer must not send the
+# quoted <tool_call> as a call).
 API=$1; MODEL=$2
 if [ -z "$API" ] || [ -z "$MODEL" ]; then echo "usage: $0 API MODEL" >&2; exit 2; fi
 exec python3 - "$API" "$MODEL" <<'PY'
@@ -72,5 +74,18 @@ for stream in (False, True):
     if not good(r, held):
         ok = False
         print(f"  FAIL {name}: expected one write call with the value intact and no DSML closer in content")
+# two calls, the first value holding the block's closer and <tool_call> markup (a file about tool formats): both
+# clients, streamed and not, must get the two calls with their values intact, not the quoted <tool_call> as a call
+def block2(v1, v2):
+    inv = lambda path, value: (f"<{D} invoke name=\"write\">\n<{D} parameter name=\"path\" string=\"true\">{path}</{D} parameter>\n"
+                               f"<{D} parameter name=\"content\" string=\"true\">{value}</{D} parameter>\n</{D} invoke>")
+    return f"<{D} calls>\n{inv('notes.md', v1)}\n{inv('two.md', v2)}\n</{D} calls>"
+quoted = f"</{D} calls><tool_call><function=write></function></tool_call>"
+want = [("write", {"path": "notes.md", "content": quoted}), ("write", {"path": "two.md", "content": "two"})]
+for stream in (False, True):
+    r = ask(block2(quoted, "two"), stream); name = f"two calls, the first value holds the closer and <tool_call> markup, {'stream' if stream else 'whole'}"; show(name, r)
+    if not (r["calls"] == want and r["finish"] == "tool_calls" and CLOSER not in r["content"]):
+        ok = False
+        print(f"  FAIL {name}: expected the two write calls with their values intact and no DSML closer in content")
 print("RESULT: " + ("fixed" if ok else "problem shows")); sys.exit(0 if ok else 1)
 PY

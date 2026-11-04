@@ -1,5 +1,31 @@
-Subject: the block's own closer inside a DSML parameter value no longer ends the block
+Subject: the block's own closer inside a DSML parameter value no longer ends the block, and a DSML template's reply streams no <tool_call> markup as a call
 
+diff --git a/zig/src/server/chat.zig b/zig/src/server/chat.zig
+index 80faee37..c237e59b 100644
+--- a/zig/src/server/chat.zig
++++ b/zig/src/server/chat.zig
+@@ -7,6 +7,7 @@ const fields_mod = @import("fields.zig");
+ const reply_text = @import("reply_text.zig");
+ const tool_stream = @import("tool_stream.zig");
+ const tool_parse = @import("tool_parse.zig");
++const tool_grammar = @import("tool_grammar.zig");
+ const output_diagnostics = @import("output_diagnostics.zig");
+ const prompt_mod = @import("prompt.zig");
+ const log = @import("log.zig");
+@@ -251,7 +252,12 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
+     defer srv.noteRequest(prepared.prompt_len, box.cached orelse 0, gen.collected.items.len, box.stats.drafted, box.stats.accepted, box.stats.rounds, received, gen.first_ns, gen.last_ns, box.stats.prefill_seconds);
+     errdefer if (!gen.engine_done) gen.cancel(); // the engine writes to the mailbox until it says finished
+     const result: Failure!Reply = blk: {
+-        if (sink != null and gen.tools.len > 0) gen.calls = tool_stream.Streamer.init(a, gen.tools) catch |e| break :blk e;
++        if (sink != null and gen.tools.len > 0) {
++            gen.calls = tool_stream.Streamer.init(a, gen.tools) catch |e| break :blk e;
++            // a DSML template's calls are DSML blocks, which the streamer does not read: it streams none, so a streaming
++            // client gets the parsed calls at the end, the ones a non-streaming client gets
++            gen.calls.?.calls_off = tool_grammar.writesDsml(srv, a);
++        }
+         gen.loop(gone) catch |e| break :blk e;
+         break :blk gen.finish(cx, prepared.prompt_len, received, submitted, thinking, effort, prepared.sampled, prepared.drafts);
+     };
 diff --git a/zig/src/server/reply_text.zig b/zig/src/server/reply_text.zig
 index 8b132bc4..5a3f0716 100644
 --- a/zig/src/server/reply_text.zig
@@ -141,6 +167,35 @@ index 8b132bc4..5a3f0716 100644
          pos = end + calls[which][1].len;
      }
  }
+diff --git a/zig/src/server/tool_grammar.zig b/zig/src/server/tool_grammar.zig
+index ea0e454b..8691b18f 100644
+--- a/zig/src/server/tool_grammar.zig
++++ b/zig/src/server/tool_grammar.zig
+@@ -54,9 +54,23 @@ pub fn style(rendered: []const u8) ?Style {
+     return null;
+ }
+ 
++/// A turn that calls `probe` with {key: "v"}, for rendering through the served chat template.
++const probe_turn_json = "[{\"role\": \"user\", \"content\": \"x\"}, {\"role\": \"assistant\", \"content\": \"\", \"tool_calls\": [{\"id\": \"call_0\", \"type\": \"function\", \"function\": {\"name\": \"" ++ probe ++ "\", \"arguments\": {\"" ++ key ++ "\": \"v\"}}}]}]";
++
++/// Whether the served chat template writes DeepSeek's DSML calls (`style` of the probe turn it renders); false when
++/// the probe does not render. A reply's calls are then read by the parse at the reply's end.
++pub fn writesDsml(srv: *Server, a: Allocator) bool {
++    const parsed = json.parse(a, probe_turn_json) catch return false;
++    var scratch: Cx = .{ .a = a };
++    const ids = prompt.renderIds(srv, &scratch, parsed.ok, &.{}, false, null, false) catch return false;
++    const rendered = srv.text.decode(a, ids) catch return false;
++    const s = style(rendered) orelse return false;
++    return s == .dsml or s == .dsml41;
++}
++
+ /// The grammar for a reply that must call one of `tools`: one call, or (`parallel`) one or more, then the end.
+ pub fn structure(srv: *Server, cx: *Cx, tools: []const Value, parallel: bool, thinking: bool) errors.Refused!api.Structure {
+-    const probe_turn = (try json.parse(cx.a, "[{\"role\": \"user\", \"content\": \"x\"}, {\"role\": \"assistant\", \"content\": \"\", \"tool_calls\": [{\"id\": \"call_0\", \"type\": \"function\", \"function\": {\"name\": \"" ++ probe ++ "\", \"arguments\": {\"" ++ key ++ "\": \"v\"}}}]}]")).ok;
++    const probe_turn = (try json.parse(cx.a, probe_turn_json)).ok;
+     var scratch: Cx = .{ .a = cx.a };
+     const rendered = if (prompt.renderIds(srv, &scratch, probe_turn, &.{}, false, null, false)) |ids| try srv.text.decode(cx.a, ids) else |_| "";
+     const s = style(rendered) orelse return cx.refuse("tool_choice \"required\" or a named function needs a chat template that writes <tool_call> calls (XML parameters or a JSON object) or DeepSeek's DSML calls, and this one does not: send \"auto\"");
 diff --git a/zig/src/server/tool_parse.zig b/zig/src/server/tool_parse.zig
 index 13db5847..daec4e64 100644
 --- a/zig/src/server/tool_parse.zig
@@ -382,3 +437,75 @@ index 5516e485..78f5d8ea 100644
 +    try std.testing.expectEqualStrings("and", rm.content);
 +    try expectStreamAgrees(a, mixed, "and");
 +}
+diff --git a/zig/src/server/tool_stream.zig b/zig/src/server/tool_stream.zig
+index a02ee06d..995e985f 100644
+--- a/zig/src/server/tool_stream.zig
++++ b/zig/src/server/tool_stream.zig
+@@ -49,6 +49,9 @@ pub const Streamer = struct {
+     held: []const u8 = "",
+     streamed: bool = false,
+     searched: usize = 0, // the answer is only ever extended, so prose already searched holds no opener
++    /// The template writes DSML calls (`tool_grammar.writesDsml`): no call is streamed, and the reply's calls reach the
++    /// client from the parse at its end, as they reach a non-streaming one.
++    calls_off: bool = false,
+ 
+     pub fn init(a: Allocator, tools: []const Value) Allocator.Error!Streamer {
+         var s: Streamer = .{ .a = a, .schemas = try tool_params.schemas(a, tools) };
+@@ -78,6 +81,7 @@ pub const Streamer = struct {
+ 
+     /// The deltas the reply's ``text`` (its whole answer so far) adds.
+     pub fn feed(s: *Streamer, text: []const u8, out: *std.ArrayList(Value)) Allocator.Error!void {
++        if (s.calls_off) return;
+         while (s.state != .abort) {
+             const rest = text[@min(s.pos, text.len)..];
+             switch (s.state) {
+@@ -386,6 +390,49 @@ test "a one-call reply drops an unoffered call and still hides an unclosed one"
+ 
+ const tool_parse = @import("tool_parse.zig");
+ 
++test "a DSML template's reply streams no call, so its parsed calls reach the client, tool markup in a value or not" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const tools = (try json.parse(a, "[{\"type\":\"function\",\"function\":{\"name\":\"write\"}}]")).ok.array;
++    const D = "\u{ff5c}DSML\u{ff5c}";
++    const qwen = "<tool_call><function=write></function></tool_call>";
++    for ([_]bool{ true, false }) |v41| {
++        const x = if (v41) " " else "";
++        const bn = if (v41) "calls" else "tool_calls";
++        const call = struct {
++            fn one(al: Allocator, sp: []const u8, value: []const u8) ![]const u8 {
++                return std.mem.concat(al, u8, &.{ "\n<", D, sp, "invoke name=\"write\">\n<", D, sp, "parameter name=\"content\" string=\"true\">", value, "</", D, sp, "parameter>\n</", D, sp, "invoke>" });
++            }
++        };
++        const open = try std.mem.concat(a, u8, &.{ "<", D, x, bn, ">" });
++        const close = try std.mem.concat(a, u8, &.{ "</", D, x, bn, ">" });
++        // a value holding Qwen markup; one holding the block's closer and Qwen markup, then a second call (the review
++        // case); Qwen markup in prose after a block
++        const replies = [_][]const u8{
++            try std.mem.concat(a, u8, &.{ open, try call.one(a, x, qwen), "\n", close }),
++            try std.mem.concat(a, u8, &.{ open, try call.one(a, x, try std.mem.concat(a, u8, &.{ close, qwen })), try call.one(a, x, "two"), "\n", close }),
++            try std.mem.concat(a, u8, &.{ open, try call.one(a, x, "one"), "\n", close, "\nThe other format: ", qwen }),
++        };
++        for (replies) |text| {
++            var st = try Streamer.init(a, tools);
++            st.calls_off = true;
++            var out: std.ArrayList(Value) = .empty;
++            for (1..text.len + 1) |n| try st.feed(text[0..n], &out);
++            try std.testing.expect(!st.streamed); // the route then sends the parsed calls
++            try std.testing.expectEqual(@as(usize, 0), out.items.len);
++            const r = try tool_parse.parse(a, text, tools, null);
++            for (r.calls.?) |c| try std.testing.expectEqualStrings("write", c.get("function").?.get("name").?.string);
++        }
++        // the review case: the two intended calls, the first value intact
++        const two = (try tool_parse.parse(a, replies[1], tools, null)).calls.?;
++        try std.testing.expectEqual(@as(usize, 2), two.len);
++        try std.testing.expectEqualStrings(try std.mem.concat(a, u8, &.{ "{\"content\":\"", close, qwen, "\"}" }), two[0].get("function").?.get("arguments").?.string);
++    }
++    // a template that writes <tool_call> calls still streams them as they are written
++    try std.testing.expect((try streamed(a, tools, &.{qwen})).len > 0);
++}
++
+ /// The deltas one streamer sends while the reply grows through ``texts``.
+ fn streamed(a: Allocator, tools: []const Value, texts: []const []const u8) Allocator.Error![]Value {
+     var s = try Streamer.init(a, tools);
