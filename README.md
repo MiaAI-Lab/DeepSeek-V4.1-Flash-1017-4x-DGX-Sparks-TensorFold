@@ -53,7 +53,7 @@ rank's rendezvous address). Full list: [Credits](#credits) and [`CREDITS.md`](CR
 - One command on spark1: `./start.sh` (a switch) or `./start-switchless.sh` (a ring) sets up all four Sparks and
   starts the four ranks; `./stop.sh` stops them
 
-**This recipe's own patches** ([`zig/patches`](zig/patches)) **are Mia's AI Lab's work, except `0008`, `0052` and `0053` (Hector), `0026`
+**This recipe's own patches** ([`zig/patches`](zig/patches)) **are Mia's AI Lab's work, except `0008`, `0052` and `0053` (Hector Isaza, hecisaza), `0026`
 (knapcio), `0027` (Thomas Kempka), `0028` and `0029` (upstream TensorFold fixes backported by Mauvis Ledford), `0030`
 and `0031` (Mauvis Ledford), `0033` (a backport by Manuel, manuel1618), `0034` (Hironori Uchikawa, uchkw), `0036`
 (upstream TensorFold's structured output by BobClawblaw and Ash Hart, and BertholomusAI's DeepSeek-V4.1 part of it,
@@ -478,7 +478,7 @@ measurements and rationale: [`CHANGELOG.md`](CHANGELOG.md); authorship: [`CREDIT
 | `0043` | SvangenStudios | -- (on) | A reply made only of orphan DSML closing tags gets `tensorfold.tool_parse_warning` (diagnostic only; [#14](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/issues/14)) |
 | `0046` | shalk3 | `TF_DS_LOAD_PREFETCH` (on) | The weight loader's file is read ahead by 8 threads (32 MiB chunks, at most 4 GiB past the loader), so its reads come from the page cache: a node's load 83 s -> 27 s from NVMe; the weights are unchanged |
 | `0052` | **Hector** | -- (on) | The block's own closer or opener inside a DSML parameter value (a file about DSML) no longer ends or splits the block: the call stays a call and the block's closers stay out of the reply's text, whole or streamed; any other block closes at its first closer, as before. With a template that writes DSML calls, the live streamer sends no `<tool_call>` markup as a call, so streaming clients get the parsed calls ([#14](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/issues/14)) |
-| `0053` | **Hector** | -- (on) | A `<tool_call>` block (or `<\|tool_call>`, `<x:tool_call>`) that holds only the start of a DSML block, shorter than the block's opener and closer together, stays the reply's text: the parser no longer slices past the block's start. Every other reply parses as before |
+| `0053` | **Hector** | -- (on) | A `<tool_call>` block (or `<\|tool_call>`, `<x:tool_call>`) whose payload holds only the start of a DSML block, shorter than the block's opener and closer together, stays the reply's text (a one-call reply drops it): the parser no longer slices past the payload's start. Every payload long enough parses as before |
 
 ### Idle RDMA CPU use
 

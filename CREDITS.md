@@ -86,7 +86,7 @@ TensorFold, `0039`-`0043`, which are SvangenStudios's, `0046`, which is shalk3's
 | `0043` | [SvangenStudios](https://github.com/SvangenStudios) | a diagnostic for replies made only of orphan DSML closing tags |
 | `0046` | [shalk3](https://github.com/shalk3) | a rank's weight file read ahead of the loader (`TF_DS_LOAD_PREFETCH`) |
 | `0052` | **Hector** ([hecisaza](https://github.com/hecisaza)) | the block's own tags inside a DSML parameter value no longer end the block: the call stays and no closer reaches the text |
-| `0053` | **Hector** ([hecisaza](https://github.com/hecisaza)) | a tool-call block too short to hold the DSML block it opens with stays text; the parser no longer slices past its start |
+| `0053` | **Hector** ([hecisaza](https://github.com/hecisaza)) | a tool-call block whose payload is too short to hold the DSML block it opens with stays text (a one-call reply drops it); the parser no longer slices past the payload's start |
 
 The per-patch notes below also credit everyone who helped find or shape a specific fix along the way -- Hector's
 reviewer, Codex and Grok's live-bug diagnosis and design reviews, an outside reviewer's observation -- without

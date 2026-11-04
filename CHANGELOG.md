@@ -1,11 +1,12 @@
 # Changelog
 
-- **2026-11-04** -- `0053` (Hector, [hecisaza](https://github.com/hecisaza)): a reply whose `<tool_call>` block
-  (or `<|tool_call>` or `<x:tool_call>` block) opens with a DSML opener and is shorter than that opener and its closer
-  together (`<tool_call><｜DSML｜ calls></tool_call>`) made the parser cut both from it, a slice past the block's start.
-  A safety-checked build panics there; the served build has no such checks and reads past the reply. Such a block now
-  stays the reply's text, as any other tool-call block that is not a call, and drops out of a one-call reply. Every
-  reply long enough to hold the opener and closer parses exactly as before: the guard returns the same slice.
+- **2026-11-04** -- `0053` (Hector, [hecisaza](https://github.com/hecisaza)): a tool-call block (`<tool_call>`,
+  `<|tool_call>` or `<x:tool_call>`) whose payload opens with a DSML opener but is shorter than that opener and its
+  closer together made the parser cut both from it, a slice past the payload's start. A safety-checked build panics
+  there; the served build has no such checks and reads out of bounds. Such a payload now reads as no DSML block: the
+  block stays the reply's text with no call, or drops out of a one-call reply, as any other tool-call block that is
+  not a call. Every payload long enough to hold the opener and the closer parses exactly as before: the guard returns
+  the same slice.
 - **2026-11-04** -- `0052` (Hector, [hecisaza](https://github.com/hecisaza)): a DSML tool call whose string value holds
   the block's own closer (`</｜DSML｜ calls>`, as in a file about DSML) was cut at that closer: the call was dropped, and
   a streamed reply showed what followed it as text, with `finish_reason: stop`, the symptom reported in
