@@ -347,7 +347,7 @@ class StartSmoke(unittest.TestCase):
         self.health["live"]["cache"]["stream_capacity"] = 7
         code, out = self.launch(args=["--parallel", "auto"])
         self.assertEqual(code, 0, out)
-        self.assertIn("7 streams (what the budget fits)", out)
+        self.assertIn("7 streams (engine-selected)", out)
         self.assertNotIn("MISMATCH", out)
 
     def test_an_override_past_the_pool_is_refused_before_any_container(self):
@@ -361,14 +361,38 @@ class StartSmoke(unittest.TestCase):
         self.assertEqual(self.fixture.launched(), [], out)
         self.assertNotIn(("GET", "/health"), self.hits)
 
-    def test_an_override_above_the_shared_pool_is_refused_before_any_container(self):
+    def test_an_override_above_context_is_refused_before_any_container(self):
+        """The followers are launched with CONTEXT and size their buffers for it (ctx_cap); a wider rank-0 window is not theirs."""
         code, out = self.fixture.run_script(
-            ["start.sh", "--context", "1048576"],
-            {"PREPARE": "0", "HOST": "127.0.0.1", "PORT": str(self.port), "POOL": "524288", "CONTEXT": "524288"},
+            ["start.sh", "--context", "524288"],
+            {"PREPARE": "0", "HOST": "127.0.0.1", "PORT": str(self.port), "POOL": "2097152", "CONTEXT": "262144"},
             timeout=15,
         )
         self.assertEqual(code, 1, out)
-        self.assertIn("past the shared pool", out)
+        self.assertIn("above CONTEXT (262144)", out)
+        self.assertEqual(self.fixture.launched(), [], out)
+
+    def test_an_engine_chosen_context_above_a_narrower_context_is_refused_before_any_container(self):
+        """`--context 0` asks for the model's 1,048,576-token window, which the followers were not sized for either."""
+        code, out = self.fixture.run_script(
+            ["start.sh", "--context", "0"],
+            {"PREPARE": "0", "HOST": "127.0.0.1", "PORT": str(self.port), "POOL": "2097152", "CONTEXT": "262144"},
+            timeout=15,
+        )
+        self.assertEqual(code, 1, out)
+        self.assertIn("above CONTEXT (262144)", out)
+        self.assertIn("set CONTEXT=1048576", out)
+        self.assertEqual(self.fixture.launched(), [], out)
+
+    def test_a_parallel_auto_below_the_engines_eight_streams_is_refused_before_any_container(self):
+        """auto is 8 streams to the engine and this backend never lowers them by memory: 4 slots would meet NoFreeSlot."""
+        code, out = self.fixture.run_script(
+            ["start.sh", "--parallel", "auto"],
+            {"PREPARE": "0", "HOST": "127.0.0.1", "PORT": str(self.port), "PARALLEL": "4"},
+            timeout=15,
+        )
+        self.assertEqual(code, 1, out)
+        self.assertIn("asks the engine for its 8 streams", out)
         self.assertEqual(self.fixture.launched(), [], out)
 
     def test_a_fractional_budget_is_the_bytes_the_engine_truncates_to(self):
@@ -487,6 +511,26 @@ class StartSmoke(unittest.TestCase):
                 self.assertEqual(code, 1, out)
                 self.assertIn("past the engine's 2^34 GiB ceiling", out)
                 self.assertEqual(self.fixture.launched(), [], out)
+
+    def test_a_leading_zero_budget_is_decimal_not_octal(self):
+        """`08` is 8 GiB to the engine; Bash read it as an invalid octal and reported a ceiling that was not there."""
+        self.cache_health()
+        self.health["live"]["cache"]["prompt_state"]["budget_bytes"] = 8 << 30
+        code, out = self.launch(args=["--prompt-cache-gib", "08"])
+        self.assertEqual(code, 0, out)
+        self.assertIn("snapshots 8192 MiB", out)
+        self.assertNotIn("ceiling", out)
+        self.assertIn("is now LIVE", out)
+
+    def test_a_leading_zero_fractional_budget_is_decimal_not_octal(self):
+        """`09.5` is 9.5 GiB, not Bash's octal error; the whole part is 9, a digit Bash refuses as octal."""
+        self.cache_health()
+        self.health["live"]["cache"]["prompt_state"]["budget_bytes"] = 10200547328
+        code, out = self.launch(args=["--prompt-cache-gib", "09.5"])
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("ceiling", out)
+        self.assertNotIn("MISMATCH", out)
+        self.assertIn("is now LIVE", out)
 
     def test_a_health_redirect_is_not_a_cache_report(self):
         self.cache_health()

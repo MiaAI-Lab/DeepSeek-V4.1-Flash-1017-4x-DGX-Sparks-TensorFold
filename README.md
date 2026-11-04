@@ -539,16 +539,19 @@ After the API answers, `start.sh` reads `/health` once (no inference request) an
 limit, streams and snapshot budget. The expected values are the ones the engine was actually given: extra arguments
 are appended to rank 0's serve line, so `./start.sh --prompt-cache-gib 1` is compared against 1 GiB, not the 0.5 GiB
 default (the last occurrence wins, `--flag value` or `--flag=value`), and a value the engine resolves itself
-(`--context 0`: the model's window, `--parallel auto`: what the memory budget fits) is reported instead of compared.
-Those arguments still change rank 0 only; the other three ranks keep the environment's settings. The budget is compared
+(`--context 0`: the model's window, `--parallel auto`: the 8 streams the engine picks) is reported instead of compared.
+Those arguments still change rank 0 only; the other three ranks keep the environment's settings, so a wider window, or
+more streams than `PARALLEL`, is refused: configure those for all four ranks instead. The budget is compared
 as the engine reads it, truncating: `--prompt-cache-gib 0.2` is 214748364 bytes, not the 214748365 a round would give.
 
 An override that could not become a working launch is refused before any container starts, instead of once the ranks
 are launched: a flag given no value (`--context=`, a trailing `--context`), a count that is not a plain decimal
-(`0100` is octal 64 to Bash and 100 to the engine), a context past the model's window or past `POOL`, a `--parallel`
-that is 0 (the engine would read it as 1) or above `PARALLEL` (past what this launch and the pool were sized for, where
-requests would meet `NoFreeSlot` later), or a snapshot budget past the engine's 2^34 GiB ceiling. A consistent report
-that disagrees with the launch stops it; set `CACHE_ALLOW_CONFIG_MISMATCH=1` to continue with a warning instead. A
+(`0100` is octal 64 to Bash and 100 to the engine), a context past the model's window or above `CONTEXT` (`--context 0`,
+the model's window, included: the followers are launched with `CONTEXT` and allocate their buffers for it), a
+`--parallel` that is 0 (the engine would read it as 1), above `PARALLEL`, or `auto` below `PARALLEL` 8 (the engine's auto
+is 8 streams and this backend never lowers them by memory, so the extra streams would meet `NoFreeSlot`, which is not
+requeued), or a snapshot budget past the engine's 2^34 GiB ceiling. A consistent report that disagrees with the launch
+stops it; set `CACHE_ALLOW_CONFIG_MISMATCH=1` to continue with a warning instead. A
 `/health` that is not HTTP 200, or that carries a top-level `error` object of any value — `{}` and `""` included —
 fails the launch, the same requirement step 5 puts on the smoke test. An engine without the cache group (older image)
 prints `Cache telemetry: unavailable` and keeps going: absence is not a measured zero, and nothing is fabricated to

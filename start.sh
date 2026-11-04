@@ -88,18 +88,30 @@ EFF_CACHE_GIB=$(eff_flag --prompt-cache-gib "$PROMPT_CACHE_GIB" "a non-negative 
 # comparison here can wrap.
 [[ "$EFF_CONTEXT" =~ ^(0|[1-9][0-9]{0,6})$ ]] || die "--context $EFF_CONTEXT: a plain decimal token count, or 0 for the model's window"
 (( EFF_CONTEXT <= 1048576 )) || die "--context $EFF_CONTEXT is past the model's 1,048,576-token window"
-(( EFF_CONTEXT != 0 || POOL >= 1048576 )) || die "--context 0 asks for the model's 1,048,576-token window, past the shared pool (POOL=$POOL)"
-(( EFF_CONTEXT == 0 || EFF_CONTEXT <= POOL )) || die "--context $EFF_CONTEXT is past the shared pool (POOL=$POOL): a request's positions must fit it"
-if [[ "$EFF_PARALLEL" != auto ]]; then
+# Only rank 0 takes these arguments; the followers are launched with CONTEXT and allocate buffers for it (ctx_cap in
+# model.zig). A wider rank-0 window would ask them to hold positions they were never sized for, so a wider window has
+# to be configured through CONTEXT for every rank.
+if (( EFF_CONTEXT == 0 )); then
+  (( CONTEXT >= 1048576 )) || die "--context 0 asks for the model's 1,048,576-token window, above CONTEXT ($CONTEXT), what the followers are launched with: set CONTEXT=1048576 for all four ranks instead"
+else
+  (( EFF_CONTEXT <= CONTEXT )) || die "--context $EFF_CONTEXT is above CONTEXT ($CONTEXT), what the followers are launched with and sized for: set CONTEXT for all four ranks instead"
+fi
+if [[ "$EFF_PARALLEL" == auto ]]; then
+  # the engine's auto is 8 streams (server/cli.zig), and this backend reports stream_bytes = 0 (families/dsv41/native.zig),
+  # so the CUDA budget never reduces them: below 8 slots the extra streams meet NoFreeSlot, which is not requeued.
+  (( PARALLEL >= 8 )) || die "--parallel auto asks the engine for its 8 streams, above PARALLEL ($PARALLEL), what this launch and the shared pool were sized for: raise PARALLEL (in the environment or scripts/local.sh) to 8 or more, or pass a count of $PARALLEL or fewer"
+else
   # the engine clamps 0 up to 1 and 4096 down at the top; 0 would also make the check expect 0 streams where the engine
   # reports 1. A count above PARALLEL is past what this launch and the shared pool were sized for: NoFreeSlot later.
   [[ "$EFF_PARALLEL" =~ ^[1-9][0-9]{0,3}$ ]] || die "--parallel $EFF_PARALLEL: a plain decimal stream count from 1, or auto (the engine reads 0 as 1)"
   (( EFF_PARALLEL <= PARALLEL )) || die "--parallel $EFF_PARALLEL is above PARALLEL ($PARALLEL), what this launch and the shared pool were sized for: raise PARALLEL (in the environment or scripts/local.sh) to run more streams"
 fi
 [[ "$EFF_CACHE_GIB" =~ ^(0|[0-9]+([.][0-9]+)?)$ ]] || die "--prompt-cache-gib $EFF_CACHE_GIB: a non-negative number of GiB"
-cache_whole=${EFF_CACHE_GIB%%.*}  # the engine refuses a budget at or past 2^34 GiB: refuse it before any container starts
+cache_whole=${EFF_CACHE_GIB%%.*}
+while [[ "$cache_whole" == 0?* ]]; do cache_whole=${cache_whole#0}; done  # 08 is 8 GiB, not Bash's octal error
+# The engine refuses a budget at or past 2^34 GiB: refuse it before any container starts.
 [[ ${#cache_whole} -le 11 ]] || die "--prompt-cache-gib $EFF_CACHE_GIB is past the engine's 2^34 GiB ceiling"
-(( cache_whole < 17179869184 )) || die "--prompt-cache-gib $EFF_CACHE_GIB is past the engine's 2^34 GiB ceiling"
+(( 10#$cache_whole < 17179869184 )) || die "--prompt-cache-gib $EFF_CACHE_GIB is past the engine's 2^34 GiB ceiling"
 
 B=$'\033[1m'; M=$'\033[1;35m'; G=$'\033[1;32m'; D=$'\033[2m'; R=$'\033[0m'
 [[ -t 1 ]] || { B=; M=; G=; D=; R=; }
@@ -268,7 +280,7 @@ log "Server answered after $((SECONDS - start))s"
 # Read-only: the engine's own account of the shared pool, the per-request limit, the streams and the snapshot budget.
 # It makes no inference request, warms nothing and changes nothing. The expected values are the ones the engine was
 # actually given (EFF_*: the environment with the operator's arguments applied), and a value the engine resolves
-# itself (`--context 0`: the model's window; `--parallel auto`: what the memory budget fits) is reported, not
+# itself (`--context 0`: the model's window; `--parallel auto`: the engine-selected streams) is reported, not
 # compared. An old engine reports no cache group: that is "unavailable" (documented), not a mismatch. A consistent
 # report that disagrees with this launch is a hard failure; CACHE_ALLOW_CONFIG_MISMATCH=1 continues with a warning
 # instead, never silently. A /health that is not HTTP 200, or that carries a top-level error, fails the launch the
@@ -314,7 +326,7 @@ if want_ctx is None:
 elif ctx != want_ctx:
     problems.append("context %s != %s" % (ctx, want_ctx))
 if want_streams is None:
-    chosen.append("%s streams (what the budget fits)" % streams)
+    chosen.append("%s streams (engine-selected)" % streams)
 elif streams != want_streams:
     problems.append("streams %s != %s" % (streams, want_streams))
 want_bytes = int(want_gib * (1 << 30))  # the engine truncates (@intFromFloat): 0.2 GiB is 214748364 bytes, not the ...365 a round gives
