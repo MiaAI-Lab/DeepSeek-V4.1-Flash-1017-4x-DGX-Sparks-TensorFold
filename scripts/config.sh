@@ -237,13 +237,16 @@ served_in_container() { echo "/hf/$DATA_SUB/model"; }
 # What scripts/prepare.sh last left ready (start.sh runs it again when this line changes): with where the checkpoint is
 # (HF_CACHE), how the workers mount it (NFS_PATH, NFS_VOLUME, NFS_SERVER*) and the chat template it copies into the
 # served folder, each of which needs prepare.sh's steps again when it changes. Each field is shell-quoted (%q, in the C
-# locale so the line does not depend on it), so no two settings give the same line.
+# locale so the line does not depend on it), so no two settings give the same line. PREPARE_CHECKS: the version of
+# prepare.sh's own checks, raised when a setup prepared before a new check must run it once (2: the workers' Engram
+# folders hold no *.safetensors file the index does not name, and the packer reads only the index's Engram files).
 PREPARED_MARKER="$STATE_DIR/prepared"
+PREPARE_CHECKS=2
 prepared_state() {
   local i tpl f
   tpl=$(sha256sum "$_cfg_root/model/chat_template.jinja" | cut -c1-64) && [[ -n "$tpl" ]] ||
     die "cannot hash model/chat_template.jinja (sha256sum)"
-  f=("model=$MODEL_ID@$(snapshot_rev)" "image=$(image_ident "$IMAGE")" "kit=$KIT_REF" "order=$ORDER" "engram=$WORKER_ENGRAM_DIR" "ablit=$ABLIT")
+  f=("checks=$PREPARE_CHECKS" "model=$MODEL_ID@$(snapshot_rev)" "image=$(image_ident "$IMAGE")" "kit=$KIT_REF" "order=$ORDER" "engram=$WORKER_ENGRAM_DIR" "ablit=$ABLIT")
   [[ "$ENGRAM_PACKED" != 1 ]] || f+=("packed=$ENGRAM_PACKED_DIR/$(packed_nodes)")
   [[ "$RANK_LOCAL" != 1 ]] || f+=("rank_local=$WORKER_RANK_DIR")
   f+=("hf=$HF_CACHE" "nfs_path=$NFS_PATH" "nfs_volume=$NFS_VOLUME" "template=$tpl")
