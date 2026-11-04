@@ -342,6 +342,11 @@ class StopHealth(ScriptTest):
         self.assertIn("could not read the open requests from /health", out)
 
 
+# two revisions of the Keys overlay (ABLIT_REVISION): each names its own DATA_SUB, so its own checkpoint view and caches
+OVERLAY_A = "a" * 40
+OVERLAY_B = "b" * 40
+
+
 class StartRestart(ScriptTest):
     """./start.sh with only what needs a Spark replaced: the links (detect_links), flock, ss, free, hostname, curl's
     answers (the server ready, the smoke test's reply) and scripts/prepare.sh (it records that it ran)."""
@@ -576,6 +581,26 @@ node_order() { echo 0,1,2,3; }
                 self.assertEqual(self.launched(), [], out)
                 self.assertFalse(self.prepared(), out)
 
+    def ablit_marker(self, revision):
+        """The marker prepare.sh leaves after preparing the Keys overlay at `revision` (ABLIT=1, RANK_LOCAL off)."""
+        code, out = self.bash('mkdir -p "$STATE_DIR"\nwrite_prepared_marker', {"ABLIT": "1", "ABLIT_REVISION": revision})
+        self.assertEqual(code, 0, out)
+
+    def test_a_new_ablit_revision_runs_prepare(self):
+        # the new revision's folders (DATA_SUB) are not prepared yet: start.sh must not call that Ready
+        self.ablit_marker(OVERLAY_A)
+        code, out = self.run_script(["start.sh"], {"ABLIT": "1", "ABLIT_REVISION": OVERLAY_B})
+        self.assertEqual(code, 0, out)
+        self.assertTrue(self.prepared(), out)
+        self.assertIn("Not ready yet", out)
+
+    def test_the_same_ablit_revision_is_ready(self):
+        self.ablit_marker(OVERLAY_A)
+        code, out = self.run_script(["start.sh"], {"ABLIT": "1", "ABLIT_REVISION": OVERLAY_A})
+        self.assertEqual(code, 0, out)
+        self.assertFalse(self.prepared(), out)
+        self.assertIn("Ready:", out)
+
     def test_old_marker_runs_prepare_once(self):
         state = self.home / ".local/state/dsv41-tensorfold"
         state.mkdir(parents=True)
@@ -788,6 +813,16 @@ class PreparedState(ScriptTest):
         for var, value in [("ORDER", "0,1,2,3"), ("ABLIT", "1"), ("WORKER2", "w9")]:
             with self.subTest(var=var):
                 self.assertChanges({var: value})
+
+    def test_ablit_revision_changes_the_marker_only_when_ablit_is_on(self):
+        on = lambda rev: self.state({"ABLIT": "1", "ABLIT_REVISION": rev})
+        off = lambda rev: self.state({"ABLIT": "0", "ABLIT_REVISION": rev})
+        self.assertNotEqual(on(OVERLAY_A), on(OVERLAY_B))
+        self.assertEqual(on(OVERLAY_A), on(OVERLAY_A))
+        # unused with ABLIT=0: the marker is the one a setup without the overlay already has
+        self.assertEqual(off(OVERLAY_A), off(OVERLAY_B))
+        self.assertEqual(off(OVERLAY_A), self.state())
+        self.assertNotIn(OVERLAY_A, self.state())
 
 
 # a stand-in for the image's tf-dsv41-rank-cache: --index-only prints "[rank G]" (or fails for a rank in $FAIL_INDEX,

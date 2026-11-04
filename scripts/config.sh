@@ -246,6 +246,8 @@ prepared_state() {
   f=("model=$MODEL_ID@$(snapshot_rev)" "image=$(image_ident "$IMAGE")" "kit=$KIT_REF" "order=$ORDER" "engram=$WORKER_ENGRAM_DIR" "ablit=$ABLIT")
   [[ "$ENGRAM_PACKED" != 1 ]] || f+=("packed=$ENGRAM_PACKED_DIR/$(packed_nodes)")
   [[ "$RANK_LOCAL" != 1 ]] || f+=("rank_local=$WORKER_RANK_DIR")
+  # the overlay's revision names its own DATA_SUB (checkpoint view and caches); a setup without it keeps its line
+  [[ "$ABLIT" != 1 ]] || f+=("ablit_revision=$ABLIT_REVISION")
   f+=("hf=$HF_CACHE" "nfs_path=$NFS_PATH" "nfs_volume=$NFS_VOLUME" "template=$tpl")
   for i in 1 2 3; do f+=("w$i=$(worker_host "$i")" "nfs$i=$(wval NFS_SERVER "$i")"); done
   (export LC_ALL=C; printf '%q ' "${f[@]}"; echo)   # (a subshell: the caller's locale is left as it was)
