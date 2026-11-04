@@ -1,0 +1,511 @@
+Subject: the block's own closer inside a DSML parameter value no longer ends the block, and a DSML template's reply streams no <tool_call> markup as a call
+
+diff --git a/zig/src/server/chat.zig b/zig/src/server/chat.zig
+index 80faee37..c237e59b 100644
+--- a/zig/src/server/chat.zig
++++ b/zig/src/server/chat.zig
+@@ -7,6 +7,7 @@ const fields_mod = @import("fields.zig");
+ const reply_text = @import("reply_text.zig");
+ const tool_stream = @import("tool_stream.zig");
+ const tool_parse = @import("tool_parse.zig");
++const tool_grammar = @import("tool_grammar.zig");
+ const output_diagnostics = @import("output_diagnostics.zig");
+ const prompt_mod = @import("prompt.zig");
+ const log = @import("log.zig");
+@@ -251,7 +252,12 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
+     defer srv.noteRequest(prepared.prompt_len, box.cached orelse 0, gen.collected.items.len, box.stats.drafted, box.stats.accepted, box.stats.rounds, received, gen.first_ns, gen.last_ns, box.stats.prefill_seconds);
+     errdefer if (!gen.engine_done) gen.cancel(); // the engine writes to the mailbox until it says finished
+     const result: Failure!Reply = blk: {
+-        if (sink != null and gen.tools.len > 0) gen.calls = tool_stream.Streamer.init(a, gen.tools) catch |e| break :blk e;
++        if (sink != null and gen.tools.len > 0) {
++            gen.calls = tool_stream.Streamer.init(a, gen.tools) catch |e| break :blk e;
++            // a DSML template's calls are DSML blocks, which the streamer does not read: it streams none, so a streaming
++            // client gets the parsed calls at the end, the ones a non-streaming client gets
++            gen.calls.?.calls_off = tool_grammar.writesDsml(srv, a);
++        }
+         gen.loop(gone) catch |e| break :blk e;
+         break :blk gen.finish(cx, prepared.prompt_len, received, submitted, thinking, effort, prepared.sampled, prepared.drafts);
+     };
+diff --git a/zig/src/server/reply_text.zig b/zig/src/server/reply_text.zig
+index 8b132bc4..5a3f0716 100644
+--- a/zig/src/server/reply_text.zig
++++ b/zig/src/server/reply_text.zig
+@@ -32,6 +32,127 @@ fn find(text: []const u8, tag: []const u8) ?usize {
+     return findTag(text, 0, tag);
+ }
+ 
++/// The invoke and parameter tags of a DSML spelling, by its block's opener (null: not a DSML block). V4's parser
++/// requires a parameter's ``string`` attribute; V4.1's reads one when it is there.
++const Dsml = struct { invoke_open: []const u8, invoke_close: []const u8, param_open: []const u8, param_close: []const u8, attr_required: bool };
++
++fn dsmlTags(opener: []const u8) ?Dsml {
++    const D = "\u{ff5c}DSML\u{ff5c}";
++    if (std.mem.eql(u8, opener, "<" ++ D ++ " calls>")) return .{ .invoke_open = "<" ++ D ++ " invoke name=\"", .invoke_close = "</" ++ D ++ " invoke>", .param_open = "<" ++ D ++ " parameter name=\"", .param_close = "</" ++ D ++ " parameter>", .attr_required = false };
++    if (std.mem.eql(u8, opener, "<" ++ D ++ "tool_calls>")) return .{ .invoke_open = "<" ++ D ++ "invoke name=\"", .invoke_close = "</" ++ D ++ "invoke>", .param_open = "<" ++ D ++ "parameter name=\"", .param_close = "</" ++ D ++ "parameter>", .attr_required = true };
++    return null;
++}
++
++/// Whether every ``closer`` in an invoke's ``body`` lies inside a parameter value, as the parser reads values: from
++/// the ``>`` after a parameter's name (and ``string`` attribute) to the first parameter closer after it.
++fn closersInValues(body: []const u8, closer: []const u8, t: Dsml) bool {
++    var c = findTag(body, 0, closer);
++    var p: usize = 0;
++    while (c) |at| {
++        const ps = findTag(body, p, t.param_open) orelse return false;
++        p = ps + 1;
++        const ns = ps + t.param_open.len;
++        const nq = std.mem.indexOfScalarPos(u8, body, ns, '"') orelse continue;
++        if (!t.attr_required and nq == ns) continue;
++        var v = nq + 1;
++        if (std.mem.startsWith(u8, body[v..], " string=\"true\"")) {
++            v += " string=\"true\"".len;
++        } else if (std.mem.startsWith(u8, body[v..], " string=\"false\"")) {
++            v += " string=\"false\"".len;
++        } else if (t.attr_required) continue;
++        if (v >= body.len or body[v] != '>') continue;
++        v += 1;
++        const pe = findTag(body, v, t.param_close) orelse continue;
++        if (at < v) return false; // a closer before this value, outside any value
++        var next: ?usize = at;
++        while (next) |n| {
++            if (n >= pe) break;
++            next = findTag(body, n + closer.len, closer);
++        }
++        c = next;
++        p = pe + t.param_close.len;
++    }
++    return true;
++}
++
++/// Whether ``rest`` is a proper start of ``tag``: the tag may still be being written.
++fn begins(rest: []const u8, tag: []const u8) bool {
++    return rest.len < tag.len and std.mem.startsWith(u8, tag, rest);
++}
++
++const Walk = union(enum) { closer: usize, more, broken };
++
++/// Reads a DSML block from ``from`` (just past its opener) the way the parser reads it: invokes, each a name up to the
++/// first quote followed by ``">``, each running to the first invoke closer after it, with only whitespace between them.
++/// The block's closer is the first one met between invokes, so a closer or an opener inside a parameter value (a file
++/// about DSML) neither ends nor splits the block. ``more``: the text ends inside the block; ``broken``: something else
++/// appears, a name holds a tag, or an invoke holds the block's closer outside its values.
++fn walkDsml(text: []const u8, from: usize, t: Dsml, closer: []const u8) Walk {
++    var p = from;
++    while (true) {
++        while (p < text.len and isSpaceByte(text[p])) p += 1;
++        if (p >= text.len) return .more;
++        const rest = text[p..];
++        if (std.mem.startsWith(u8, rest, closer)) return .{ .closer = p };
++        if (!std.mem.startsWith(u8, rest, t.invoke_open)) return if (begins(rest, closer) or begins(rest, t.invoke_open)) .more else .broken;
++        const ns = p + t.invoke_open.len;
++        const q = std.mem.indexOfScalarPos(u8, text, ns, '"') orelse
++            return if (std.mem.indexOfScalar(u8, text[ns..], '<') != null) .broken else .more;
++        if (std.mem.indexOfScalar(u8, text[ns..q], '<') != null) return .broken;
++        if (q + 2 > text.len) return .more;
++        if (!std.mem.startsWith(u8, text[q..], "\">")) return .broken;
++        const e = findTag(text, q + 2, t.invoke_close) orelse return .more;
++        // the invoke may hold the block's closer only inside its parameter values (a file about DSML)
++        if (!closersInValues(text[q + 2 .. e], closer, t)) return .broken;
++        p = e + t.invoke_close.len;
++    }
++}
++
++/// How many invokes in ``region`` the parser reads whole: a name up to its quote, then ``">``, then the first invoke
++/// closer after it (``dsml41Calls``' reading, which skips any invoke that does not complete).
++fn wholeInvokes(region: []const u8, t: Dsml) usize {
++    var n: usize = 0;
++    var pos: usize = 0;
++    while (findTag(region, pos, t.invoke_open)) |s| {
++        pos = s + 1;
++        const ns = s + t.invoke_open.len;
++        const q = std.mem.indexOfScalarPos(u8, region, ns, '"') orelse continue;
++        if (q == ns or !std.mem.startsWith(u8, region[q..], "\">")) continue;
++        const e = findTag(region, q + 2, t.invoke_close) orelse continue;
++        pos = e + t.invoke_close.len;
++        n += 1;
++    }
++    return n;
++}
++
++/// Where the call block opened before ``from`` closes: the index of its closer, or null while it may still close. A
++/// DSML block's string values are not escaped, so a value can hold the block's own closer (a file about DSML). A block
++/// that reads as the parser reads it (``walkDsml``) closes at the first closer between its invokes, not at one inside
++/// an invoke, but only when that reading gives the parser more whole invokes than the first-closer rule gives over the
++/// same text (that block and the blocks it would have been split into): otherwise, and in every other case (a block
++/// that does not read that way, a reply that ended inside one, Qwen's and Gemma's markup), the first closer closes it.
++/// While the reply streams, a DSML block still being written stays hidden.
++pub fn blockEnd(text: []const u8, from: usize, opener: []const u8, closer: []const u8, finished: bool) ?usize {
++    const first = findTag(text, from, closer);
++    const t = dsmlTags(opener) orelse return first;
++    switch (walkDsml(text, from, t, closer)) {
++        .closer => |at| {
++            if (first == null or at == first.?) return at;
++            // the first-closer rule over the same text: the block to the first closer, then each block it opens after it
++            var split = wholeInvokes(text[from..first.?], t);
++            var pos = first.? + closer.len;
++            while (findTag(text[0..at], pos, opener)) |o| {
++                const e = findTag(text, o + opener.len, closer) orelse break;
++                split += wholeInvokes(text[o + opener.len .. e], t);
++                pos = e + closer.len;
++            }
++            return if (wholeInvokes(text[from..at], t) > split) at else first;
++        },
++        .more => return if (finished) first else null,
++        .broken => return first,
++    }
++}
++
+ pub fn isChannel(m: Markers) bool {
+     return std.mem.eql(u8, m.close, channel_markers.close);
+ }
+@@ -125,7 +246,7 @@ pub fn hideInto(a: Allocator, out: *std.ArrayList(u8), text: []const u8, finishe
+         }
+         try out.appendSlice(a, text[pos..start.?]);
+         const opener = calls[which][0];
+-        const end = findTag(text, start.? + opener.len, calls[which][1]) orelse return out.items;
++        const end = blockEnd(text, start.? + opener.len, opener, calls[which][1], finished) orelse return out.items;
+         pos = end + calls[which][1].len;
+     }
+ }
+diff --git a/zig/src/server/tool_grammar.zig b/zig/src/server/tool_grammar.zig
+index ea0e454b..8691b18f 100644
+--- a/zig/src/server/tool_grammar.zig
++++ b/zig/src/server/tool_grammar.zig
+@@ -54,9 +54,23 @@ pub fn style(rendered: []const u8) ?Style {
+     return null;
+ }
+ 
++/// A turn that calls `probe` with {key: "v"}, for rendering through the served chat template.
++const probe_turn_json = "[{\"role\": \"user\", \"content\": \"x\"}, {\"role\": \"assistant\", \"content\": \"\", \"tool_calls\": [{\"id\": \"call_0\", \"type\": \"function\", \"function\": {\"name\": \"" ++ probe ++ "\", \"arguments\": {\"" ++ key ++ "\": \"v\"}}}]}]";
++
++/// Whether the served chat template writes DeepSeek's DSML calls (`style` of the probe turn it renders); false when
++/// the probe does not render. A reply's calls are then read by the parse at the reply's end.
++pub fn writesDsml(srv: *Server, a: Allocator) bool {
++    const parsed = json.parse(a, probe_turn_json) catch return false;
++    var scratch: Cx = .{ .a = a };
++    const ids = prompt.renderIds(srv, &scratch, parsed.ok, &.{}, false, null, false) catch return false;
++    const rendered = srv.text.decode(a, ids) catch return false;
++    const s = style(rendered) orelse return false;
++    return s == .dsml or s == .dsml41;
++}
++
+ /// The grammar for a reply that must call one of `tools`: one call, or (`parallel`) one or more, then the end.
+ pub fn structure(srv: *Server, cx: *Cx, tools: []const Value, parallel: bool, thinking: bool) errors.Refused!api.Structure {
+-    const probe_turn = (try json.parse(cx.a, "[{\"role\": \"user\", \"content\": \"x\"}, {\"role\": \"assistant\", \"content\": \"\", \"tool_calls\": [{\"id\": \"call_0\", \"type\": \"function\", \"function\": {\"name\": \"" ++ probe ++ "\", \"arguments\": {\"" ++ key ++ "\": \"v\"}}}]}]")).ok;
++    const probe_turn = (try json.parse(cx.a, probe_turn_json)).ok;
+     var scratch: Cx = .{ .a = cx.a };
+     const rendered = if (prompt.renderIds(srv, &scratch, probe_turn, &.{}, false, null, false)) |ids| try srv.text.decode(cx.a, ids) else |_| "";
+     const s = style(rendered) orelse return cx.refuse("tool_choice \"required\" or a named function needs a chat template that writes <tool_call> calls (XML parameters or a JSON object) or DeepSeek's DSML calls, and this one does not: send \"auto\"");
+diff --git a/zig/src/server/tool_parse.zig b/zig/src/server/tool_parse.zig
+index 13db5847..daec4e64 100644
+--- a/zig/src/server/tool_parse.zig
++++ b/zig/src/server/tool_parse.zig
+@@ -56,8 +56,9 @@ fn allSpace(s: []const u8) bool {
+     return strip(s).len == 0;
+ }
+ 
+-/// (start, end, payload) of each tool-call block in order; a block inside an earlier one is part of it.
+-fn envelopes(a: Allocator, text: []const u8) Allocator.Error![]Envelope {
++/// (start, end, payload) of each tool-call block in order; a block inside an earlier one is part of it. A DSML block
++/// ends at its first closer, or with ``extend`` where ``reply_text.blockEnd`` ends it (past a closer inside a value).
++fn envelopes(a: Allocator, text: []const u8, extend: bool) Allocator.Error![]Envelope {
+     var found: std.ArrayList(Envelope) = .empty;
+     var pos: usize = 0;
+     while (findCI(text, "<tool_call>", pos)) |s| {
+@@ -86,13 +87,13 @@ fn envelopes(a: Allocator, text: []const u8) Allocator.Error![]Envelope {
+     }
+     pos = 0;
+     while (find(text, dsml_open, pos)) |s| {
+-        const e = find(text, dsml_close, s + dsml_open.len) orelse break;
++        const e = (if (extend) reply_text.blockEnd(text, s + dsml_open.len, dsml_open, dsml_close, true) else find(text, dsml_close, s + dsml_open.len)) orelse break;
+         try found.append(a, .{ .start = s, .end = e + dsml_close.len, .payload = text[s .. e + dsml_close.len] });
+         pos = e + dsml_close.len;
+     }
+     pos = 0;
+     while (find(text, dsml41_open, pos)) |s| {
+-        const e = find(text, dsml41_close, s + dsml41_open.len) orelse break;
++        const e = (if (extend) reply_text.blockEnd(text, s + dsml41_open.len, dsml41_open, dsml41_close, true) else find(text, dsml41_close, s + dsml41_open.len)) orelse break;
+         try found.append(a, .{ .start = s, .end = e + dsml41_close.len, .payload = text[s .. e + dsml41_close.len] });
+         pos = e + dsml41_close.len;
+     }
+@@ -117,9 +118,28 @@ pub fn parse(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?u
+         try known.put(a, try std.ascii.allocLowerString(a, name), name);
+     }
+     const schemas = try tool_params.schemas(a, tools);
+-    const envs = try envelopes(a, text);
++    // DSML values are not escaped, so a value can hold its block's closer: the blocks read past such closers are taken
++    // only when they give strictly more calls than the blocks cut at the first closer, so no reply loses a call
++    const first = try envelopes(a, text, false);
++    const cut = try parseEnvelopes(a, text, first, &known, &schemas, max_calls);
++    const longer = try envelopes(a, text, true);
++    if (sameEnvelopes(first, longer)) return cut;
++    const read = try parseEnvelopes(a, text, longer, &known, &schemas, max_calls);
++    const n_read = if (read.calls) |c| c.len else 0;
++    const n_cut = if (cut.calls) |c| c.len else 0;
++    return if (n_read > n_cut) read else cut;
++}
++
++fn sameEnvelopes(x: []const Envelope, y: []const Envelope) bool {
++    if (x.len != y.len) return false;
++    for (x, y) |p, q| if (p.start != q.start or p.end != q.end) return false;
++    return true;
++}
++
++/// The content and calls of ``text`` split into ``envs``.
++fn parseEnvelopes(a: Allocator, text: []const u8, envs: []const Envelope, known: *const std.StringArrayHashMapUnmanaged([]const u8), schemas: *const tool_params.Schemas, max_calls: ?usize) Allocator.Error!Parsed {
+     if (envs.len == 0) {
+-        if (try bareCalls(a, text, &known, max_calls)) |calls| return .{ .content = "", .calls = calls };
++        if (try bareCalls(a, text, known, max_calls)) |calls| return .{ .content = "", .calls = calls };
+         return .{ .content = text, .calls = null };
+     }
+     var calls: std.ArrayList(Value) = .empty;
+@@ -129,7 +149,7 @@ pub fn parse(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?u
+         try residue.appendSlice(a, text[cursor..env.start]);
+         cursor = env.end;
+         if (std.mem.startsWith(u8, env.payload, dsml41_open)) {
+-            try dsml41Calls(a, env.payload[dsml41_open.len .. env.payload.len - dsml41_close.len], &known, max_calls, &calls, &residue);
++            try dsml41Calls(a, env.payload[dsml41_open.len .. env.payload.len - dsml41_close.len], known, max_calls, &calls, &residue);
+             continue;
+         }
+         if (max_calls) |m| if (calls.items.len >= m) continue;
+@@ -141,7 +161,7 @@ pub fn parse(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?u
+                     error.Invalid => null,
+                 };
+             }
+-            const one = payload(a, env.payload, &schemas, max_calls != null) catch |e| switch (e) {
++            const one = payload(a, env.payload, schemas, max_calls != null) catch |e| switch (e) {
+                 error.OutOfMemory => return error.OutOfMemory,
+                 error.Invalid => break :blk null,
+             };
+@@ -153,7 +173,7 @@ pub fn parse(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?u
+             break :blk null;
+         };
+         const good = if (parsed) |list| list.len > 0 and for (list) |c| {
+-            if ((try callName(a, c, &known)) == null) break false;
++            if ((try callName(a, c, known)) == null) break false;
+         } else true else false;
+         if (!good) {
+             // a malformed or unoffered call stays text when calls are unlimited, and drops out of a one-call reply
+@@ -161,7 +181,7 @@ pub fn parse(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?u
+             continue;
+         }
+         for (parsed.?) |c| {
+-            if (max_calls == null or calls.items.len < max_calls.?) try calls.append(a, try openaiCall(a, (try callName(a, c, &known)).?, c.arguments));
++            if (max_calls == null or calls.items.len < max_calls.?) try calls.append(a, try openaiCall(a, (try callName(a, c, known)).?, c.arguments));
+         }
+     }
+     try residue.appendSlice(a, text[cursor..]);
+diff --git a/zig/src/server/tool_parse_test.zig b/zig/src/server/tool_parse_test.zig
+index 5516e485..78f5d8ea 100644
+--- a/zig/src/server/tool_parse_test.zig
++++ b/zig/src/server/tool_parse_test.zig
+@@ -151,3 +151,137 @@ test "DeepSeek-V4.1's DSML calls, read as the served lane reads them" {
+     const open = "Hi.<" ++ D ++ " calls>\n<" ++ D ++ " invoke name=\"weather\">";
+     try std.testing.expectEqualStrings(open, (try parse(a, open, tools, null)).content);
+ }
++
++/// One `write` call in a DSML block of either spelling (DeepSeek-V4.1's when `v41`), its `content` value as given.
++fn dsmlWrite(a: std.mem.Allocator, v41: bool, value: []const u8) ![]const u8 {
++    const D = "\u{ff5c}DSML\u{ff5c}";
++    const s = if (v41) " " else "";
++    const block = if (v41) "calls" else "tool_calls";
++    return std.mem.concat(a, u8, &.{ "<", D, s, block, ">\n<", D, s, "invoke name=\"write\">\n<", D, s, "parameter name=\"content\" string=\"true\">", value, "</", D, s, "parameter>\n</", D, s, "invoke>\n</", D, s, block, ">" });
++}
++
++/// The streamed text never takes back what it showed, and it ends as the whole parse's content.
++fn expectStreamAgrees(a: std.mem.Allocator, text: []const u8, content: []const u8) !void {
++    const reply_text = @import("reply_text.zig");
++    const final = try reply_text.hideToolCalls(a, text, true);
++    try std.testing.expectEqualStrings(content, std.mem.trim(u8, final, " \t\r\n"));
++    try expectNoRetraction(a, text);
++}
++
++/// Each streamed byte only adds to what was shown before it, up to the end of the reply.
++fn expectNoRetraction(a: std.mem.Allocator, text: []const u8) !void {
++    const reply_text = @import("reply_text.zig");
++    var before: []const u8 = "";
++    for (0..text.len + 2) |n| {
++        const shown = if (n <= text.len) try reply_text.hideToolCalls(a, text[0..n], false) else try reply_text.hideToolCalls(a, text, true);
++        if (!std.mem.startsWith(u8, shown, before)) {
++            std.debug.print("after {d} bytes the stream showed {s}, taking back part of {s}\n", .{ n, shown, before });
++            return error.TestUnexpectedResult;
++        }
++        before = try a.dupe(u8, shown);
++    }
++}
++
++test "a DSML value that holds the block's own tags stays in the call, and none of them reaches the text" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const tools = (try json.parse(a, "[{\"type\":\"function\",\"function\":{\"name\":\"write\"}}]")).ok.array;
++    const D = "\u{ff5c}DSML\u{ff5c}";
++    for ([_]bool{ true, false }) |v41| {
++        const open = if (v41) "<" ++ D ++ " calls>" else "<" ++ D ++ "tool_calls>";
++        const close = if (v41) "</" ++ D ++ " calls>" else "</" ++ D ++ "tool_calls>";
++        // a file about DSML: the value holds the closer (#14), the opener (parsed before the change too), or both
++        const values = [_][]const u8{
++            try std.mem.concat(a, u8, &.{ "end: ", close }),
++            try std.mem.concat(a, u8, &.{ "start: ", open }),
++            try std.mem.concat(a, u8, &.{ open, " inner ", close }),
++            try std.mem.concat(a, u8, &.{ close, " then ", open }),
++        };
++        for (values) |value| {
++            const block = try dsmlWrite(a, v41, value);
++            const want = try std.mem.concat(a, u8, &.{ "{\"content\":\"", value, "\"}" });
++            const r = try parse(a, block, tools, null);
++            try std.testing.expectEqual(@as(usize, 1), r.calls.?.len);
++            try std.testing.expectEqualStrings(want, r.calls.?[0].get("function").?.get("arguments").?.string);
++            try std.testing.expectEqualStrings("", r.content);
++            try expectStreamAgrees(a, block, "");
++            // prose around the block: before it streams at once, after it streams once the block has closed
++            const around = try std.mem.concat(a, u8, &.{ "Writing.\n\n", block, "\nDone." });
++            const ra = try parse(a, around, tools, null);
++            try std.testing.expectEqual(@as(usize, 1), ra.calls.?.len);
++            try std.testing.expectEqualStrings("Writing.\n\n\nDone.", ra.content);
++            try expectStreamAgrees(a, around, "Writing.\n\n\nDone.");
++        }
++    }
++}
++
++test "around a DSML block: prose that quotes its closer, several blocks, both spellings, a reply cut inside one" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const tools = (try json.parse(a, "[{\"type\":\"function\",\"function\":{\"name\":\"write\"}}]")).ok.array;
++    const D = "\u{ff5c}DSML\u{ff5c}";
++    for ([_]bool{ true, false }) |v41| {
++        const close = if (v41) "</" ++ D ++ " calls>" else "</" ++ D ++ "tool_calls>";
++        const plain = try dsmlWrite(a, v41, "plain");
++        // prose after a complete block that quotes the closer: the call and the prose both stay, as before the change
++        const quoted = try std.mem.concat(a, u8, &.{ plain, "\nA block ends with ", close, "." });
++        const rq = try parse(a, quoted, tools, null);
++        try std.testing.expectEqual(@as(usize, 1), rq.calls.?.len);
++        try std.testing.expect(std.mem.indexOf(u8, rq.content, try std.mem.concat(a, u8, &.{ "ends with ", close })) != null);
++        try expectStreamAgrees(a, quoted, rq.content);
++        // two blocks with prose between them: two calls, the prose kept
++        const twice = try std.mem.concat(a, u8, &.{ plain, "\nThen.\n", try dsmlWrite(a, v41, try std.mem.concat(a, u8, &.{ "end: ", close })) });
++        const rt = try parse(a, twice, tools, null);
++        try std.testing.expectEqual(@as(usize, 2), rt.calls.?.len);
++        try std.testing.expectEqualStrings("Then.", rt.content);
++        try expectStreamAgrees(a, twice, "Then.");
++        // a reply cut inside a block whose value holds the closer: the first closer ends it, as it always did (the
++        // parser drops the cut invoke), and the stream takes nothing back on the way there
++        for ([_][]const u8{ try std.mem.concat(a, u8, &.{ "end: ", close }), "plain" }) |value| {
++            const full = try dsmlWrite(a, v41, value);
++            const cut = full[0 .. full.len - close.len];
++            const rc = try parse(a, cut, tools, null);
++            try std.testing.expect(rc.calls == null or rc.calls.?.len == 0);
++            try expectNoRetraction(a, cut);
++        }
++        // a name that holds the closer reads as no structure: the first closer ends the block, as it always did, so the
++        // complete invoke before it is still recovered, whether the reply ends in that name or goes on past it
++        const named = try std.mem.concat(a, u8, &.{ if (v41) "<" ++ D ++ " calls>\n<" ++ D ++ " invoke name=\"write\"></" ++ D ++ " invoke>\n<" ++ D ++ " invoke name=\"" else "<" ++ D ++ "tool_calls>\n<" ++ D ++ "invoke name=\"write\"></" ++ D ++ "invoke>\n<" ++ D ++ "invoke name=\"", close });
++        const longer = try std.mem.concat(a, u8, &.{ named, if (v41) "\"></" ++ D ++ " invoke>" else "\"></" ++ D ++ "invoke>", close });
++        for ([_][]const u8{ named, longer }) |text| {
++            const rn = try parse(a, text, tools, null);
++            if (v41) {
++                try std.testing.expectEqual(@as(usize, 1), rn.calls.?.len);
++                try std.testing.expectEqualStrings("write", rn.calls.?[0].get("function").?.get("name").?.string);
++            }
++            try expectNoRetraction(a, text);
++        }
++        // a block whose invoke never closes, then a whole block: the second block's call stays, as it always did (the
++        // open invoke must not borrow the second block's closers)
++        const inv = if (v41) "<" ++ D ++ " invoke name=\"" else "<" ++ D ++ "invoke name=\"";
++        const invc = if (v41) "</" ++ D ++ " invoke>" else "</" ++ D ++ "invoke>";
++        const opn = if (v41) "<" ++ D ++ " calls>" else "<" ++ D ++ "tool_calls>";
++        const unclosed = try std.mem.concat(a, u8, &.{ opn, "\n", inv, "broken\">\n", close, "\n", opn, "\n", inv, "write\">", invc, "\n", close });
++        const ru = try parse(a, unclosed, tools, null);
++        if (v41) {
++            try std.testing.expectEqual(@as(usize, 1), ru.calls.?.len);
++            try std.testing.expectEqualStrings("write", ru.calls.?[0].get("function").?.get("name").?.string);
++        }
++        try expectNoRetraction(a, unclosed);
++    }
++    // a V4 block whose JSON value (string="false") holds a whole V4.1 block: the V4.1 call is kept, as it always was,
++    // though the V4 block reads past its first closer (its value is not JSON, so reading it whole gives no call)
++    const nested = "<" ++ D ++ "tool_calls>\n<" ++ D ++ "invoke name=\"write\">\n<" ++ D ++ "parameter name=\"content\" string=\"false\">\n</" ++ D ++ "tool_calls>\n<" ++ D ++ " calls>\n<" ++ D ++ " invoke name=\"write\"></" ++ D ++ " invoke>\n</" ++ D ++ " calls>\n</" ++ D ++ "parameter>\n</" ++ D ++ "invoke>\n</" ++ D ++ "tool_calls>";
++    const rn = try parse(a, nested, tools, null);
++    try std.testing.expectEqual(@as(usize, 1), rn.calls.?.len);
++    try std.testing.expectEqualStrings("write", rn.calls.?[0].get("function").?.get("name").?.string);
++    try expectNoRetraction(a, nested);
++    // both spellings in one reply: one call each
++    const mixed = try std.mem.concat(a, u8, &.{ try dsmlWrite(a, true, "one"), "\nand\n", try dsmlWrite(a, false, "two") });
++    const rm = try parse(a, mixed, tools, null);
++    try std.testing.expectEqual(@as(usize, 2), rm.calls.?.len);
++    try std.testing.expectEqualStrings("and", rm.content);
++    try expectStreamAgrees(a, mixed, "and");
++}
+diff --git a/zig/src/server/tool_stream.zig b/zig/src/server/tool_stream.zig
+index a02ee06d..995e985f 100644
+--- a/zig/src/server/tool_stream.zig
++++ b/zig/src/server/tool_stream.zig
+@@ -49,6 +49,9 @@ pub const Streamer = struct {
+     held: []const u8 = "",
+     streamed: bool = false,
+     searched: usize = 0, // the answer is only ever extended, so prose already searched holds no opener
++    /// The template writes DSML calls (`tool_grammar.writesDsml`): no call is streamed, and the reply's calls reach the
++    /// client from the parse at its end, as they reach a non-streaming one.
++    calls_off: bool = false,
+ 
+     pub fn init(a: Allocator, tools: []const Value) Allocator.Error!Streamer {
+         var s: Streamer = .{ .a = a, .schemas = try tool_params.schemas(a, tools) };
+@@ -78,6 +81,7 @@ pub const Streamer = struct {
+ 
+     /// The deltas the reply's ``text`` (its whole answer so far) adds.
+     pub fn feed(s: *Streamer, text: []const u8, out: *std.ArrayList(Value)) Allocator.Error!void {
++        if (s.calls_off) return;
+         while (s.state != .abort) {
+             const rest = text[@min(s.pos, text.len)..];
+             switch (s.state) {
+@@ -386,6 +390,49 @@ test "a one-call reply drops an unoffered call and still hides an unclosed one"
+ 
+ const tool_parse = @import("tool_parse.zig");
+ 
++test "a DSML template's reply streams no call, so its parsed calls reach the client, tool markup in a value or not" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const tools = (try json.parse(a, "[{\"type\":\"function\",\"function\":{\"name\":\"write\"}}]")).ok.array;
++    const D = "\u{ff5c}DSML\u{ff5c}";
++    const qwen = "<tool_call><function=write></function></tool_call>";
++    for ([_]bool{ true, false }) |v41| {
++        const x = if (v41) " " else "";
++        const bn = if (v41) "calls" else "tool_calls";
++        const call = struct {
++            fn one(al: Allocator, sp: []const u8, value: []const u8) ![]const u8 {
++                return std.mem.concat(al, u8, &.{ "\n<", D, sp, "invoke name=\"write\">\n<", D, sp, "parameter name=\"content\" string=\"true\">", value, "</", D, sp, "parameter>\n</", D, sp, "invoke>" });
++            }
++        };
++        const open = try std.mem.concat(a, u8, &.{ "<", D, x, bn, ">" });
++        const close = try std.mem.concat(a, u8, &.{ "</", D, x, bn, ">" });
++        // a value holding Qwen markup; one holding the block's closer and Qwen markup, then a second call (the review
++        // case); Qwen markup in prose after a block
++        const replies = [_][]const u8{
++            try std.mem.concat(a, u8, &.{ open, try call.one(a, x, qwen), "\n", close }),
++            try std.mem.concat(a, u8, &.{ open, try call.one(a, x, try std.mem.concat(a, u8, &.{ close, qwen })), try call.one(a, x, "two"), "\n", close }),
++            try std.mem.concat(a, u8, &.{ open, try call.one(a, x, "one"), "\n", close, "\nThe other format: ", qwen }),
++        };
++        for (replies) |text| {
++            var st = try Streamer.init(a, tools);
++            st.calls_off = true;
++            var out: std.ArrayList(Value) = .empty;
++            for (1..text.len + 1) |n| try st.feed(text[0..n], &out);
++            try std.testing.expect(!st.streamed); // the route then sends the parsed calls
++            try std.testing.expectEqual(@as(usize, 0), out.items.len);
++            const r = try tool_parse.parse(a, text, tools, null);
++            for (r.calls.?) |c| try std.testing.expectEqualStrings("write", c.get("function").?.get("name").?.string);
++        }
++        // the review case: the two intended calls, the first value intact
++        const two = (try tool_parse.parse(a, replies[1], tools, null)).calls.?;
++        try std.testing.expectEqual(@as(usize, 2), two.len);
++        try std.testing.expectEqualStrings(try std.mem.concat(a, u8, &.{ "{\"content\":\"", close, qwen, "\"}" }), two[0].get("function").?.get("arguments").?.string);
++    }
++    // a template that writes <tool_call> calls still streams them as they are written
++    try std.testing.expect((try streamed(a, tools, &.{qwen})).len > 0);
++}
++
+ /// The deltas one streamer sends while the reply grows through ``texts``.
+ fn streamed(a: Allocator, tools: []const Value, texts: []const []const u8) Allocator.Error![]Value {
+     var s = try Streamer.init(a, tools);

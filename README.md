@@ -477,6 +477,7 @@ measurements and rationale: [`CHANGELOG.md`](CHANGELOG.md); authorship: [`CREDIT
 | `0042` | SvangenStudios | -- (on) | A JSON answer (`response_format`, `guided_json`) stays content when `tools` are offered; it is not parsed as tool calls |
 | `0043` | SvangenStudios | -- (on) | A reply made only of orphan DSML closing tags gets `tensorfold.tool_parse_warning` (diagnostic only; [#14](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/issues/14)) |
 | `0046` | shalk3 | `TF_DS_LOAD_PREFETCH` (on) | The weight loader's file is read ahead by 8 threads (32 MiB chunks, at most 4 GiB past the loader), so its reads come from the page cache: a node's load 83 s -> 27 s from NVMe; the weights are unchanged |
+| `0052` | **Hector** | -- (on) | The block's own closer or opener inside a DSML parameter value (a file about DSML) no longer ends or splits the block: the call stays a call and the block's closers stay out of the reply's text, whole or streamed; any other block closes at its first closer, as before. With a template that writes DSML calls, the live streamer sends no `<tool_call>` markup as a call, so streaming clients get the parsed calls ([#14](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/issues/14)) |
 
 ### Idle RDMA CPU use
 
