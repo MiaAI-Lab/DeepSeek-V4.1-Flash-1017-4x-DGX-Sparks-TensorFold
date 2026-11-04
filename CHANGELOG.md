@@ -1,5 +1,12 @@
 # Changelog
 
+- **2026-11-04** -- `0053` (Hector, [hecisaza](https://github.com/hecisaza)): a tool-call block (`<tool_call>`,
+  `<|tool_call>` or `<x:tool_call>`) whose payload opens with a DSML opener but is shorter than that opener and its
+  closer together made the parser cut both from it, a slice past the payload's start. A safety-checked build panics
+  there; the served build has no such checks and reads out of bounds. Such a payload now reads as no DSML block, and
+  the block is handled as any other tool-call block that is not a call: no call; a whole reply with no call limit keeps
+  it as text, a one-call reply drops it, and a stream shows it as the stream filter does. Every payload long enough to
+  hold the opener and the closer parses exactly as before: the guard returns the same slice.
 - **2026-11-04** -- `0052` (Hector, [hecisaza](https://github.com/hecisaza)): a DSML tool call whose string value holds
   the block's own closer (`</｜DSML｜ calls>`, as in a file about DSML) was cut at that closer: the call was dropped, and
   a streamed reply showed what followed it as text, with `finish_reason: stop`, the symptom reported in

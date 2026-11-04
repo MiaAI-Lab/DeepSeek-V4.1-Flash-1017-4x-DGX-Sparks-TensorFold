@@ -1,0 +1,123 @@
+Subject: a tool-call block whose payload opens with a DSML opener but is too short to hold its closer stays text, instead of a slice past the payload's start
+
+diff --git a/zig/src/server/tool_parse.zig b/zig/src/server/tool_parse.zig
+index daec4e64..d0eb23a1 100644
+--- a/zig/src/server/tool_parse.zig
++++ b/zig/src/server/tool_parse.zig
+@@ -130,6 +130,15 @@ pub fn parse(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?u
+     return if (n_read > n_cut) read else cut;
+ }
+ 
++/// The inside of ``body`` (an envelope's payload) when it opens with a DSML opener, read as it always was: the opener cut
++/// from its start and a closer's length from its end. The payload of a ``<tool_call>`` block (or another tool-call
++/// envelope) can open with a DSML opener and be too short to hold a closer as well; cutting both from it would slice past
++/// its own start, so it reads as no DSML block. Every payload long enough reads as before.
++fn dsmlBlock(body: []const u8, open: []const u8, close: []const u8) ?[]const u8 {
++    if (body.len < open.len + close.len or !std.mem.startsWith(u8, body, open)) return null;
++    return body[open.len .. body.len - close.len];
++}
++
+ fn sameEnvelopes(x: []const Envelope, y: []const Envelope) bool {
+     if (x.len != y.len) return false;
+     for (x, y) |p, q| if (p.start != q.start or p.end != q.end) return false;
+@@ -148,14 +157,13 @@ fn parseEnvelopes(a: Allocator, text: []const u8, envs: []const Envelope, known:
+     for (envs) |env| {
+         try residue.appendSlice(a, text[cursor..env.start]);
+         cursor = env.end;
+-        if (std.mem.startsWith(u8, env.payload, dsml41_open)) {
+-            try dsml41Calls(a, env.payload[dsml41_open.len .. env.payload.len - dsml41_close.len], known, max_calls, &calls, &residue);
++        if (dsmlBlock(env.payload, dsml41_open, dsml41_close)) |inner| {
++            try dsml41Calls(a, inner, known, max_calls, &calls, &residue);
+             continue;
+         }
+         if (max_calls) |m| if (calls.items.len >= m) continue;
+         const parsed: ?[]Call = blk: {
+-            if (std.mem.startsWith(u8, env.payload, dsml_open)) {
+-                const inner = env.payload[dsml_open.len .. env.payload.len - dsml_close.len];
++            if (dsmlBlock(env.payload, dsml_open, dsml_close)) |inner| {
+                 break :blk dsmlCalls(a, inner) catch |e| switch (e) {
+                     error.OutOfMemory => return error.OutOfMemory,
+                     error.Invalid => null,
+diff --git a/zig/src/server/tool_parse_test.zig b/zig/src/server/tool_parse_test.zig
+index 78f5d8ea..0607d1a6 100644
+--- a/zig/src/server/tool_parse_test.zig
++++ b/zig/src/server/tool_parse_test.zig
+@@ -4,6 +4,7 @@ const json = @import("json.zig");
+ const tool_parse = @import("tool_parse.zig");
+ const parse = tool_parse.parse;
+ const closeCall = tool_parse.closeCall;
++const tool_stream = @import("tool_stream.zig");
+ 
+ test "families" {
+     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+@@ -285,3 +286,70 @@ test "around a DSML block: prose that quotes its closer, several blocks, both sp
+     try std.testing.expectEqualStrings("and", rm.content);
+     try expectStreamAgrees(a, mixed, "and");
+ }
++
++test "a tool-call block that opens with a DSML opener but is too short to hold its closer stays text" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const tools = (try json.parse(a, "[{\"type\":\"function\",\"function\":{\"name\":\"write\"}}]")).ok.array;
++    const D = "\u{ff5c}DSML\u{ff5c}";
++    // each payload opens with a DSML opener and is shorter than that opener and its closer: before the length guard the
++    // parser cut both from it, a slice past its own start
++    const short = [_][]const u8{
++        "<tool_call><" ++ D ++ " calls></tool_call>",
++        "<tool_call><" ++ D ++ "tool_calls></tool_call>",
++        "Sure: <tool_call> <" ++ D ++ " calls> x </tool_call>",
++        "<TOOL_CALL><" ++ D ++ " calls></TOOL_CALL>",
++        "<|tool_call><" ++ D ++ " calls><tool_call|>",
++        "<ns:tool_call><" ++ D ++ "tool_calls></ns:tool_call>",
++        "<tool_call><" ++ D ++ " calls></" ++ D ++ " calls</tool_call>", // one byte short
++    };
++    // the stream filter's text at the end of each reply: it hides an unclosed DSML block from its opener on (the
++    // route sends the whole content at the end when the filter showed nothing, so only the replies with text before
++    // the opener reach a streaming client shorter than they reach a non-streaming one)
++    const streamed_text = [_][]const u8{ "", "", "Sure:", "<TOOL_CALL>", "", "<ns:tool_call>", "" };
++    for (short, streamed_text) |text, shown| {
++        // with no limit the block stays the reply's text; a one-call reply drops it and keeps the prose before it
++        const r = try parse(a, text, tools, null);
++        try std.testing.expect(r.calls == null);
++        try std.testing.expectEqualStrings(text, r.content);
++        const one = try parse(a, text, tools, 1);
++        try std.testing.expect(one.calls == null);
++        try std.testing.expectEqualStrings(if (std.mem.startsWith(u8, text, "Sure:")) "Sure:" else "", one.content);
++        const reply_text = @import("reply_text.zig");
++        try std.testing.expectEqualStrings(shown, std.mem.trim(u8, try reply_text.hideToolCalls(a, text, true), " \t\r\n"));
++        try expectNoRetraction(a, text);
++        // the live tool-call streamer, fed byte by byte, sends no call, with a <tool_call> template or a DSML one
++        for ([_]bool{ false, true }) |dsml_template| {
++            var st = try tool_stream.Streamer.init(a, tools);
++            st.calls_off = dsml_template;
++            var out: std.ArrayList(json.Value) = .empty;
++            for (1..text.len + 1) |n| try st.feed(text[0..n], &out);
++            try std.testing.expect(!st.streamed);
++            try std.testing.expectEqual(@as(usize, 0), out.items.len);
++        }
++    }
++    // after an offered call, either spelling, each limit: a V4 block is read after the limit is checked, a V4.1 block
++    // before it, so before the guard a V4.1 block crashed the parser at any limit and a V4 block only with no limit
++    const call = "<tool_call>{\"name\": \"write\", \"arguments\": {}}</tool_call>";
++    for ([_][]const u8{ "<tool_call><" ++ D ++ "tool_calls></tool_call>", "<tool_call><" ++ D ++ " calls></tool_call>" }) |block| {
++        const text = try std.mem.concat(a, u8, &.{ call, "\n", block });
++        const unlimited = try parse(a, text, tools, null);
++        try std.testing.expectEqual(@as(usize, 1), unlimited.calls.?.len);
++        try std.testing.expectEqualStrings(block, unlimited.content);
++        const none = try parse(a, text, tools, 0);
++        try std.testing.expect(none.calls == null);
++        try std.testing.expectEqualStrings("", none.content);
++        const one = try parse(a, text, tools, 1);
++        try std.testing.expectEqual(@as(usize, 1), one.calls.?.len);
++        try std.testing.expectEqualStrings("", one.content);
++    }
++    // long enough, the payload reads as it always did: an empty block makes no call, a whole block in a tool-call
++    // block makes its call
++    const empty = try parse(a, "<tool_call><" ++ D ++ " calls></" ++ D ++ " calls></tool_call>", tools, null);
++    try std.testing.expect(empty.calls == null);
++    try std.testing.expectEqualStrings("", empty.content);
++    const wrapped = try parse(a, try std.mem.concat(a, u8, &.{ "<tool_call>", try dsmlWrite(a, true, "x"), "</tool_call>" }), tools, null);
++    try std.testing.expectEqual(@as(usize, 1), wrapped.calls.?.len);
++    try std.testing.expectEqualStrings("{\"content\":\"x\"}", wrapped.calls.?[0].get("function").?.get("arguments").?.string);
++}
