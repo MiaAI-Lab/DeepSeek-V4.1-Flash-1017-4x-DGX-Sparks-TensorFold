@@ -7,8 +7,10 @@
   parser now also reads a DSML block (either spelling) past a closer that lies inside a parameter value, and keeps that
   reading only when it returns strictly more calls after `max_calls`; otherwise the reply parses exactly as before. The
   stream filter hides such a block until its own closer; a reply that ends inside a block falls back to the first
-  closer, as before. `tests/repro-issue-14.sh` forces such a call (`guided_regex`, greedy) and checks the streamed and
-  whole replies. `TOP_P` is unchanged.
+  closer, as before. With a chat template that writes DSML calls, the live streamer no longer sends `<tool_call>`
+  markup as calls (it could send a quoted one and drop the reply's DSML calls); a streaming client gets the parsed
+  calls, as a non-streaming one does. `tests/repro-issue-14.sh` forces such calls (`guided_regex`, greedy) and checks
+  the streamed and whole replies. `TOP_P` is unchanged.
 - **2026-11-02** -- `tools/claims/`: three scripts that check a patch's promise against a running server, written by
   Hector Isaza ([hecisaza](https://github.com/hecisaza)) with the verify step of
   [inference-agent-kit](https://github.com/hecisaza/inference-agent-kit): `0042`'s JSON answers, `0043`'s orphan DSML
