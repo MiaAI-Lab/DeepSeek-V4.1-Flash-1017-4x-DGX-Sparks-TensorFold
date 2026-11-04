@@ -442,6 +442,55 @@ node_order() { echo 0,1,2,3; }
         self.assertNotEqual(code, 0, out)
         self.assertIn("RANK_LOCAL is 0 or 1", out)
 
+    def copies(self, *workers):
+        """This Spark's four weight files, and on each worker named a copy of the one it reads (name, size and time)."""
+        code, out = self.bash('echo "@$DATA_DIR|$WORKER_RANK_DIR"')
+        data_dir, rank_dir = out.split("@")[-1].strip().split("|")
+        cache = Path(data_dir) / "rank-cache"
+        cache.mkdir(parents=True, exist_ok=True)
+        for n in range(4):
+            (cache / f"rank{n}of4-abc.bin").write_bytes(b"x" * (10 + n))
+        for h in workers:   # node_order 0,1,2,3: worker wN reads node N's file
+            name = f"rank{h[1]}of4-abc.bin"
+            d = Path(rank_dir.replace("$HOME", str(self.sim / "home" / h)))
+            d.mkdir(parents=True, exist_ok=True)
+            (d / name).write_bytes((cache / name).read_bytes())
+            os.utime(d / name, (1000, (cache / name).stat().st_mtime))
+        return Path(rank_dir)
+
+    def test_step_4_says_where_the_weights_load_from(self):
+        for h in ["head", "w1", "w2", "w3"]:
+            self.containers(h, NAME)
+        rank_dir = self.copies("w1", "w2", "w3")
+        cases = [({}, "Loading: ~75 GiB of weights on each Spark from its own disk, then the caches (a minute or two)"),
+                 ({"gone": "w2"}, "Loading: ~75 GiB of weights on each Spark over NFS (ranks 1,3 from their own disks)"),
+                 ({"gone": "w1"}, "Loading: ~75 GiB of weights on each Spark over NFS (rank 3 from its own disk)"),
+                 ({"off": True}, "Loading: ~75 GiB of weights on each Spark over NFS, then the caches (a few minutes)")]
+        for change, want in cases:
+            if "gone" in change:
+                for f in Path(str(rank_dir).replace("$HOME", str(self.sim / "home" / change["gone"]))).glob("*.bin"):
+                    f.unlink()
+            env = {"PREPARE": "0", "RANK_LOCAL": "0" if change.get("off") else "1"}
+            code, out = self.run_script(["start.sh", "restart"], env)
+            self.assertEqual(code, 0, out)
+            self.assertIn(want, out)
+            self.assertEqual(out.count("Loading: "), 1, out)
+
+    def test_the_hints_name_the_launcher_this_run_was_started_as(self):
+        for h in ["head", "w1", "w2", "w3"]:
+            self.containers(h, NAME)
+        self.copies()   # no copies on the workers: each rank warns, naming the script to re-prepare with
+        for script, want in (("start.sh", "./start.sh"), ("start-switchless.sh", "./start-switchless.sh")):
+            code, out = self.run_script([script, "restart"], {"PREPARE": "0", "RANK_LOCAL": "1"})
+            self.assertEqual(code, 0, out)
+            self.assertEqual(out.count(f"(PREPARE=1 {want} restart makes one)"), 3, out)
+            self.assertIn(f"Restart  {want} restart", out)
+            for h in ["head", "w1", "w2", "w3"]:   # already running everywhere: nothing to do
+                self.containers(h, NAME)
+            code, out = self.run_script([script], {"PREPARE": "0"})
+            self.assertEqual(code, 0, out)
+            self.assertIn(f"nothing to do. {want} restart restarts it", out)
+
     def test_smoke_test_needs_a_real_completion(self):
         ok_body = '{"choices": [{"message": {"role": "assistant", "content": "OK"}}], "usage": {"completion_tokens": 1}}'
         cases = {"HTTP 500 with a completion's body": (ok_body, "500"),
@@ -571,6 +620,24 @@ class MasterAddr(ScriptTest):
     def test_an_explicit_master_addr_wins(self):
         self.env["MASTER_ADDR"] = "100.101.1.2"
         self.assertEqual(self.derived(["192.0.2.5"], "192.0.2.5"), "100.101.1.2")
+
+
+class LauncherHint(ScriptTest):
+    """The start script a message names fits the fabric: ./start.sh stops on a ring, ./start-switchless.sh on a switch."""
+
+    def test_launcher_fits_the_fabric(self):
+        code, out = self.bash("launcher ring; launcher mesh")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(out.split(), ["./start-switchless.sh", "./start.sh"])
+
+    def test_prepare_names_the_launcher_for_the_fabric_it_found(self):
+        source = (self.repo / "scripts" / "prepare.sh").read_text()
+        done = [l for l in source.splitlines() if l.startswith('log "Done:')]
+        self.assertEqual(len(done), 1, done)
+        for fabric, want in (("ring", "./start-switchless.sh"), ("mesh", "./start.sh")):
+            code, out = self.bash(f'log() {{ echo "$*"; }}\nFABRIC={fabric}\n{done[0]}')
+            self.assertEqual(code, 0, out)
+            self.assertIn(f"Start the server with {want} (port 8888).", out)
 
 
 class RingGraphs(ScriptTest):

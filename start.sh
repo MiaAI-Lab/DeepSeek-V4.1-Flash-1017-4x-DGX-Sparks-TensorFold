@@ -73,7 +73,7 @@ running_here()   { [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME
 running_worker() { [[ "$(worker "$1" docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null)" == true ]]; }
 all_running() { local i; running_here || return 1; for i in 1 2 3; do running_worker "$i" || return 1; done; }
 if (( ! DRY )) && [[ "$MODE" == start ]] && all_running; then
-  log "$CONTAINER_NAME is already running on all 4 Sparks (port $PORT): nothing to do. ./start.sh restart restarts it, ./stop.sh stops it."
+  log "$CONTAINER_NAME is already running on all 4 Sparks (port $PORT): nothing to do. $(launcher "$FABRIC_EXPECT") restart restarts it, ./stop.sh stops it."
   exit 0
 fi
 
@@ -139,14 +139,15 @@ FOLLOW="--pool $POOL --context $CONTEXT --engram $MODEL_ARG --token-map $DATA/ds
 FOLLOW+=" --graphs $GRAPHS --side $SIDE --prefetch $PREFETCH --aio $ENGRAM_AIO"
 step 3 "Launch: container $CONTAINER_NAME, ranks 3 to 1 on the workers, then rank 0 here"
 IFS=, read -r -a ORD <<<"$NODE_ORDER"
+LOCAL_RANKS=()   # the workers that read their weight file from their own disk
 for i in 3 2 1; do
   # its weight file from its own disk when the copy there (prepare.sh) matches this Spark's, else over NFS
   rank_dir="$DATA/rank-cache"; rank_mount=""
   rf=""; [[ "$RANK_LOCAL" != 1 ]] || rf=$(rank_file "${ORD[i]}")
   if [[ -n "$rf" ]] && worker "$i" "[[ \"\$(stat -c '%s %Y' $WORKER_RANK_DIR/${rf##*/} 2>/dev/null)\" == '$(rank_stamp "$rf")' ]]" 2>/dev/null; then
-    rank_dir=/rank-local; rank_mount="-v $WORKER_RANK_DIR:/rank-local:ro"
+    rank_dir=/rank-local; rank_mount="-v $WORKER_RANK_DIR:/rank-local:ro"; LOCAL_RANKS=("$i" "${LOCAL_RANKS[@]}")
   elif [[ "$RANK_LOCAL" == 1 ]]; then
-    warn "rank $i reads its weight file over NFS: no matching copy in $WORKER_RANK_DIR on $(worker_host "$i") (PREPARE=1 ./start.sh restart makes one)"
+    warn "rank $i reads its weight file over NFS: no matching copy in $WORKER_RANK_DIR on $(worker_host "$i") (PREPARE=1 $(launcher "$FABRIC_EXPECT") restart makes one)"
   fi
   # Engram's tables from the worker's own disk (prepare.sh), the rest over NFS; with packed shards the tables' headers
   # come over NFS and the rows from the shards on the worker's disk
@@ -186,7 +187,12 @@ log "Rank 0 here: ${SERVE[*]}"
 "${here[@]}" >/dev/null
 
 # ---------------------------------------------------------------- 4. load
-step 4 "Loading: ~75 GiB of weights on each Spark over NFS, then the caches (a few minutes)"
+# where the workers read their weight file (most of the ~75 GiB): over NFS, unless RANK_LOCAL=1 mounted their own copy
+local_n=${#LOCAL_RANKS[@]}; local_list=$(IFS=,; echo "${LOCAL_RANKS[*]}")
+if (( local_n == 3 )); then step 4 "Loading: ~75 GiB of weights on each Spark from its own disk, then the caches (a minute or two)"
+elif (( local_n == 1 )); then step 4 "Loading: ~75 GiB of weights on each Spark over NFS (rank $local_list from its own disk), then the caches (a few minutes)"
+elif (( local_n == 2 )); then step 4 "Loading: ~75 GiB of weights on each Spark over NFS (ranks $local_list from their own disks), then the caches (a few minutes)"
+else step 4 "Loading: ~75 GiB of weights on each Spark over NFS, then the caches (a few minutes)"; fi
 # Neither log follower may retain the parent launcher lock after it exits.
 docker logs -f "$CONTAINER_NAME" 8>&- 2>&1 | sed -u "s/^/  ${D}│${R} /" 8>&- &
 LOGS_PID=$!
@@ -237,7 +243,7 @@ cat <<EOF
     API      http://${IP:-<spark-address>}:$PORT/v1   (model: $SERVED_NAME)
     Window   $CONTEXT tokens · $PARALLEL at once · $MODEL_FORMAT · drafts $( [[ "$DRAFTS" == 1 ]] && echo on || echo off) · images $( [[ "$VISION" == 1 ]] && echo on || echo off)
     Logs     docker logs -f $CONTAINER_NAME$(for i in 1 2 3; do printf '   (rank %s: ssh %s docker logs -f %s)' "$i" "$(worker_host "$i")" "$CONTAINER_NAME"; done)
-    Restart  ./start.sh restart
+    Restart  $(launcher "$FABRIC_EXPECT") restart
     Stop     ./stop.sh
 
 EOF

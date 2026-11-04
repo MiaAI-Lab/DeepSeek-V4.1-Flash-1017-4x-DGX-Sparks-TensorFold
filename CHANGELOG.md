@@ -6,6 +6,11 @@
   closers, and `0044`'s GET and DELETE bodies, which exits 1 here until
   [PR #37](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/37) lands. Exit 0: the
   claim holds; 1: it does not; 2: the script could not judge.
+- **2026-11-01** -- The messages name the start script that fits the fabric: on a ring, prepare.sh's last line,
+  start.sh's "already running" hint, its re-prepare warning and the LIVE banner's restart line said `./start.sh`,
+  which stops there and asks for `./start-switchless.sh` (`launcher` in `scripts/nodes.sh`). start.sh's step 4 says
+  where the workers' weight files load from: over NFS, or with `RANK_LOCAL=1` from each worker's own disk (all
+  three: "a minute or two"; some: which ranks), instead of always "over NFS ... a few minutes".
 - **2026-11-01** -- README notes from three issues, none of them changing a default: `TF_DS_RDMA_CPUS` and the GB10's
   core layout ([making](https://github.com/making), [#40](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/issues/40));
   what `__vm_enough_memory` in `dmesg` means ([#36](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/issues/36));
