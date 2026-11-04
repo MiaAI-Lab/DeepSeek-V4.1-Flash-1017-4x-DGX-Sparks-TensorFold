@@ -60,7 +60,7 @@ Thomas Kempka's, `0028` and `0029`, upstream TensorFold fixes backported by Mauv
 Mauvis Ledford's, `0033`, a backport by Manuel (manuel1618), `0034`, which is Hironori Uchikawa's (uchkw,
 Codex-assisted), `0036`, a port of upstream TensorFold's structured output (BobClawblaw, Ash Hart) and of
 BertholomusAI's DeepSeek-V4.1 part of it (bertholomus), `0037`, whose `mma_fp4` and activation format are Ash Hart's from
-TensorFold, `0039`-`0043`, which are SvangenStudios's, and `0046`, which is shalk3's.** At a glance:
+TensorFold, `0039`-`0043`, which are SvangenStudios's, `0046`, which is shalk3's, and `0052`, which is Hector's.** At a glance:
 
 | Patches | Author | What |
 | --- | --- | --- |
@@ -85,6 +85,7 @@ TensorFold, `0039`-`0043`, which are SvangenStudios's, and `0046`, which is shal
 | `0042` | [SvangenStudios](https://github.com/SvangenStudios) | JSON answers stay JSON beside offered tools (no tool-call parsing on the JSON channel) |
 | `0043` | [SvangenStudios](https://github.com/SvangenStudios) | a diagnostic for replies made only of orphan DSML closing tags |
 | `0046` | [shalk3](https://github.com/shalk3) | a rank's weight file read ahead of the loader (`TF_DS_LOAD_PREFETCH`) |
+| `0052` | **Hector** ([hecisaza](https://github.com/hecisaza)) | the block's own tags inside a DSML parameter value no longer end the block: the call stays and no closer reaches the text |
 
 The per-patch notes below also credit everyone who helped find or shape a specific fix along the way -- Hector's
 reviewer, Codex and Grok's live-bug diagnosis and design reviews, an outside reviewer's observation -- without
