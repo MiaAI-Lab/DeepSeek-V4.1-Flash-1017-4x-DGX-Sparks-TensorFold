@@ -1,5 +1,11 @@
 # Changelog
 
+- **2026-11-02** -- `tools/claims/`: three scripts that check a patch's promise against a running server, written by
+  Hector Isaza ([hecisaza](https://github.com/hecisaza)) with the verify step of
+  [inference-agent-kit](https://github.com/hecisaza/inference-agent-kit): `0042`'s JSON answers, `0043`'s orphan DSML
+  closers, and `0044`'s GET and DELETE bodies, which exits 1 here until
+  [PR #37](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/37) lands. Exit 0: the
+  claim holds; 1: it does not; 2: the script could not judge.
 - **2026-11-01** -- The messages name the start script that fits the fabric: on a ring, prepare.sh's last line,
   start.sh's "already running" hint, its re-prepare warning and the LIVE banner's restart line said `./start.sh`,
   which stops there and asks for `./start-switchless.sh` (`launcher` in `scripts/nodes.sh`). start.sh's step 4 says

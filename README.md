@@ -547,6 +547,7 @@ scripts/banner.sh         the start banner
 zig/Dockerfile            the engine image
 zig/patches/              the engine patches
 model/chat_template.jinja the chat template the server renders
+tools/claims/             checks of a patch's promise against a running server
 ```
 
 ## License
@@ -577,7 +578,8 @@ part of this repository.
   the kernel kit
   ([deepseek-v4.1-tensorfold-tp4-4xgb10@`6033ea4`](https://github.com/bertholomus/deepseek-v4.1-tensorfold-tp4-4xgb10/commit/6033ea48a27004b2715db82190e2a61f33411d92))
   and the served settings this recipe starts with.
-- **[Hector](https://github.com/hecisaza)**: patch `0008` (pair-sum gathers, `TF_DS_PAIR_SUM`) and the prefill measurements behind it.
+- **Hector Isaza ([hecisaza](https://github.com/hecisaza))**: patch `0008` (pair-sum gathers, `TF_DS_PAIR_SUM`) and the prefill measurements behind it;
+  the claim scripts in [`tools/claims`](tools/claims), written with the verify step of [inference-agent-kit](https://github.com/hecisaza/inference-agent-kit).
 - **Manrique ([hashd1ve](https://github.com/hashd1ve))**: the change to `model/chat_template.jinja` that writes each
   piece of the prompt out as it is made instead of adding it to one growing string, which ends rank 0's memory growth
   with long conversations (the two-Spark recipe's
