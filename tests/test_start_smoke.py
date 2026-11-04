@@ -318,6 +318,23 @@ class StartSmoke(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertNotIn("MISMATCH", out)
 
+    def test_a_fractional_budget_is_the_bytes_the_engine_truncates_to(self):
+        """0.2 GiB is 214748364 bytes to the engine's truncation, not the 214748365 a round would expect."""
+        self.cache_health()
+        self.health["live"]["cache"]["prompt_state"]["budget_bytes"] = 214748364
+        code, out = self.launch(args=["--prompt-cache-gib", "0.2"])
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("MISMATCH", out)
+        self.assertIn("is now LIVE", out)
+
+    def test_a_rounded_fractional_budget_is_a_mismatch(self):
+        self.cache_health()
+        self.health["live"]["cache"]["prompt_state"]["budget_bytes"] = 214748365
+        code, out = self.launch(infer=False, args=["--prompt-cache-gib", "0.2"])
+        self.assertEqual(code, 1, out)
+        self.assertIn("snapshot budget 214748365 != 214748364", out)
+        self.assertNotIn("is now LIVE", out)
+
     def test_a_context_override_is_the_expected_window(self):
         self.cache_health()
         self.health["live"]["cache"]["context_limit_positions"] = 262144

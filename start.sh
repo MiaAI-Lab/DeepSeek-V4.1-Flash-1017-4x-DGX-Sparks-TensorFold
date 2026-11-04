@@ -294,7 +294,7 @@ if want_streams is None:
     chosen.append("%s streams (what the budget fits)" % streams)
 elif streams != want_streams:
     problems.append("streams %s != %s" % (streams, want_streams))
-want_bytes = int(round(want_gib * (1 << 30)))
+want_bytes = int(want_gib * (1 << 30))  # the engine truncates (@intFromFloat): 0.2 GiB is 214748364 bytes, not the ...365 a round gives
 if want_gib > 0 and enabled is not True: problems.append("the prompt-state store is disabled")
 elif want_gib > 0 and budget != want_bytes: problems.append("snapshot budget %s != %s" % (budget, want_bytes))
 elif want_gib == 0 and enabled is True: problems.append("the prompt-state store is enabled, not 0 GiB")
