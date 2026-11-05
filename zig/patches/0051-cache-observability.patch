@@ -1,3 +1,7 @@
+Subject: the shared pool's four disjoint categories and the prompt-state store's account under /health and
+ /metrics, plus the launcher's check of the configuration the engine actually got
+Ported from: https://github.com/bertholomus/TensorFold/pull/52 (Tyler Folkman, tfolkman)
+
 diff --git a/zig/src/core/engine_api.zig b/zig/src/core/engine_api.zig
 index 18da06a0..a6ef536e 100644
 --- a/zig/src/core/engine_api.zig

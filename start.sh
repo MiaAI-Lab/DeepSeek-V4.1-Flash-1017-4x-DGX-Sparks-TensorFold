@@ -112,6 +112,12 @@ while [[ "$cache_whole" == 0?* ]]; do cache_whole=${cache_whole#0}; done  # 08 i
 # The engine refuses a budget at or past 2^34 GiB: refuse it before any container starts.
 [[ ${#cache_whole} -le 11 ]] || die "--prompt-cache-gib $EFF_CACHE_GIB is past the engine's 2^34 GiB ceiling"
 (( 10#$cache_whole < 17179869184 )) || die "--prompt-cache-gib $EFF_CACHE_GIB is past the engine's 2^34 GiB ceiling"
+# The engine truncates the budget to whole bytes. A positive budget below one byte truncates to 0, which disables
+# the store, while the check below reads the launch as one that asked for it: refuse the ambiguity, 0 is explicit.
+if (( 10#$cache_whole == 0 )); then
+  cache_bytes=$(awk -v g="$EFF_CACHE_GIB" 'BEGIN { print int(g * 1073741824) }')  # truncated, as the engine reads it
+  (( cache_bytes > 0 )) || die "--prompt-cache-gib $EFF_CACHE_GIB is below one byte once the engine truncates it: pass 0 to disable the prompt-state store"
+fi
 
 B=$'\033[1m'; M=$'\033[1;35m'; G=$'\033[1;32m'; D=$'\033[2m'; R=$'\033[0m'
 [[ -t 1 ]] || { B=; M=; G=; D=; R=; }
@@ -282,10 +288,17 @@ log "Server answered after $((SECONDS - start))s"
 # actually given (EFF_*: the environment with the operator's arguments applied), and a value the engine resolves
 # itself (`--context 0`: the model's window; `--parallel auto`: the engine-selected streams) is reported, not
 # compared. An old engine reports no cache group: that is "unavailable" (documented), not a mismatch. A consistent
-# report that disagrees with this launch is a hard failure; CACHE_ALLOW_CONFIG_MISMATCH=1 continues with a warning
-# instead, never silently. A /health that is not HTTP 200, or that carries a top-level error, fails the launch the
-# same way step 5 requires of the smoke test (the status is the last line of the body, as in step 5).
-health_raw=$(curl -s --max-time 10 -w '\n%{http_code}' "$URL/health") || health_raw=""
+# report that disagrees with this launch is a warning by default, never silent: the ranks are already serving and a
+# supervisor that restarts on a non-zero exit would restart a healthy server. CACHE_STRICT=1 makes it fatal instead.
+# A /health that is not HTTP 200, or that carries a top-level error, is read three times before it is called fatal
+# (one refused read from a server that is otherwise answering is not a verdict): that test is the one step 5 requires
+# of the smoke test (the status is the last line of the body, as in step 5).
+for attempt in 1 2 3; do
+  health_raw=$(curl -s --max-time 10 -w '\n%{http_code}' "$URL/health") || health_raw=""
+  [[ "${health_raw##*$'\n'}" == 200 ]] && break
+  (( attempt < 3 )) && sleep 2
+  true
+done
 cache_rc=0
 cache_meta=$(EXPECT_POOL="$POOL" EXPECT_CONTEXT="$EFF_CONTEXT" EXPECT_PARALLEL="$EFF_PARALLEL" EXPECT_CACHE_GIB="$EFF_CACHE_GIB" \
   python3 -c '
@@ -343,11 +356,11 @@ sys.exit(0 if not problems else 6)
 case $cache_rc in
   0) log "Cache telemetry: $cache_meta" ;;
   4) log "Cache telemetry: unavailable ($cache_meta); showing no pool or snapshot figures" ;;
-  3) die "health check failed: $cache_meta. The engine must answer HTTP 200 with no error object before its cache account is read." ;;
-  *) if [[ "${CACHE_ALLOW_CONFIG_MISMATCH:-0}" == 1 ]]; then
-       warn "Cache telemetry: $cache_meta (CACHE_ALLOW_CONFIG_MISMATCH=1: continuing with an unverified configuration)"
+  3) die "health check failed after 3 reads: $cache_meta. The engine must answer HTTP 200 with no error object before its cache account is read." ;;
+  *) if [[ "${CACHE_STRICT:-0}" == 1 ]]; then
+       die "cache telemetry check failed: $cache_meta. CACHE_STRICT=1 makes this fatal; the ranks were launched and are still serving (./stop.sh stops them)."
      else
-       die "cache telemetry check failed: $cache_meta. The engine's effective configuration disagrees with the values this launch gave it (CACHE_ALLOW_CONFIG_MISMATCH=1 continues anyway)."
+       warn "cache telemetry check failed: $cache_meta. This launch's effective configuration is unverified; the ranks serve (CACHE_STRICT=1 makes this fatal)."
      fi ;;
 esac
 

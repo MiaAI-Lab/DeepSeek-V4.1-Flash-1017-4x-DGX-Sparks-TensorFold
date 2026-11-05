@@ -38,6 +38,7 @@ class StartSmoke(unittest.TestCase):
         # /health: the launcher reads the engine's effective cache account from it (absent here, as an old engine's)
         self.health = {"status": "ok", "live": {"connections": 0, "waiting": 0}}
         self.health_status = 200
+        self.health_failures = 0
         self.abort_post = False
         self.hits = []
         test = self
@@ -53,7 +54,11 @@ class StartSmoke(unittest.TestCase):
             def do_GET(self):
                 test.hits.append(("GET", self.path))
                 if self.path == "/health":
-                    self.respond(test.health_status, json.dumps(test.health).encode())
+                    if test.health_failures:
+                        test.health_failures -= 1
+                        self.respond(500, b"{}")
+                    else:
+                        self.respond(test.health_status, json.dumps(test.health).encode())
                 else:
                     self.respond(200, b'{"object":"list","data":[]}')
 
@@ -261,37 +266,41 @@ class StartSmoke(unittest.TestCase):
         self.assertIn("Cache telemetry: unavailable", out)
         self.assertIn("is now LIVE", out)
 
-    def test_a_pool_mismatch_stops_the_launcher(self):
+    def test_a_pool_mismatch_is_a_warning_by_default(self):
         self.cache_health()
         self.health["live"]["cache"]["pool"]["capacity_positions"] = 8388608
-        code, out = self.launch(infer=False)
-        self.assertEqual(code, 1, out)
+        code, out = self.launch()
+        self.assertEqual(code, 0, out)
+        self.assertIn("WARN:", out)
         self.assertIn("cache telemetry check failed", out)
         self.assertIn("pool 8388608 != 2097152", out)
-        self.assertNotIn("is now LIVE", out)
+        self.assertIn("CACHE_STRICT=1", out)
+        self.assertIn("is now LIVE", out)
 
-    def test_an_inconsistent_account_stops_the_launcher(self):
+    def test_cache_strict_makes_an_inconsistent_account_fatal(self):
         self.cache_health(consistent=False)
-        code, out = self.launch(infer=False)
+        code, out = self.launch({"CACHE_STRICT": "1"}, infer=False)
         self.assertEqual(code, 1, out)
         self.assertIn("inconsistent accounting", out)
+        self.assertIn("CACHE_STRICT=1", out)
         self.assertNotIn("is now LIVE", out)
 
-    def test_a_disabled_store_with_a_configured_budget_stops_the_launcher(self):
+    def test_a_disabled_store_with_a_configured_budget_is_a_warning(self):
         self.cache_health()
         self.health["live"]["cache"]["prompt_state"] = {"enabled": False, "budget_bytes": 0}
-        code, out = self.launch(infer=False)
-        self.assertEqual(code, 1, out)
-        self.assertIn("the prompt-state store is disabled", out)
-        self.assertNotIn("is now LIVE", out)
-
-    def test_an_unverified_configuration_needs_an_explicit_opt_in(self):
-        self.cache_health()
-        self.health["live"]["cache"]["stream_capacity"] = 8
-        code, out = self.launch({"CACHE_ALLOW_CONFIG_MISMATCH": "1"})
+        code, out = self.launch()
         self.assertEqual(code, 0, out)
-        self.assertIn("CACHE_ALLOW_CONFIG_MISMATCH=1", out)
+        self.assertIn("the prompt-state store is disabled", out)
         self.assertIn("is now LIVE", out)
+
+    def test_one_failed_health_read_is_retried(self):
+        """A server that is serving but answers /health once with a 5xx does not fail the launch."""
+        self.cache_health()
+        self.health_failures = 1
+        code, out = self.launch()
+        self.assertEqual(code, 0, out)
+        self.assertIn("Cache telemetry: shared pool 2,097,152 positions", out)
+        self.assertEqual(self.hits.count(("GET", "/health")), 2, out)
 
     # ─── operator arguments are what the engine actually runs ────────────
     def test_a_prompt_cache_override_is_the_expected_budget(self):
@@ -407,7 +416,7 @@ class StartSmoke(unittest.TestCase):
     def test_a_rounded_fractional_budget_is_a_mismatch(self):
         self.cache_health()
         self.health["live"]["cache"]["prompt_state"]["budget_bytes"] = 214748365
-        code, out = self.launch(infer=False, args=["--prompt-cache-gib", "0.2"])
+        code, out = self.launch({"CACHE_STRICT": "1"}, infer=False, args=["--prompt-cache-gib", "0.2"])
         self.assertEqual(code, 1, out)
         self.assertIn("snapshot budget 214748365 != 214748364", out)
         self.assertNotIn("is now LIVE", out)
@@ -433,6 +442,16 @@ class StartSmoke(unittest.TestCase):
         )
         self.assertEqual(code, 1, out)
         self.assertIn("is above PARALLEL (4)", out)
+        self.assertEqual(self.fixture.launched(), [], out)
+
+    def test_a_positive_budget_below_one_byte_is_refused_before_any_container(self):
+        code, out = self.fixture.run_script(
+            ["start.sh", "--prompt-cache-gib", "0.0000000001"],
+            {"PREPARE": "0", "HOST": "127.0.0.1", "PORT": str(self.port)},
+            timeout=15,
+        )
+        self.assertEqual(code, 1, out)
+        self.assertIn("below one byte", out)
         self.assertEqual(self.fixture.launched(), [], out)
 
     def test_a_flag_without_a_value_is_refused_before_any_container(self):
@@ -548,12 +567,14 @@ class StartSmoke(unittest.TestCase):
         self.assertIn("health reported an error", out)
         self.assertNotIn("is now LIVE", out)
 
-    def test_a_genuine_pool_mismatch_still_fails_with_an_override_in_play(self):
+    def test_a_genuine_pool_mismatch_is_reported_with_an_override_in_play(self):
         self.cache_health()
         self.health["live"]["cache"]["pool"]["capacity_positions"] = 8388608
-        code, out = self.launch(infer=False, args=["--prompt-cache-gib", "1"])
-        self.assertEqual(code, 1, out)
+        code, out = self.launch(args=["--prompt-cache-gib", "1"])
+        self.assertEqual(code, 0, out)
+        self.assertIn("WARN:", out)
         self.assertIn("pool 8388608 != 2097152", out)
+        self.assertIn("is now LIVE", out)
 
     def test_short_single_character_reply_remains_accepted(self):
         self.set_content("A" * 7)

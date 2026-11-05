@@ -60,7 +60,10 @@ Thomas Kempka's, `0028` and `0029`, upstream TensorFold fixes backported by Mauv
 Mauvis Ledford's, `0033`, a backport by Manuel (manuel1618), `0034`, which is Hironori Uchikawa's (uchkw,
 Codex-assisted), `0036`, a port of upstream TensorFold's structured output (BobClawblaw, Ash Hart) and of
 BertholomusAI's DeepSeek-V4.1 part of it (bertholomus), `0037`, whose `mma_fp4` and activation format are Ash Hart's from
-TensorFold, `0039`-`0043`, which are SvangenStudios's, `0046`, which is shalk3's, and `0052` and `0053`, which are Hector's.** At a glance:
+TensorFold, `0039`-`0043`, which are SvangenStudios's, `0046`, which is shalk3's, and `0052` and `0053`, which are Hector's.**
+`0051` is [Tyler Folkman](https://github.com/tfolkman)'s, ported from his own upstream pull request
+([TensorFold #52](https://github.com/bertholomus/TensorFold/pull/52)); `Mia's AI Lab` in the lists below means the
+maintainer's work when it is not separately attributed. At a glance:
 
 | Patches | Author | What |
 | --- | --- | --- |
@@ -85,6 +88,7 @@ TensorFold, `0039`-`0043`, which are SvangenStudios's, `0046`, which is shalk3's
 | `0042` | [SvangenStudios](https://github.com/SvangenStudios) | JSON answers stay JSON beside offered tools (no tool-call parsing on the JSON channel) |
 | `0043` | [SvangenStudios](https://github.com/SvangenStudios) | a diagnostic for replies made only of orphan DSML closing tags |
 | `0046` | [shalk3](https://github.com/shalk3) | a rank's weight file read ahead of the loader (`TF_DS_LOAD_PREFETCH`) |
+| `0051` | [Tyler Folkman](https://github.com/tfolkman), from [TensorFold #52](https://github.com/bertholomus/TensorFold/pull/52) | the shared pool's four disjoint categories and the prompt-state store's account under `/health` and `/metrics`, plus the launcher's effective-configuration check |
 | `0052` | **Hector** ([hecisaza](https://github.com/hecisaza)) | the block's own tags inside a DSML parameter value no longer end the block: the call stays and no closer reaches the text |
 | `0053` | **Hector** ([hecisaza](https://github.com/hecisaza)) | a tool-call block whose payload is too short to hold the DSML block it opens with is handled as a block that is not a call; the parser no longer slices past the payload's start |
 
