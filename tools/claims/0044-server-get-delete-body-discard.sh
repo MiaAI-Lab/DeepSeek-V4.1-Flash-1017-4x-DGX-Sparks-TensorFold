@@ -2,7 +2,9 @@
 # Written by Hector Isaza (hecisaza, https://github.com/hecisaza) with the verify step of inference-agent-kit
 # (https://github.com/hecisaza/inference-agent-kit). Apache-2.0. Below this header it is
 # https://github.com/hecisaza/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/blob/10c4c7c21679f920aa2780d25a0019989ff284af/claims/MiaAI-Lab-DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold-pr-37.sh
-# unchanged, except that this recipe added the connection check before the controls: a server that is down exits 2, not 1.
+# unchanged, except that this recipe added the connection check before the controls: a server that is down exits 2, not 1;
+# and (SvangenStudios) a reply that should succeed is not good with an error object beside its data: on a control or
+# the create that is exit 2, on a body case exit 1.
 # Usage: tools/claims/0044-server-get-delete-body-discard.sh API MODEL. Exit 0: the claim holds. 1: it does not. 2: the script could not judge.
 # Exits 1 on this recipe until patch 0044 lands (https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/37).
 # claim: patches: 0044 GET and DELETE request bodies are drained, so a kept connection cannot hand one request's bytes
@@ -102,9 +104,13 @@ def js(text):
     except Exception: return None
 
 
+def no_error(j):
+    return j.get("error") is None   # a 200 that also carries an error object is not a good reply; "error": null is none
+
+
 def models_ok(rep):
     j = js(rep[1])
-    return rep[0] == 200 and isinstance(j, dict) and any(m.get("id") == model for m in j.get("data", []))
+    return rep[0] == 200 and isinstance(j, dict) and no_error(j) and any(m.get("id") == model for m in j.get("data", []))
 
 
 def model_ids(rep):
@@ -122,7 +128,7 @@ def not_stored(rid):
 def deleted(rid):
     def check(rep):
         j = js(rep[1])
-        return rep[0] == 200 and isinstance(j, dict) and j.get("id") == rid and j.get("deleted") is True
+        return rep[0] == 200 and isinstance(j, dict) and no_error(j) and j.get("id") == rid and j.get("deleted") is True
     return check
 
 
@@ -162,11 +168,12 @@ try:
         "model": model, "input": "Say ok.", "temperature": 0, "max_output_tokens": 8, "store": True}),
         {"content-type": "application/json"})
     hr = hc.getresponse(); created = js(hr.read().decode("utf-8", "replace")); hc.close()
-    rid = created.get("id") if hr.status == 200 and isinstance(created, dict) else None
+    rid = created.get("id") if hr.status == 200 and isinstance(created, dict) and no_error(created) else None
 except (OSError, http.client.HTTPException) as e:
     print(f"CLAIM: error could not create a stored response: {e}"); sys.exit(2)
 if not rid:
-    print(f"CLAIM: error could not create a stored response (status {hr.status})"); sys.exit(2)
+    note = " with an error" if isinstance(created, dict) and not no_error(created) else ""
+    print(f"CLAIM: error could not create a stored response (status {hr.status}{note})"); sys.exit(2)
 print(f"stored response created for the delete case: {rid}")
 
 same_list = lambda rep: models_ok(rep) and model_ids(rep) == ids
