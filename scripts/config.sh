@@ -119,6 +119,9 @@ PORT="${PORT:-8888}"
 CONTEXT="${CONTEXT:-1048576}"
 POOL="${POOL:-2097152}"
 PARALLEL="${PARALLEL:-16}"             # requests at once (the engine's streams)
+# The prompt-state snapshot budget in GiB (the engine's own --prompt-cache-gib, separate from POOL: it is the byte
+# budget of the reusable snapshot copies, not positions of the shared pool). 0 disables the store.
+PROMPT_CACHE_GIB="${PROMPT_CACHE_GIB:-0.5}"
 ROUND_ROWS="${ROUND_ROWS:-48}"         # a decode round's rows at most (drafts of every stream together)
 MAX_TOKENS="${MAX_TOKENS:-32768}"      # a reply's budget when a request sets none
 THINKING="${THINKING:-1}"              # think first unless a request turns it off

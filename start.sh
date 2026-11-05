@@ -43,11 +43,81 @@ for v in CONTEXT POOL PARALLEL ROUND_ROWS MAX_TOKENS; do [[ "${!v}" =~ ^[1-9][0-
 (( CONTEXT <= 1048576 )) || die "CONTEXT is at most 1048576 (the model's window), not $CONTEXT"
 (( POOL >= CONTEXT )) || die "POOL ($POOL) holds every stream's positions together: at least CONTEXT ($CONTEXT)"
 (( PARALLEL <= 16 )) || die "PARALLEL is 1 to 16, not $PARALLEL"
+[[ "$PROMPT_CACHE_GIB" =~ ^(0|[0-9]+([.][0-9]+)?)$ ]] || die "PROMPT_CACHE_GIB is a non-negative number of GiB, not $PROMPT_CACHE_GIB"
 [[ "$SERVED_K" =~ ^(solo|all|off)$ ]] || die "SERVED_K is solo, all or off, not $SERVED_K"
 for v in THINKING DRAFTS VISION RDMA GRAPHS SIDE PREFETCH ENGRAM_AIO ENGRAM_PACKED ENGRAM_OWNED ENGRAM_INSTREAM RANK_LOCAL; do [[ "${!v}" =~ ^[01]$ ]] || die "$v is 0 or 1, not ${!v}"; done
 [[ "$ENGRAM_CACHE_MIB" =~ ^[0-9]+$ ]] || die "ENGRAM_CACHE_MIB is a count of MiB, not $ENGRAM_CACHE_MIB"
 [[ "$ENGRAM_INSTREAM" == 0 || ( "$ENGRAM_PACKED" == 1 && "$ENGRAM_AIO" == 1 ) ]] || die "ENGRAM_INSTREAM=1 needs ENGRAM_PACKED=1 and ENGRAM_AIO=1"
 check_workers
+
+# The operator's arguments are appended to rank 0's serve line, so they win over the environment: everything that
+# compares against the launch must read the same final value the engine will — the last occurrence, in either form
+# (`--flag value`, `--flag=value`). A flag given no value at all (`--context=`, a trailing `--context`) is the operator's
+# mistake and is refused here, not by the engine once the ranks are launched.
+EXTRA=("$@")
+argv_flag() {  # sets ARGV_SEEN (the flag was given) and ARGV_VALUE (its last value: empty when it was given none)
+  local name=$1 i=0 arg
+  ARGV_SEEN=0; ARGV_VALUE=
+  while (( i < ${#EXTRA[@]} )); do
+    arg=${EXTRA[i]}
+    if [[ "$arg" == "$name" ]]; then
+      ARGV_SEEN=1; ARGV_VALUE=
+      if (( i + 1 < ${#EXTRA[@]} )); then ARGV_VALUE=${EXTRA[i + 1]}; fi
+    elif [[ "$arg" == "$name="* ]]; then
+      ARGV_SEEN=1; ARGV_VALUE=${arg#*=}
+    fi
+    i=$((i + 1))
+  done
+  return 0
+}
+eff_flag() {  # the operator's last --flag, else the environment's value; `what` completes "needs a value: ..."
+  local name=$1 env=$2 what=$3
+  argv_flag "$name"
+  if (( ARGV_SEEN )); then
+    [[ -n "$ARGV_VALUE" ]] || die "$name needs a value: $what"
+    printf '%s' "$ARGV_VALUE"
+  else
+    printf '%s' "$env"
+  fi
+}
+EFF_CONTEXT=$(eff_flag --context "$CONTEXT" "a token count, or 0 for the model's window")
+EFF_PARALLEL=$(eff_flag --parallel "$PARALLEL" "a stream count, or auto")
+EFF_CACHE_GIB=$(eff_flag --prompt-cache-gib "$PROMPT_CACHE_GIB" "a non-negative number of GiB")
+# The engine refuses these only after loading ~75 GiB on every Spark: refuse them before any container starts. A count is
+# a plain decimal: digits only, no sign and no leading zero (Bash would read 0100 as octal 64), at most a few digits so no
+# comparison here can wrap.
+[[ "$EFF_CONTEXT" =~ ^(0|[1-9][0-9]{0,6})$ ]] || die "--context $EFF_CONTEXT: a plain decimal token count, or 0 for the model's window"
+(( EFF_CONTEXT <= 1048576 )) || die "--context $EFF_CONTEXT is past the model's 1,048,576-token window"
+# Only rank 0 takes these arguments; the followers are launched with CONTEXT and allocate buffers for it (ctx_cap in
+# model.zig). A wider rank-0 window would ask them to hold positions they were never sized for, so a wider window has
+# to be configured through CONTEXT for every rank.
+if (( EFF_CONTEXT == 0 )); then
+  (( CONTEXT >= 1048576 )) || die "--context 0 asks for the model's 1,048,576-token window, above CONTEXT ($CONTEXT), what the followers are launched with: set CONTEXT=1048576 for all four ranks instead"
+else
+  (( EFF_CONTEXT <= CONTEXT )) || die "--context $EFF_CONTEXT is above CONTEXT ($CONTEXT), what the followers are launched with and sized for: set CONTEXT for all four ranks instead"
+fi
+if [[ "$EFF_PARALLEL" == auto ]]; then
+  # the engine's auto is 8 streams (server/cli.zig), and this backend reports stream_bytes = 0 (families/dsv41/native.zig),
+  # so the CUDA budget never reduces them: below 8 slots the extra streams meet NoFreeSlot, which is not requeued.
+  (( PARALLEL >= 8 )) || die "--parallel auto asks the engine for its 8 streams, above PARALLEL ($PARALLEL), what this launch and the shared pool were sized for: raise PARALLEL (in the environment or scripts/local.sh) to 8 or more, or pass a count of $PARALLEL or fewer"
+else
+  # the engine clamps 0 up to 1 and 4096 down at the top; 0 would also make the check expect 0 streams where the engine
+  # reports 1. A count above PARALLEL is past what this launch and the shared pool were sized for: NoFreeSlot later.
+  [[ "$EFF_PARALLEL" =~ ^[1-9][0-9]{0,3}$ ]] || die "--parallel $EFF_PARALLEL: a plain decimal stream count from 1, or auto (the engine reads 0 as 1)"
+  (( EFF_PARALLEL <= PARALLEL )) || die "--parallel $EFF_PARALLEL is above PARALLEL ($PARALLEL), what this launch and the shared pool were sized for: raise PARALLEL (in the environment or scripts/local.sh) to run more streams"
+fi
+[[ "$EFF_CACHE_GIB" =~ ^(0|[0-9]+([.][0-9]+)?)$ ]] || die "--prompt-cache-gib $EFF_CACHE_GIB: a non-negative number of GiB"
+cache_whole=${EFF_CACHE_GIB%%.*}
+while [[ "$cache_whole" == 0?* ]]; do cache_whole=${cache_whole#0}; done  # 08 is 8 GiB, not Bash's octal error
+# The engine refuses a budget at or past 2^34 GiB: refuse it before any container starts.
+[[ ${#cache_whole} -le 11 ]] || die "--prompt-cache-gib $EFF_CACHE_GIB is past the engine's 2^34 GiB ceiling"
+(( 10#$cache_whole < 17179869184 )) || die "--prompt-cache-gib $EFF_CACHE_GIB is past the engine's 2^34 GiB ceiling"
+# The engine truncates the budget to whole bytes. A positive budget below one byte truncates to 0, which disables
+# the store, while the check below reads the launch as one that asked for it: refuse the ambiguity, 0 is explicit.
+if (( 10#$cache_whole == 0 )); then
+  cache_bytes=$(awk -v g="$EFF_CACHE_GIB" 'BEGIN { print int(g * 1073741824) }')  # truncated, as the engine reads it
+  (( cache_bytes > 0 )) || die "--prompt-cache-gib $EFF_CACHE_GIB is below one byte once the engine truncates it: pass 0 to disable the prompt-state store"
+fi
 
 B=$'\033[1m'; M=$'\033[1;35m'; G=$'\033[1;32m'; D=$'\033[2m'; R=$'\033[0m'
 [[ -t 1 ]] || { B=; M=; G=; D=; R=; }
@@ -170,7 +240,7 @@ LISTEN="${LINK_HEAD_ADDR[1]:-$MASTER_ADDR},${LINK_HEAD_ADDR[2]:-$MASTER_ADDR},${
 ENV0=(TF_TP_WORLD=4 "TF_TP_MASTER=$MASTER_ADDR" "TF_TP_LISTEN=$LISTEN" "TF_TP_PORT=$MASTER_PORT" "TF_DS_RANK_CACHE=$DATA/rank-cache" "TF_DS_KIT=$KIT"
       "TENSORFOLD_CUDA_KERNELS=$KIT/aot" "TF_DS_ENGRAM=$MODEL_ARG" "TF_DS_TOKEN_MAP=$DATA/dsv41_token_map.json")
 SERVE=(tensorfold-native serve "$(served_in_container)" --backend cuda --host "$HOST" --port "$PORT" --name "$SERVED_NAME"
-       --context "$CONTEXT" --parallel "$PARALLEL" --max-tokens "$MAX_TOKENS" --temperature "$TEMPERATURE" --top-p "$TOP_P" --top-k "$TOP_K")
+       --context "$CONTEXT" --parallel "$PARALLEL" --prompt-cache-gib "$PROMPT_CACHE_GIB" --max-tokens "$MAX_TOKENS" --temperature "$TEMPERATURE" --top-p "$TOP_P" --top-k "$TOP_K")
 if [[ "$THINKING" == 1 ]]; then SERVE+=(--thinking); else SERVE+=(--no-thinking); fi
 [[ -z "$REASONING_EFFORT" ]] || SERVE+=(--reasoning-effort "$REASONING_EFFORT")
 # drafts off on rank 0 as on the followers (a follower without the drafter refuses a drafted round)
@@ -212,6 +282,88 @@ done
 kill $LOGS_PID 2>/dev/null || true
 log "Server answered after $((SECONDS - start))s"
 
+# ---------------------------------------------------------------- 4b. effective cache configuration
+# Read-only: the engine's own account of the shared pool, the per-request limit, the streams and the snapshot budget.
+# It makes no inference request, warms nothing and changes nothing. The expected values are the ones the engine was
+# actually given (EFF_*: the environment with the operator's arguments applied), and a value the engine resolves
+# itself (`--context 0`: the model's window; `--parallel auto`: the engine-selected streams) is reported, not
+# compared. An old engine reports no cache group: that is "unavailable" (documented), not a mismatch. A consistent
+# report that disagrees with this launch is a warning by default, never silent: the ranks are already serving and a
+# supervisor that restarts on a non-zero exit would restart a healthy server. CACHE_STRICT=1 makes it fatal instead.
+# A /health that is not HTTP 200, or that carries a top-level error, is read three times before it is called fatal
+# (one refused read from a server that is otherwise answering is not a verdict): that test is the one step 5 requires
+# of the smoke test (the status is the last line of the body, as in step 5).
+for attempt in 1 2 3; do
+  health_raw=$(curl -s --max-time 10 -w '\n%{http_code}' "$URL/health") || health_raw=""
+  [[ "${health_raw##*$'\n'}" == 200 ]] && break
+  (( attempt < 3 )) && sleep 2
+  true
+done
+cache_rc=0
+cache_meta=$(EXPECT_POOL="$POOL" EXPECT_CONTEXT="$EFF_CONTEXT" EXPECT_PARALLEL="$EFF_PARALLEL" EXPECT_CACHE_GIB="$EFF_CACHE_GIB" \
+  python3 -c '
+import json, os, sys
+raw = sys.stdin.read().rstrip("\n")
+body, _, code = raw.rpartition("\n")
+if not code:
+    body, code = raw, ""
+if code != "200":
+    print("health answered HTTP %s, not 200" % (code or "nothing")); sys.exit(3)
+try:
+    doc = json.loads(body)
+except Exception:
+    print("health is unreadable"); sys.exit(3)
+if not isinstance(doc, dict):
+    print("health is not a JSON object"); sys.exit(3)
+if doc.get("error") is not None:  # the same test step 5 applies: {} or a blank string is an error, not absence
+    print("health reported an error: %s" % str(doc["error"])[:160]); sys.exit(3)
+c = (doc.get("live") or {}).get("cache")
+if not isinstance(c, dict):
+    print("this engine reports none"); sys.exit(4)
+if c.get("consistent") is not True:
+    print("the engine reports inconsistent accounting"); sys.exit(5)
+pool = c.get("pool") or {}
+st = c.get("prompt_state") or {}
+cap, ctx, streams = pool.get("capacity_positions"), c.get("context_limit_positions"), c.get("stream_capacity")
+budget, enabled = st.get("budget_bytes"), st.get("enabled")
+want_pool = int(os.environ["EXPECT_POOL"])
+raw_ctx = os.environ["EXPECT_CONTEXT"].strip()
+raw_par = os.environ["EXPECT_PARALLEL"].strip()
+want_ctx = None if raw_ctx in ("", "0") else int(raw_ctx)
+want_streams = None if raw_par.lower() in ("", "auto") else int(raw_par)
+want_gib = float(os.environ["EXPECT_CACHE_GIB"])
+problems, chosen = [], []
+if cap != want_pool: problems.append("pool %s != %s" % (cap, want_pool))
+if want_ctx is None:
+    chosen.append("context {:,} (the model'"'"'s window)".format(ctx or 0))
+elif ctx != want_ctx:
+    problems.append("context %s != %s" % (ctx, want_ctx))
+if want_streams is None:
+    chosen.append("%s streams (engine-selected)" % streams)
+elif streams != want_streams:
+    problems.append("streams %s != %s" % (streams, want_streams))
+want_bytes = int(want_gib * (1 << 30))  # the engine truncates (@intFromFloat): 0.2 GiB is 214748364 bytes, not the ...365 a round gives
+if want_gib > 0 and enabled is not True: problems.append("the prompt-state store is disabled")
+elif want_gib > 0 and budget != want_bytes: problems.append("snapshot budget %s != %s" % (budget, want_bytes))
+elif want_gib == 0 and enabled is True: problems.append("the prompt-state store is enabled, not 0 GiB")
+summary = "shared pool {:,} positions · per request {:,} · {:d} streams · snapshots {:.0f} MiB (held {:.1f} MiB, {:d} entries)".format(
+    cap or 0, ctx or 0, streams or 0, (budget or 0) / 1048576, (st.get("held_bytes") or 0) / 1048576, st.get("entries") or 0)
+if chosen:
+    summary += " · " + ", ".join(chosen)
+print((summary if not problems else summary + "; MISMATCH: " + " ".join(problems)))
+sys.exit(0 if not problems else 6)
+' <<<"$health_raw" 2>/dev/null) || cache_rc=$?
+case $cache_rc in
+  0) log "Cache telemetry: $cache_meta" ;;
+  4) log "Cache telemetry: unavailable ($cache_meta); showing no pool or snapshot figures" ;;
+  3) die "health check failed after 3 reads: $cache_meta. The engine must answer HTTP 200 with no error object before its cache account is read." ;;
+  *) if [[ "${CACHE_STRICT:-0}" == 1 ]]; then
+       die "cache telemetry check failed: $cache_meta. CACHE_STRICT=1 makes this fatal; the ranks were launched and are still serving (./stop.sh stops them)."
+     else
+       warn "cache telemetry check failed: $cache_meta. This launch's effective configuration is unverified; the ranks serve (CACHE_STRICT=1 makes this fatal)."
+     fi ;;
+esac
+
 # ---------------------------------------------------------------- 5. smoke test
 step 5 "Smoke test: one chat completion through all 4 ranks"
 # a pass needs HTTP 200, no error object and the assistant's reply text (curl -w adds the status as the last line)
@@ -242,6 +394,7 @@ printf '\n%s  ✔ %s is now LIVE! on port %s%s\n\n' "$G" "$SERVED_NAME" "$PORT" 
 cat <<EOF
     API      http://${IP:-<spark-address>}:$PORT/v1   (model: $SERVED_NAME)
     Window   $CONTEXT tokens · $PARALLEL at once · $MODEL_FORMAT · drafts $( [[ "$DRAFTS" == 1 ]] && echo on || echo off) · images $( [[ "$VISION" == 1 ]] && echo on || echo off)
+    Pool     $POOL shared positions · $PROMPT_CACHE_GIB GiB of prompt-state snapshots (separate from the pool)
     Logs     docker logs -f $CONTAINER_NAME$(for i in 1 2 3; do printf '   (rank %s: ssh %s docker logs -f %s)' "$i" "$(worker_host "$i")" "$CONTAINER_NAME"; done)
     Restart  $(launcher "$FABRIC_EXPECT") restart
     Stop     ./stop.sh

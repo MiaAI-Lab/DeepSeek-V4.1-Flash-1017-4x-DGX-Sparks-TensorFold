@@ -8,6 +8,8 @@ WORKER3=user@192.0.2.4         # NCCL rank 3 (spark4)
 # NFS_SERVER3=192.0.2.21       # the head's address a worker mounts the weights from, when the link's is not the one
 # NFS_PATH=/huggingface        # HF_CACHE's path in this Spark's NFS export (an export with fsid=0 at its root)
 # PORT=8888
+# POOL=8388608                # the positions every stream shares (start.sh checks the engine's report against it)
+# PROMPT_CACHE_GIB=0.5        # the prompt-state snapshot budget, separate from POOL (0 disables the store)
 # DERISKED=1                  # use Blackfrost-AI/DeepSeek-V4.1-Flash-1017-DERISKED-FP8
 # NVFP4=1                     # use nvidia/DeepSeek-V4.1-Flash-1017-NVFP4 (~430 GB; see README: NVFP4)
 # export TF_DS_PAIR_SUM=1     # pair-sum gathers (zig/patches/0008, 0010): validate on your own ring first
