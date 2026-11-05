@@ -248,4 +248,4 @@ for i in 1 2 3; do
 done
 
 write_prepared_marker || die "cannot record the prepared state (the previous marker is left as it was): see the error above"
-log "Done: all 4 Sparks are ready. Start the server with ./start.sh (port $PORT)."
+log "Done: all 4 Sparks are ready. Start the server with $(launcher "$FABRIC") (port $PORT)."

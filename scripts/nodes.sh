@@ -381,6 +381,8 @@ if len(ranks) > 3 and all(len(links[r]) == 2 for r in ranks):
 # sends to the neighbours, which relay to the rank across (patch 0099, TF_ROCE_RING=1); and a worker across the ring
 # from the head gets the head's address on its route there (an address on lo the Sparks route between them, say) for
 # its rendezvous and NFS. FABRIC=mesh: every pair cabled.
+# launcher <ring|mesh>: the start script for that fabric (./start.sh stops on a ring, ./start-switchless.sh on a switch)
+launcher() { if [[ "$1" == ring ]]; then echo ./start-switchless.sh; else echo ./start.sh; fi; }
 FABRIC=mesh
 RING_PREFIX=""   # pair_links' "prefix": NCCL_IB_SUBNET_PREFIX_LEN on a ring (its graph files)
 detect_links() {

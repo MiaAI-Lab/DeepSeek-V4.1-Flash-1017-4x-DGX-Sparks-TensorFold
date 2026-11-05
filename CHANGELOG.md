@@ -1,5 +1,23 @@
 # Changelog
 
+- **2026-11-04** -- `0053` (Hector, [hecisaza](https://github.com/hecisaza)): a tool-call block (`<tool_call>`,
+  `<|tool_call>` or `<x:tool_call>`) whose payload opens with a DSML opener but is shorter than that opener and its
+  closer together made the parser cut both from it, a slice past the payload's start. A safety-checked build panics
+  there; the served build has no such checks and reads out of bounds. Such a payload now reads as no DSML block, and
+  the block is handled as any other tool-call block that is not a call: no call; a whole reply with no call limit keeps
+  it as text, a one-call reply drops it, and a stream shows it as the stream filter does. Every payload long enough to
+  hold the opener and the closer parses exactly as before: the guard returns the same slice.
+- **2026-11-04** -- `0052` (Hector, [hecisaza](https://github.com/hecisaza)): a DSML tool call whose string value holds
+  the block's own closer (`</｜DSML｜ calls>`, as in a file about DSML) was cut at that closer: the call was dropped, and
+  a streamed reply showed what followed it as text, with `finish_reason: stop`, the symptom reported in
+  [#14](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/issues/14) (ecohash-co). The
+  parser now also reads a DSML block (either spelling) past a closer that lies inside a parameter value, and keeps that
+  reading only when it returns strictly more calls after `max_calls`; otherwise the reply parses exactly as before. The
+  stream filter hides such a block until its own closer; a reply that ends inside a block falls back to the first
+  closer, as before. With a chat template that writes DSML calls, the live streamer no longer sends `<tool_call>`
+  markup as calls (it could send a quoted one and drop the reply's DSML calls); a streaming client gets the parsed
+  calls, as a non-streaming one does. `tests/repro-issue-14.sh` forces such calls (`guided_regex`, greedy) and checks
+  the streamed and whole replies. `TOP_P` is unchanged.
 - **2026-11-02** -- (SvangenStudios) `tools/claims/` `0042`, `0043` and `0044` no longer report a claim as holding on missing
   evidence: in `0043` a reply without `token_sha` or `completion_tokens` (equal by absence), or with an `error`
   object, is one the script cannot judge (exit 2), and the stream's `tensorfold` object is read from its final event
@@ -14,6 +32,11 @@
   closers, and `0044`'s GET and DELETE bodies, which exits 1 here until
   [PR #37](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/37) lands. Exit 0: the
   claim holds; 1: it does not; 2: the script could not judge.
+- **2026-11-01** -- The messages name the start script that fits the fabric: on a ring, prepare.sh's last line,
+  start.sh's "already running" hint, its re-prepare warning and the LIVE banner's restart line said `./start.sh`,
+  which stops there and asks for `./start-switchless.sh` (`launcher` in `scripts/nodes.sh`). start.sh's step 4 says
+  where the workers' weight files load from: over NFS, or with `RANK_LOCAL=1` from each worker's own disk (all
+  three: "a minute or two"; some: which ranks), instead of always "over NFS ... a few minutes".
 - **2026-11-01** -- README notes from three issues, none of them changing a default: `TF_DS_RDMA_CPUS` and the GB10's
   core layout ([making](https://github.com/making), [#40](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/issues/40));
   what `__vm_enough_memory` in `dmesg` means ([#36](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/issues/36));
