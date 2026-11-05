@@ -325,7 +325,9 @@ BertholomusAI's fork ([bertholomus/TensorFold](https://github.com/bertholomus/Te
   - [PR #26](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/26): the preparation utilities on the runtime image (`scripts/prepare.sh`), with
     `tests/test_prepare_image.py`.
 - Contributed by **Christopher A. Williamson ([cawilliamson](https://github.com/cawilliamson))**: [PR #38](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/38),
-  [`docs/engram-zfs-dataset.md`](docs/engram-zfs-dataset.md), with its measurements.
+  [`docs/engram-zfs-dataset.md`](docs/engram-zfs-dataset.md), with its measurements;
+  [PR #51](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/51): `0054`, the request-body ceiling as
+  `TF_DS_MAX_BODY_MIB` (default unchanged), with `tests/test_body_limit.py`.
 - Written by **Hector Isaza ([hecisaza](https://github.com/hecisaza))** with the verify step of
   [inference-agent-kit](https://github.com/hecisaza/inference-agent-kit): the claim scripts in
   [`tools/claims`](tools/claims), from
