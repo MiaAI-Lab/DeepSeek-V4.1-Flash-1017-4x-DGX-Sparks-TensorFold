@@ -1,0 +1,42 @@
+diff --git a/zig/src/server/http_body.zig b/zig/src/server/http_body.zig
+index ad2951e..c2b4d31 100644
+--- a/zig/src/server/http_body.zig
++++ b/zig/src/server/http_body.zig
+@@ -5,7 +5,16 @@ const errors = @import("errors.zig");
+ const Conn = @import("http_conn.zig").Conn;
+ const Allocator = std.mem.Allocator;
+ 
+-pub const limit = 32 * 1024 * 1024;
++/// The request-body ceiling in bytes: 32 MiB unless TF_DS_MAX_BODY_MIB (whole MiB) raises it, set once
++/// at startup by initLimit. A front proxy that forwards larger bodies -- images dominate a request's
++/// bytes -- needs the matching value here, or it admits what this then refuses.
++pub var limit: usize = 32 * 1024 * 1024;
++
++pub fn initLimit() void {
++    const v = std.c.getenv("TF_DS_MAX_BODY_MIB") orelse return;
++    const mib = std.fmt.parseInt(usize, std.mem.span(v), 10) catch return;
++    if (mib > 0) limit = mib * 1024 * 1024;
++}
+ const metadata_limit = 65536;
+ 
+ /// A body, or the refusal a RequestError carries (the connection then closes).
+diff --git a/zig/src/server/main.zig b/zig/src/server/main.zig
+index da79ffc..ea0ebaa 100644
+--- a/zig/src/server/main.zig
++++ b/zig/src/server/main.zig
+@@ -3,6 +3,7 @@ const std = @import("std");
+ const json = @import("json.zig");
+ const cli = @import("cli.zig");
+ const log = @import("log.zig");
++const http_body = @import("http_body.zig");
+ const hub = @import("hub.zig");
+ const engines = @import("engines.zig");
+ const serve = @import("serve.zig");
+@@ -34,6 +35,7 @@ pub fn main(init: std.process.Init) !u8 {
+     // the checkpoint commands need no model, GPU or driver either
+     if (argv.len >= 2 and checkpoint_cli.wants(@ptrCast(argv[1..]))) return checkpoint_cli.main(init, argv[1..]);
+     log.init(io, false);
++    http_body.initLimit();
+     if (argv.len == 3 and std.mem.eql(u8, argv[1], "capabilities") and std.mem.eql(u8, argv[2], "--json")) {
+         var out: std.Io.Writer.Allocating = .init(a);
+         try cli.capabilities(&out.writer, engines.capabilities(a));
