@@ -1,5 +1,12 @@
 # Changelog
 
+- **2026-11-05** -- `0054` (Christopher A. Williamson, [cawilliamson](https://github.com/cawilliamson)): the
+  request-body ceiling (`zig/src/server/http_body.zig`) was a `pub const` 32 MiB, so a body a front proxy
+  forwards was still refused here with a 413 ("request body exceeds the 32 MiB limit") and no setting could
+  widen it; bodies are where images land, and one 32 MiB body is about a 23 MiB image. It is a flag now,
+  `TF_DS_MAX_BODY_MIB` (whole MiB, read once at startup; `start.sh` forwards it to every rank), and the
+  default is the old 32 MiB, so a deployment that sets nothing serves as before. The refusal, its message and
+  the framing are unchanged; only the number is a setting. `tests/test_body_limit.py` needs no Spark.
 - **2026-11-04** -- `0053` (Hector, [hecisaza](https://github.com/hecisaza)): a tool-call block (`<tool_call>`,
   `<|tool_call>` or `<x:tool_call>`) whose payload opens with a DSML opener but is shorter than that opener and its
   closer together made the parser cut both from it, a slice past the payload's start. A safety-checked build panics
