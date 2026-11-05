@@ -1,9 +1,10 @@
 """The claim scripts in tools/claims (0042, 0043, 0044) against a loopback stand-in for the server.
 
 Offline: the stand-in answers /v1/chat/completions (0042, 0043) or /v1/models and /v1/responses (0044) the way a build
-with the patch does, unless a test makes it answer otherwise (an error object beside good data, a reply without its
-statistics, a warning on an earlier stream event only, a body left in the socket). Each case pins the script's exit:
-0 the claim holds, 1 it does not, 2 the script cannot judge.
+with the patch does in the fields these scripts read, unless a test makes it answer otherwise (an error object beside
+good data, a reply without its statistics, a warning on the wrong stream event, a body left in the socket). It is not
+the server: its hashes cover the content's bytes rather than token ids, and it always sends usage on its own stream
+event. Each case pins the script's exit: 0 the claim holds, 1 it does not, 2 the script cannot judge.
 Run: python3 -m unittest tests.test_claims       SCRIPTS_DIR=<a repository copy> tests the scripts there instead.
 """
 import hashlib
@@ -38,7 +39,7 @@ def closers_only(text):
 
 
 class Server:
-    """A reply as a build with 0042 and 0043 gives it; `mode` names the one way it differs."""
+    """A reply as a build with 0042 and 0043 gives it, in the fields the scripts read; `mode` names the one way it differs."""
 
     def __init__(self):
         self.mode = "valid"
@@ -110,6 +111,12 @@ class Server:
             events.append({"id": rid, "choices": [], "usage": usage})
         if self.mode == "early_warning" and "tool_parse_warning" in tf:
             events[0]["tensorfold"] = events[1].pop("tensorfold")  # the final event carries none
+        if self.mode == "warning_before_final" and "tool_parse_warning" in tf:  # only the warning moves: the hash stays
+            events[0]["tensorfold"] = {"tool_parse_warning": tf["tool_parse_warning"]}
+            events[1]["tensorfold"] = {"token_sha": tf["token_sha"]}
+        if self.mode == "warning_after_final" and "tool_parse_warning" in tf:  # the event after the final one has it
+            events[1]["tensorfold"] = {"token_sha": tf["token_sha"]}
+            events[2]["tensorfold"] = dict(tf)
         failure = {"message": "the engine failed this request", "type": "server_error"}
         if self.mode == "error_envelope" and calls is None:  # (0042's control call stays good)
             whole["error"] = failure
@@ -173,11 +180,22 @@ class ClaimScripts(unittest.TestCase):
     def test_0043_different_statistics_do_not_hold(self):
         self.assertExit("0043-orphan-dsml-closer-diagnostic.sh", "stream_mismatch", 1, "CLAIM: does not hold")
 
-    def test_0043_a_warning_only_before_the_final_event_is_not_a_pass(self):
+    def test_0043_a_final_event_without_a_tensorfold_object_cannot_be_judged(self):
         # the final event (finish_reason) carries no tensorfold object: neither its warning nor its token_sha is there
         out = self.assertExit("0043-orphan-dsml-closer-diagnostic.sh", "early_warning", 2, "CLAIM: error")
         self.assertIn("FAIL V4 stream: final event tool_parse_warning", out)
         self.assertNotIn("FAIL V4 whole", out)
+
+    def test_0043_a_warning_only_before_the_final_event_does_not_hold(self):
+        # the final event keeps its token_sha, so the statistics compare and only the warning's place is at issue
+        out = self.assertExit("0043-orphan-dsml-closer-diagnostic.sh", "warning_before_final", 1, "CLAIM: does not hold")
+        self.assertIn("FAIL V4 stream: final event tool_parse_warning", out)
+        self.assertNotRegex(out, r"FAIL .*same token_sha")
+
+    def test_0043_a_warning_only_after_the_final_event_does_not_hold(self):
+        out = self.assertExit("0043-orphan-dsml-closer-diagnostic.sh", "warning_after_final", 1, "CLAIM: does not hold")
+        self.assertIn("FAIL V4 stream: final event tool_parse_warning", out)
+        self.assertNotRegex(out, r"FAIL .*same token_sha")
 
     def test_0043_no_warning_does_not_hold(self):
         self.assertExit("0043-orphan-dsml-closer-diagnostic.sh", "missing_warning", 1, "CLAIM: does not hold")
@@ -196,8 +214,8 @@ class ClaimScripts(unittest.TestCase):
 
 
 class ResponsesServer:
-    """/v1/models and /v1/responses on kept HTTP/1.1 connections, as a build with 0044 answers them (a GET or DELETE
-    body is read and dropped); `mode` names the one way it differs."""
+    """/v1/models and /v1/responses on kept HTTP/1.1 connections, as a build with 0044 answers them in the fields the
+    script reads (a GET or DELETE body is read and dropped); `mode` names the one way it differs."""
 
     def __init__(self):
         self.mode = "valid"

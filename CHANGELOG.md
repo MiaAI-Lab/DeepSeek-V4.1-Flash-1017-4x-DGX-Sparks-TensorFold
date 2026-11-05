@@ -18,8 +18,9 @@
   markup as calls (it could send a quoted one and drop the reply's DSML calls); a streaming client gets the parsed
   calls, as a non-streaming one does. `tests/repro-issue-14.sh` forces such calls (`guided_regex`, greedy) and checks
   the streamed and whole replies. `TOP_P` is unchanged.
-- **2026-11-02** -- (SvangenStudios) `tools/claims/` `0042`, `0043` and `0044` no longer report a claim as holding on missing
-  evidence: in `0043` a reply without `token_sha` or `completion_tokens` (equal by absence), or with an `error`
+- **2026-11-02** -- `tools/claims/` `0042`, `0043` and `0044` no longer report a claim as holding on missing evidence
+  ([SvangenStudios](https://github.com/SvangenStudios), [#46](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/46)):
+  in `0043` a reply without `token_sha` or `completion_tokens` (equal by absence), or with an `error`
   object, is one the script cannot judge (exit 2), and the stream's `tensorfold` object is read from its final event
   (the one with the finish reason), not from whichever event carried one last; in `0042` a reply or stream event with
   an `error` object fails its case, as an HTTP error does; in `0044` an HTTP 200 that should succeed (the model list,

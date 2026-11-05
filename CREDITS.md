@@ -340,6 +340,10 @@ BertholomusAI's fork ([bertholomus/TensorFold](https://github.com/bertholomus/Te
     ([`10c4c7c`](https://github.com/hecisaza/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/commit/10c4c7c21679f920aa2780d25a0019989ff284af));
     Mia's AI Lab added its connection check, so a server that is down exits 2, not 1.
 
+  [SvangenStudios](https://github.com/SvangenStudios) made all three stricter about missing evidence, and wrote
+  `tests/test_claims.py` ([PR #46](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/46));
+  each script's header says what differs.
+
 ## Tools and platform
 
 - [Zig](https://ziglang.org) 0.17.0 (MIT), the compiler of the engine.
