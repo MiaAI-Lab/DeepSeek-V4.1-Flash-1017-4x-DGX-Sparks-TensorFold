@@ -57,7 +57,7 @@ rank's rendezvous address). Full list: [Credits](#credits) and [`CREDITS.md`](CR
 (knapcio), `0027` (Thomas Kempka), `0028` and `0029` (upstream TensorFold fixes backported by Mauvis Ledford), `0030`
 and `0031` (Mauvis Ledford), `0033` (a backport by Manuel, manuel1618), `0034` (Hironori Uchikawa, uchkw), `0036`
 (upstream TensorFold's structured output by BobClawblaw and Ash Hart, and BertholomusAI's DeepSeek-V4.1 part of it,
-ported here), `0037`'s `mma_fp4` and activation format (Ash Hart's, from TensorFold), `0039`-`0043` (SvangenStudios) and `0046` (shalk3)** -- see
+ported here), `0037`'s `mma_fp4` and activation format (Ash Hart's, from TensorFold), `0039`-`0043` (SvangenStudios), `0046` (shalk3) and `0055` (Michael Cray, Mcray4)** -- see
 [What the patches change](#what-the-patches-change) and [Credits](#credits) for who found or shaped each specific fix
 along the way.
 
@@ -413,7 +413,7 @@ Settings come from the environment, then `scripts/local.sh`, then `./.env`, then
 | `CONTEXT` | 1048576 | a request's positions at most (the model's window) |
 | `POOL` | 2097152 | the positions all requests share |
 | `PARALLEL` | 16 | requests at once |
-| `THINKING` | 1 | think first unless a request sends `enable_thinking: false` |
+| `THINKING` | 1 | think first unless a request sends `enable_thinking: false` (or `"thinking": {"type": "disabled"}`, `0055`) |
 | `REASONING_EFFORT` | max | the effort when a request names none (`low` 50, `high` 75, `max` 100) |
 | `TEMPERATURE` / `TOP_P` / `TOP_K` | 1.0 / 1.0 / 20 | the server's sampling defaults; a request's own win |
 | `DRAFTS` | 1 | DSpark drafting |
@@ -479,6 +479,7 @@ measurements and rationale: [`CHANGELOG.md`](CHANGELOG.md); authorship: [`CREDIT
 | `0046` | shalk3 | `TF_DS_LOAD_PREFETCH` (on) | The weight loader's file is read ahead by 8 threads (32 MiB chunks, at most 4 GiB past the loader), so its reads come from the page cache: a node's load 83 s -> 27 s from NVMe; the weights are unchanged |
 | `0052` | **Hector** | -- (on) | The block's own closer or opener inside a DSML parameter value (a file about DSML) no longer ends or splits the block: the call stays a call and the block's closers stay out of the reply's text, whole or streamed; any other block closes at its first closer, as before. With a template that writes DSML calls, the live streamer sends no `<tool_call>` markup as a call, so streaming clients get the parsed calls ([#14](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/issues/14)) |
 | `0053` | **Hector** | -- (on) | A `<tool_call>` block (or `<\|tool_call>`, `<x:tool_call>`) whose payload holds only the start of a DSML block, shorter than the block's opener and closer together, is handled as any tool-call block that is not a call (no call; a whole reply keeps it as text, a one-call reply drops it): the parser no longer slices past the payload's start. Every payload long enough parses as before |
+| `0055` | Michael Cray | -- (on) | A chat request's own top-level `thinking` (`{"type": "enabled"}` or `{"type": "disabled"}`, DeepSeek's API spelling) is the thinking switch where `chat_template_kwargs` sets none; it beats `reasoning_effort` as the kwargs switch does, and the kwargs' own switches still win. Before, it was ignored and the server default (`THINKING`) applied |
 
 ### Idle RDMA CPU use
 
@@ -583,6 +584,8 @@ part of this repository.
 - **Hector Isaza ([hecisaza](https://github.com/hecisaza))**: patch `0008` (pair-sum gathers, `TF_DS_PAIR_SUM`) and the prefill measurements behind it;
   patches `0052` and `0053` (the DSML tool-call parser fixes);
   the claim scripts in [`tools/claims`](tools/claims), written with the verify step of [inference-agent-kit](https://github.com/hecisaza/inference-agent-kit).
+- **Michael Cray ([Mcray4](https://github.com/Mcray4))**: patch `0055` (a request body's own `thinking` type as the
+  thinking switch).
 - **Manrique ([hashd1ve](https://github.com/hashd1ve))**: the change to `model/chat_template.jinja` that writes each
   piece of the prompt out as it is made instead of adding it to one growing string, which ends rank 0's memory growth
   with long conversations (the two-Spark recipe's

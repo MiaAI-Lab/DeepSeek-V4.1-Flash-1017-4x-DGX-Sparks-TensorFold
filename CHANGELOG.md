@@ -1,5 +1,13 @@
 # Changelog
 
+- **2026-11-06** -- `0055` (Michael Cray, [Mcray4](https://github.com/Mcray4)): a chat request's own top-level
+  `thinking` (`{"type": "enabled"}` or `{"type": "disabled"}`, DeepSeek's API spelling) is the thinking switch where
+  `chat_template_kwargs` sets none. `thinkingFields` already read that shape, but only inside
+  `chat_template_kwargs.thinking`, so a top-level `thinking` was ignored and the server default applied: with `THINKING=1`
+  and `REASONING_EFFORT=max`, a client that turned thinking off this way (pi-ai's `thinkingFormat: "deepseek"`, as
+  DeepSeek's dsh harness sends it) got max-effort thinking. The body's own switch beats `reasoning_effort` exactly as
+  the kwargs switch does, and `chat_template_kwargs`'s `enable_thinking` and `thinking` still win over it. Any other
+  value leaves the server default, as before; the Anthropic route (`/v1/messages`) is unchanged.
 - **2026-11-04** -- `0053` (Hector, [hecisaza](https://github.com/hecisaza)): a tool-call block (`<tool_call>`,
   `<|tool_call>` or `<x:tool_call>`) whose payload opens with a DSML opener but is shorter than that opener and its
   closer together made the parser cut both from it, a slice past the payload's start. A safety-checked build panics
