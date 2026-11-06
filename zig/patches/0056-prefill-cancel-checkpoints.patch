@@ -1,0 +1,61 @@
+--- a/zig/src/core/prompt_cache.zig
++++ b/zig/src/core/prompt_cache.zig
+@@ -46,6 +46,12 @@
+     min_gap: u32 = 256,
+     /// Shorter prompts keep nothing: below it a mark's extra prompt call costs more than a later turn's reuse saves.
+     min_prompt: u32 = 4096,
++    /// A long cold pass keeps a state every this many tokens as it goes (0: only the marks below): a request
++    /// cancelled mid-prefill resumes from its last rung instead of prefilled positions it already paid for.
++    ladder_gap: u32 = 0,
++    /// Rungs stay this far below the prompt's end: a family restores a state only where a fresh pass of the prompt
++    /// reproduces it (its own window bound); a family without one keeps 0 (the marks' own guards still apply).
++    keep_slack: u32 = 0,
+ };
+ 
+ pub const Entry = struct {
+@@ -262,6 +268,11 @@
+             if (stable > 0 and stable < history_len and stable >= history_len / 2) try want.append(a, stable);
+         }
+         try want.appendSlice(a, shared);
++        if (s.rules.ladder_gap > 0) { // rungs a long pass keeps as it goes: its own guards below floor and space them
++            const top: u32 = @intCast(prompt.len -| @max(s.rules.keep_slack, s.rules.lookahead + 1));
++            var at: u32 = from + s.rules.ladder_gap;
++            while (at < top) : (at += s.rules.ladder_gap) try want.append(a, at);
++        }
+         for (want.items, 0..) |w, k| {
+             const at = if (s.rules.planned) floorStart(starts, w) else w;
+             if (at <= from or at + s.rules.lookahead > prompt.len or at >= prompt.len or !s.usable(at, starts)) continue;
+--- a/zig/src/families/dsv41/native.zig
++++ b/zig/src/families/dsv41/native.zig
+@@ -81,6 +81,11 @@
+     save: *const fn (*anyopaque, ?*anyopaque, u32) anyerror!*anyopaque,
+     restore: *const fn (*anyopaque, ?*anyopaque, *anyopaque) anyerror!void,
+     drop: *const fn (*anyopaque, *anyopaque) void,
++    /// The host prompt cache's ladder rules this family wants: a long cold pass keeps a state every
++    /// `ladder_gap` tokens as it goes (0: only the host's own marks), each rung at least `keep_slack`
++    /// below the prompt's end, where this family's restore bound (its window) still reproduces it.
++    ladder_gap: u32 = 0,
++    keep_slack: u32 = 0,
+ };
+ 
+ /// The rank's model and the backend over it (what `open` hands the server, freed by `deinit`).
+@@ -173,7 +178,7 @@
+     st.lanes.vision = st.vision;
+     // the pool is the model's (preallocated): a stream takes no device memory of its own
+     const L = lanes_mod.Lanes;
+-    const snaps: Snaps = .{ .ptr = &st.lanes, .bytes = L.snapBytesFn, .save = L.snapSaveFn, .restore = L.snapRestoreFn, .drop = L.snapDropFn };
++    const snaps: Snaps = .{ .ptr = &st.lanes, .bytes = L.snapBytesFn, .save = L.snapSaveFn, .restore = L.snapRestoreFn, .drop = L.snapDropFn, .ladder_gap = 64 * 1024, .keep_slack = @intCast(st.m.cfg.window + model.chunk_rows) };
+     try st.lanes.idleRdma(); // park even before the first API request
+     return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .vision = if (st.vision) |v| v.hook() else null };
+ }
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -390,7 +390,7 @@
+         const want: u64 = @intFromFloat((o.prompt_cache_gib orelse 0.5) * gib);
+         if (want > 0) {
+             h.snap_vt = .{ .bytes = sn.bytes, .save = sn.save, .restore = sn.restore, .drop = sn.drop };
+-            h.cache = api.prompt_cache.Store.init(gpa, .{ .ptr = sn.ptr, .vtable = &h.snap_vt }, .{}, want);
++            h.cache = api.prompt_cache.Store.init(gpa, .{ .ptr = sn.ptr, .vtable = &h.snap_vt }, .{ .ladder_gap = sn.ladder_gap, .keep_slack = sn.keep_slack }, want);
+         }
+     };
+     // the family cuts its own prompt grid from position 0, as `tensorfold run` does: prefill_step 0
