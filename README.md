@@ -341,10 +341,12 @@ here. The worker across the ring reaches spark1 through a neighbour, and on that
 over a management network can be given its fabric address with `FABRIC_PEER2` / `FABRIC_PEER3`. `MASTER_ADDR` is derived
 from this Spark's own addresses and passes over a Tailscale one (`100.64.0.0/10`) unless it has no other; set it
 yourself if the workers reach spark1 elsewhere.
-`RANK_LOCAL=1` (opt-in) gives each worker its weight file (~77-81 GB) on its own disk as well: `scripts/prepare.sh`
-copies the one a worker reads to `WORKER_RANK_DIR` (under `~/.cache/dsv41-tensorfold`), and `start.sh` mounts that copy
-when its name, size and modification time match spark1's, so a start reads no weights over NFS. A worker without a
-matching copy (short of disk, say) reads over NFS, with a warning. It costs ~80 GB on each worker. Copies are kept for
+`RANK_LOCAL=1` (opt-in) gives each Spark its weight file (~77-81 GB) on its own disk as well, rank 0 included:
+`scripts/prepare.sh` copies the one a rank reads to `WORKER_RANK_DIR` (under `~/.cache/dsv41-tensorfold`), or to
+`HEAD_RANK_DIR` for rank 0 on this Spark, and `start.sh` mounts that copy when its name, size and modification time
+match the NFS folder's, so a start reads no weights over NFS. A Spark without a matching copy (short of disk, say)
+reads over NFS, with a warning. It costs ~80 GB on each Spark. Rank 0's copy is the one that pays most on a cluster
+whose weights live off-spark: it loads last, so its read is the longest of a start. Copies are kept for
 each `DATA_SUB`, so `ABLIT` builds do not share them; a folder you no longer use, or the copies after going back to
 `RANK_LOCAL=0`, are yours to delete. On a four-GB10 ring [shalk3](https://github.com/shalk3) measured the engine's load
 at 315 s before and 96 s after, with one worker mounting over 2.5 GbE

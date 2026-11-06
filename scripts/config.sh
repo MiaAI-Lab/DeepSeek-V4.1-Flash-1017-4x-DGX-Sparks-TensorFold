@@ -190,13 +190,17 @@ NFS_VOLUME="${NFS_VOLUME:-dsv41-hf}"
 # random 4 KiB rows from them, which over NFS took ~10 ms each and most of the round. prepare.sh copies them there once
 # (from the NFS volume); the main weights and the weight files still load over NFS. A path on the worker.
 WORKER_ENGRAM_DIR="${WORKER_ENGRAM_DIR:-\$HOME/.cache/dsv41-tensorfold/engram-${MODEL_REVISION:0:8}}"
-# RANK_LOCAL=1 (opt-in): each worker's own weight file on its own disk too. Read over NFS, a worker's ~77-81 GB file was
-# most of a start (~0.7 GB/s over a CX7 cable, ~0.27 GB/s over a 2.5 GbE LAN). prepare.sh copies the file each worker
-# reads there and removes that folder's other weight files (a worker short of disk keeps NFS, with a warning); start.sh
-# mounts the copy when its name, size and modification time match this Spark's, else that worker reads over NFS as
-# before. RANK_LOCAL=0 leaves every worker on NFS and leaves any copies on disk. A path on the worker.
+# RANK_LOCAL=1 (opt-in): each Spark's own weight file on its own disk too, rank 0 included. Read over NFS, a ~77-81 GB
+# file was most of a start (~0.7 GB/s over a CX7 cable, ~0.27 GB/s over a 2.5 GbE LAN). prepare.sh copies the file each
+# rank reads there and removes that folder's other weight files (a Spark short of disk keeps NFS, with a warning);
+# start.sh mounts the copy when its name, size and modification time match this Spark's, else that rank reads over NFS
+# as before. RANK_LOCAL=0 leaves every rank on NFS and leaves any copies on disk. A path on each Spark.
 RANK_LOCAL="${RANK_LOCAL:-0}"
 WORKER_RANK_DIR="${WORKER_RANK_DIR:-\$HOME/.cache/dsv41-tensorfold/rank-cache-${DATA_SUB//\//-}}"
+# rank 0's copy (this Spark), when RANK_LOCAL=1: rank 0 loads last, so its read is the longest one of a start. Same
+# path by default; head_rank_dir_here expands the one every Spark's own $HOME names.
+HEAD_RANK_DIR="${HEAD_RANK_DIR:-$WORKER_RANK_DIR}"
+head_rank_dir_here() { echo "${HEAD_RANK_DIR//\$HOME/$HOME}"; }
 # rank_file <node>: this Spark's weight file of 2D node <node> (its name carries the index's hash), empty if none
 rank_file() { local f; for f in "$DATA_DIR"/rank-cache/rank"$1"of4-*.bin; do [[ -f "$f" ]] && { echo "$f"; return 0; }; done; return 0; }
 # what identifies a weight file's bytes between two Sparks: its name holds only the index's hash, so a file baked again
@@ -245,7 +249,7 @@ prepared_state() {
     die "cannot hash model/chat_template.jinja (sha256sum)"
   f=("model=$MODEL_ID@$(snapshot_rev)" "image=$(image_ident "$IMAGE")" "kit=$KIT_REF" "order=$ORDER" "engram=$WORKER_ENGRAM_DIR" "ablit=$ABLIT")
   [[ "$ENGRAM_PACKED" != 1 ]] || f+=("packed=$ENGRAM_PACKED_DIR/$(packed_nodes)")
-  [[ "$RANK_LOCAL" != 1 ]] || f+=("rank_local=$WORKER_RANK_DIR")
+  [[ "$RANK_LOCAL" != 1 ]] || f+=("rank_local=$WORKER_RANK_DIR" "rank_local_head=$HEAD_RANK_DIR")
   f+=("hf=$HF_CACHE" "nfs_path=$NFS_PATH" "nfs_volume=$NFS_VOLUME" "template=$tpl")
   for i in 1 2 3; do f+=("w$i=$(worker_host "$i")" "nfs$i=$(wval NFS_SERVER "$i")"); done
   (export LC_ALL=C; printf '%q ' "${f[@]}"; echo)   # (a subshell: the caller's locale is left as it was)
