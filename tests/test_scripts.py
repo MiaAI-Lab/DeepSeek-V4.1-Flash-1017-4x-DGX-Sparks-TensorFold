@@ -442,10 +442,46 @@ node_order() { echo 0,1,2,3; }
         self.assertNotEqual(code, 0, out)
         self.assertIn("RANK_LOCAL is 0 or 1", out)
 
-    def copies(self, *workers):
-        """This Spark's four weight files, and on each worker named a copy of the one it reads (name, size and time)."""
-        code, out = self.bash('echo "@$DATA_DIR|$WORKER_RANK_DIR"')
-        data_dir, rank_dir = out.split("@")[-1].strip().split("|")
+    def test_rank_0_reads_its_weight_file_from_its_disk_when_its_copy_matches(self):
+        for h in ["head", "w1", "w2", "w3"]:
+            self.containers(h, NAME)
+        rank_dir = self.copies()          # rank 0's copy on this Spark's disk; the workers stay on NFS
+        head_dir = Path(str(rank_dir).replace("$HOME", str(self.home)))
+
+        def runs():
+            log = (self.sim / "docker.log").read_text()
+            (self.sim / "docker.log").unlink()
+            return {l.split()[0]: l for l in log.splitlines() if " docker run -d " in l}
+
+        code, out = self.run_script(["start.sh", "restart"], {"PREPARE": "0", "RANK_LOCAL": "1"})
+        self.assertEqual(code, 0, out)
+        r = runs()
+        self.assertIn(":/rank-local:ro", r["head"], out)
+        self.assertIn("TF_DS_RANK_CACHE=/rank-local", r["head"], out)
+        self.assertNotIn("rank 0 reads its weight file over NFS", out)
+        self.assertIn("(rank 0 from its own disk)", out)
+        for h in ("w1", "w2", "w3"):
+            self.assertNotIn("/rank-local", r[h], out)
+        # a copy of the same name and size baked earlier than this Spark's file holds other bytes: NFS, with a warning
+        os.utime(head_dir / "rank0of4-abc.bin", (1000, 1000))
+        code, out = self.run_script(["start.sh", "restart"], {"PREPARE": "0", "RANK_LOCAL": "1"})
+        self.assertEqual(code, 0, out)
+        r = runs()
+        self.assertNotIn("/rank-local", r["head"], out)
+        self.assertNotIn("TF_DS_RANK_CACHE=/rank-local", r["head"], out)
+        self.assertIn("rank 0 reads its weight file over NFS: no matching copy", out)
+        self.assertIn("(PREPARE=1 ./start.sh restart makes one)", out)
+        # off: no copy mounted, no warning
+        code, out = self.run_script(["start.sh", "restart"], {"PREPARE": "0", "RANK_LOCAL": "0"})
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("/rank-local", "".join(runs().values()), out)
+        self.assertNotIn("reads its weight file over NFS", out)
+
+    def copies(self, *workers, head=True):
+        """This Spark's four weight files, on each worker named a copy of the one it reads, and on this Spark's own disk
+        rank 0's copy (head=False leaves it on NFS)."""
+        code, out = self.bash('echo "@$DATA_DIR|$WORKER_RANK_DIR|$HEAD_RANK_DIR"')
+        data_dir, rank_dir, head_dir = out.split("@")[-1].strip().split("|")
         cache = Path(data_dir) / "rank-cache"
         cache.mkdir(parents=True, exist_ok=True)
         for n in range(4):
@@ -456,6 +492,12 @@ node_order() { echo 0,1,2,3; }
             d.mkdir(parents=True, exist_ok=True)
             (d / name).write_bytes((cache / name).read_bytes())
             os.utime(d / name, (1000, (cache / name).stat().st_mtime))
+        if head:   # rank 0 reads node 0's file
+            name = "rank0of4-abc.bin"
+            d = Path(head_dir.replace("$HOME", str(self.home)))
+            d.mkdir(parents=True, exist_ok=True)
+            (d / name).write_bytes((cache / name).read_bytes())
+            os.utime(d / name, (1000, (cache / name).stat().st_mtime))
         return Path(rank_dir)
 
     def test_step_4_says_where_the_weights_load_from(self):
@@ -463,8 +505,8 @@ node_order() { echo 0,1,2,3; }
             self.containers(h, NAME)
         rank_dir = self.copies("w1", "w2", "w3")
         cases = [({}, "Loading: ~75 GiB of weights on each Spark from its own disk, then the caches (a minute or two)"),
-                 ({"gone": "w2"}, "Loading: ~75 GiB of weights on each Spark over NFS (ranks 1,3 from their own disks)"),
-                 ({"gone": "w1"}, "Loading: ~75 GiB of weights on each Spark over NFS (rank 3 from its own disk)"),
+                 ({"gone": "w2"}, "Loading: ~75 GiB of weights on each Spark over NFS (ranks 1,3,0 from their own disks)"),
+                 ({"gone": "w1"}, "Loading: ~75 GiB of weights on each Spark over NFS (ranks 3,0 from their own disks)"),
                  ({"off": True}, "Loading: ~75 GiB of weights on each Spark over NFS, then the caches (a few minutes)")]
         for change, want in cases:
             if "gone" in change:
@@ -820,14 +862,15 @@ script=${!#}; script=${script//\/hf/$HF_CACHE}; script=${script//\/out/$out}
 exec """ + BASH + r""" -c "$script"
 """)
         self.env["HF_CACHE"] = str(self.tmp / "hf")
-        code, out = self.bash('echo "@$DATA_DIR|$WORKER_RANK_DIR"')
+        code, out = self.bash('echo "@$DATA_DIR|$WORKER_RANK_DIR|$HEAD_RANK_DIR"')
         self.assertEqual(code, 0, out)
-        data_dir, rank_dir = out.split("@")[-1].strip().split("|")
+        data_dir, rank_dir, head_dir = out.split("@")[-1].strip().split("|")
         self.cache = Path(data_dir) / "rank-cache"
         self.cache.mkdir(parents=True)
         for n in range(4):
             (self.cache / f"rank{n}of4-new.bin").write_bytes(b"n" * (10 + n))
         self.home_dir = {h: Path(rank_dir.replace("$HOME", str(self.sim / "home" / h))) for h in ("w1", "w2", "w3")}
+        self.head_dir = Path(head_dir.replace("$HOME", str(self.home)))
 
     def run_step(self):
         return self.bash("die() { echo \"DIED: $*\" >&2; exit 1; }\nnode_order() { echo 0,1,2,3; }\n" + self.step,
@@ -867,6 +910,23 @@ exec """ + BASH + r""" -c "$script"
         code, out = self.run_step()
         self.assertEqual(code, 0, out)
         self.assertEqual(stale.read_bytes(), b"n" * 11)
+
+    def test_rank_0s_own_copy_on_this_spark(self):
+        d = self.head_dir
+        d.mkdir(parents=True)
+        (d / "rank1of4-old.bin").write_bytes(b"o" * 11)    # another node's file: removed
+        (d / "rank0of4-old.bin").write_bytes(b"o" * 99)    # an older copy of node 0's: replaced
+        (d / "keep.txt").write_text("not a weight file")
+        code, out = self.run_step()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(sorted(f.name for f in d.iterdir()), ["keep.txt", "rank0of4-new.bin"])
+        copy = d / "rank0of4-new.bin"
+        self.assertEqual(copy.read_bytes(), (self.cache / copy.name).read_bytes())
+        self.assertEqual(int(copy.stat().st_mtime), int((self.cache / copy.name).stat().st_mtime))
+        code, out = self.run_step()   # up to date: not copied again
+        self.assertEqual(code, 0, out)
+        self.assertIn("Rank 0 (this Spark): its weight file on its disk", out)
+        self.assertNotIn("copying its weight file", out)
 
 
 class PrepareWeightFiles(ScriptTest):

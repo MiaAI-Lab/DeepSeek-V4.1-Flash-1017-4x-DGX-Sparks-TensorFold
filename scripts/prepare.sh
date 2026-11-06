@@ -223,10 +223,30 @@ for i in 1 2 3; do
     die "copying Engram's tables to $(worker_host "$i") failed"
 done
 
-# ---------------------------------------------------------------- 8. each worker's weight file on its disk
+# ---------------------------------------------------------------- 8. each Spark's weight file on its disk
 # RANK_LOCAL=1: start.sh mounts the copy when it matches this Spark's file. A second weight file of a node in the folder
-# stops that rank (rank_cache.find: SeveralRankCaches), so the folder holds only the file the worker reads.
+# stops that rank (rank_cache.find: SeveralRankCaches), so the folder holds only the file the rank reads.
 IFS=, read -r -a ord <<<"$(node_order)"
+# rank 0 (this Spark): a plain copy, the file is already here; it loads last, so its read is the longest of a start.
+if [[ "$RANK_LOCAL" == 1 ]]; then
+  rf=$(rank_file "${ord[0]}"); [[ -n "$rf" ]] || die "no weight file of node ${ord[0]} in $DATA_DIR/rank-cache"
+  name=${rf##*/}; size=$(stat -c %s "$rf"); stamp=$(rank_stamp "$rf")
+  hdir=$(head_rank_dir_here); mkdir -p "$hdir"
+  find "$hdir" -maxdepth 1 -type f -name 'rank?of4-*' ! -name "$name" -delete
+  if [[ "$(stat -c '%s %Y' "$hdir/$name" 2>/dev/null || echo none)" == "$stamp" ]]; then
+    log "Rank 0 (this Spark): its weight file on its disk"
+  else
+    rm -f "$hdir/$name"
+    free=$(df -B1 --output=avail "$hdir" | tail -1)
+    if (( ${free:-0} > size + 10 * 1024 ** 3 )); then
+      log "Rank 0 (this Spark): copying its weight file to its disk ($(( size / 1024 ** 3 )) GiB, once)"
+      cp --preserve=timestamps -- "$rf" "$hdir/$name.part" && mv -f -- "$hdir/$name.part" "$hdir/$name" ||
+        die "copying rank 0's weight file to $hdir failed"
+    else
+      warn "this Spark has $(( ${free:-0} / 1024 ** 3 )) GiB free in HEAD_RANK_DIR, its weight file $(( size / 1024 ** 3 )) GiB and 10 to spare: rank 0 keeps reading it over NFS"
+    fi
+  fi
+fi
 for i in 1 2 3; do
   [[ "$RANK_LOCAL" == 1 ]] || break
   rf=$(rank_file "${ord[i]}"); [[ -n "$rf" ]] || die "no weight file of node ${ord[i]} in $DATA_DIR/rank-cache"

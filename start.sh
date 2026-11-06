@@ -167,7 +167,17 @@ done
 # rank 0 listens for each worker at the address that worker was given (its link's address of this node; a ring has
 # no one address every cable reaches)
 LISTEN="${LINK_HEAD_ADDR[1]:-$MASTER_ADDR},${LINK_HEAD_ADDR[2]:-$MASTER_ADDR},${LINK_HEAD_ADDR[3]:-$MASTER_ADDR}"
-ENV0=(TF_TP_WORLD=4 "TF_TP_MASTER=$MASTER_ADDR" "TF_TP_LISTEN=$LISTEN" "TF_TP_PORT=$MASTER_PORT" "TF_DS_RANK_CACHE=$DATA/rank-cache" "TF_DS_KIT=$KIT"
+# rank 0's weight file from its own disk when the copy (prepare.sh) matches this Spark's, else over NFS
+rank0_dir="$DATA/rank-cache"; rank0_mount=()
+if [[ "$RANK_LOCAL" == 1 ]]; then
+  rf0=$(rank_file "${ORD[0]}")
+  if [[ -n "$rf0" && "$(stat -c '%s %Y' "$(head_rank_dir_here)/${rf0##*/}" 2>/dev/null || echo none)" == "$(rank_stamp "$rf0")" ]]; then
+    rank0_dir=/rank-local; rank0_mount=(-v "$(head_rank_dir_here):/rank-local:ro")
+  else
+    warn "rank 0 reads its weight file over NFS: no matching copy in $HEAD_RANK_DIR (PREPARE=1 $(launcher "$FABRIC_EXPECT") restart makes one)"
+  fi
+fi
+ENV0=(TF_TP_WORLD=4 "TF_TP_MASTER=$MASTER_ADDR" "TF_TP_LISTEN=$LISTEN" "TF_TP_PORT=$MASTER_PORT" "TF_DS_RANK_CACHE=$rank0_dir" "TF_DS_KIT=$KIT"
       "TENSORFOLD_CUDA_KERNELS=$KIT/aot" "TF_DS_ENGRAM=$MODEL_ARG" "TF_DS_TOKEN_MAP=$DATA/dsv41_token_map.json")
 SERVE=(tensorfold-native serve "$(served_in_container)" --backend cuda --host "$HOST" --port "$PORT" --name "$SERVED_NAME"
        --context "$CONTEXT" --parallel "$PARALLEL" --max-tokens "$MAX_TOKENS" --temperature "$TEMPERATURE" --top-p "$TOP_P" --top-k "$TOP_K")
@@ -177,6 +187,7 @@ if [[ "$THINKING" == 1 ]]; then SERVE+=(--thinking); else SERVE+=(--no-thinking)
 [[ "$DRAFTS" == 1 ]] || SERVE+=(--no-drafts)
 SERVE+=("$@")
 here=(docker run -d --name "$CONTAINER_NAME" $RUN_ARGS -v "$HF_CACHE:/hf:ro")
+(( ${#rank0_mount[@]} == 0 )) || here+=("${rank0_mount[@]}")
 [[ "$ENGRAM_PACKED" != 1 ]] || here+=(-v "$(packed_dir_here):/engram-packed:ro")
 [[ "$RDMA" == 0 ]] || ENV0+=("TF_RDMA_DEVICES=${NODE_HCAS[0]}")
 for x in "${ENV0[@]}" "${ENGINE_ENV[@]}"; do here+=(-e "$x"); done
@@ -187,11 +198,12 @@ log "Rank 0 here: ${SERVE[*]}"
 "${here[@]}" >/dev/null
 
 # ---------------------------------------------------------------- 4. load
-# where the workers read their weight file (most of the ~75 GiB): over NFS, unless RANK_LOCAL=1 mounted their own copy
+# where each rank reads its weight file (most of the ~75 GiB): over NFS, unless RANK_LOCAL=1 mounted its own copy
 local_n=${#LOCAL_RANKS[@]}; local_list=$(IFS=,; echo "${LOCAL_RANKS[*]}")
-if (( local_n == 3 )); then step 4 "Loading: ~75 GiB of weights on each Spark from its own disk, then the caches (a minute or two)"
+if [[ "$rank0_dir" == /rank-local ]]; then local_n=$(( local_n + 1 )); local_list="${local_list:+$local_list,}0"; fi
+if (( local_n == 4 )); then step 4 "Loading: ~75 GiB of weights on each Spark from its own disk, then the caches (a minute or two)"
 elif (( local_n == 1 )); then step 4 "Loading: ~75 GiB of weights on each Spark over NFS (rank $local_list from its own disk), then the caches (a few minutes)"
-elif (( local_n == 2 )); then step 4 "Loading: ~75 GiB of weights on each Spark over NFS (ranks $local_list from their own disks), then the caches (a few minutes)"
+elif (( local_n > 1 )); then step 4 "Loading: ~75 GiB of weights on each Spark over NFS (ranks $local_list from their own disks), then the caches (a few minutes)"
 else step 4 "Loading: ~75 GiB of weights on each Spark over NFS, then the caches (a few minutes)"; fi
 # Neither log follower may retain the parent launcher lock after it exits.
 docker logs -f "$CONTAINER_NAME" 8>&- 2>&1 | sed -u "s/^/  ${D}│${R} /" 8>&- &

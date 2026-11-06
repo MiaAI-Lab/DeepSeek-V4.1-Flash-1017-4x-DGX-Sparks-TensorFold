@@ -1,5 +1,13 @@
 # Changelog
 
+- **2026-11-06** -- `RANK_LOCAL=1` covers rank 0: `scripts/prepare.sh` copies rank 0's own weight file to
+  `HEAD_RANK_DIR` on this Spark (a plain `cp --preserve=timestamps`, the file is already at the path the container
+  sees; the folder is cleared of any other node's file, as for a worker), and `start.sh` mounts it at `/rank-local` and
+  sets `TF_DS_RANK_CACHE` to it when its name, size and modification time match, else rank 0 reads over NFS with a
+  warning naming `PREPARE=1`. Rank 0 loads last, so on a cluster whose weights live on a filer rather than on spark1
+  this is the longest read of a start; the marker gains `rank_local_head`, and step 4's line counts rank 0.
+  `HEAD_RANK_DIR` defaults to `WORKER_RANK_DIR`. Tests: `tests/test_scripts.py` (a matching copy, an older one, none,
+  `RANK_LOCAL=0`, the step-4 line, and step 8's copy, replacement and clearing).
 - **2026-11-04** -- `0053` (Hector, [hecisaza](https://github.com/hecisaza)): a tool-call block (`<tool_call>`,
   `<|tool_call>` or `<x:tool_call>`) whose payload opens with a DSML opener but is shorter than that opener and its
   closer together made the parser cut both from it, a slice past the payload's start. A safety-checked build panics
