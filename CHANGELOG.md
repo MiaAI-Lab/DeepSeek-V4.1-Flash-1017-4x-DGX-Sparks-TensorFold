@@ -10,9 +10,10 @@
   `RANK_LOCAL=0`, the step-4 line, and step 8's copy, replacement and clearing).
   Measured on the four-Spark switched-fabric cluster this was written on, whose weights live on a filer rather than on
   spark1: a full-ring restart with all four copies in place reported `Server answered after 36s` (rank 0's engine:
-  `loaded in 34.0s`), against `Server answered after 838s` for the same command the day before with every rank on NFS.
-  That cluster's worker copies ran at ~0.29 GB/s, so the one-time copy costs about the same as one NFS read it replaces;
-  the 838 s includes the image's read-ahead patch (`0046`), which only helps a local read.
+  `loaded in 34.0s`), against `Server answered after 838s` — 14 min from launch, no stop in that run — for the same
+  command the day before with every rank on NFS. That cluster's copies ran at ~0.29 GB/s, so the one-time copy costs
+  about the same as one NFS read it replaces. The copies are not the whole difference: the 36 s start also carried that
+  image's read-ahead patch (`0046`, which only helps a local read) and `0035`'s early rendezvous.
 - **2026-11-04** -- `0053` (Hector, [hecisaza](https://github.com/hecisaza)): a tool-call block (`<tool_call>`,
   `<|tool_call>` or `<x:tool_call>`) whose payload opens with a DSML opener but is shorter than that opener and its
   closer together made the parser cut both from it, a slice past the payload's start. A safety-checked build panics
