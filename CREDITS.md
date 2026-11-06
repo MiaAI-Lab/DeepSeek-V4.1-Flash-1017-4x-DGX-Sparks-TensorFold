@@ -60,7 +60,7 @@ Thomas Kempka's, `0028` and `0029`, upstream TensorFold fixes backported by Mauv
 Mauvis Ledford's, `0033`, a backport by Manuel (manuel1618), `0034`, which is Hironori Uchikawa's (uchkw,
 Codex-assisted), `0036`, a port of upstream TensorFold's structured output (BobClawblaw, Ash Hart) and of
 BertholomusAI's DeepSeek-V4.1 part of it (bertholomus), `0037`, whose `mma_fp4` and activation format are Ash Hart's from
-TensorFold, `0039`-`0043`, which are SvangenStudios's, `0046`, which is shalk3's, and `0052` and `0053`, which are Hector's.** At a glance:
+TensorFold, `0039`-`0043`, which are SvangenStudios's, `0046`, which is shalk3's, `0052` and `0053`, which are Hector's, and `0055`, which is Michael Cray's (Mcray4, Claude-assisted).** At a glance:
 
 | Patches | Author | What |
 | --- | --- | --- |
@@ -87,6 +87,7 @@ TensorFold, `0039`-`0043`, which are SvangenStudios's, `0046`, which is shalk3's
 | `0046` | [shalk3](https://github.com/shalk3) | a rank's weight file read ahead of the loader (`TF_DS_LOAD_PREFETCH`) |
 | `0052` | **Hector** ([hecisaza](https://github.com/hecisaza)) | the block's own tags inside a DSML parameter value no longer end the block: the call stays and no closer reaches the text |
 | `0053` | **Hector** ([hecisaza](https://github.com/hecisaza)) | a tool-call block whose payload is too short to hold the DSML block it opens with is handled as a block that is not a call; the parser no longer slices past the payload's start |
+| `0055` | Michael Cray ([Mcray4](https://github.com/Mcray4)) | a chat request's own top-level `thinking` `{"type": "enabled" \| "disabled"}` is the thinking switch where `chat_template_kwargs` sets none |
 
 The per-patch notes below also credit everyone who helped find or shape a specific fix along the way -- Hector's
 reviewer, Codex and Grok's live-bug diagnosis and design reviews, an outside reviewer's observation -- without

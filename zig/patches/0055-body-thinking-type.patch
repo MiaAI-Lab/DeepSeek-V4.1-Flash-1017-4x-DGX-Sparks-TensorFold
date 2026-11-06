@@ -1,0 +1,75 @@
+Subject: a request body's own thinking {type} is the thinking switch where chat_template_kwargs sets none
+
+diff --git a/zig/src/server/fields.zig b/zig/src/server/fields.zig
+index 7d7e8fd..ce55849 100644
+--- a/zig/src/server/fields.zig
++++ b/zig/src/server/fields.zig
+@@ -182,7 +182,7 @@ fn digitsInto(s: []const u8, out: *std.ArrayList(u8)) bool {
+     return true;
+ }
+ 
+-/// ``chat_template_kwargs.thinking`` as a switch: a bool, or DeepSeek's ``{"type": "enabled" | "disabled"}``.
++/// ``chat_template_kwargs.thinking`` (or a body's own ``thinking``) as a switch: a bool, or DeepSeek's ``{"type": "enabled" | "disabled"}``.
+ fn thinkingSwitch(v: ?Value) ?bool {
+     const value = v orelse return null;
+     if (value == .bool) return value.bool;
+@@ -206,6 +206,9 @@ pub fn thinkingFields(cx: *Cx, body: Value, levels: []const []const u8) errors.R
+     if (kw_object and !has_enable) if (thinkingSwitch(if (kwargs) |k| k.get("thinking") else null)) |sw| {
+         enable = .{ .bool = sw };
+     };
++    // A body's own ``thinking`` (DeepSeek's API: ``{"type": "enabled" | "disabled"}``) where
++    // ``chat_template_kwargs`` sets no switch: OpenAI-compatible clients send it there, not in the kwargs.
++    const top: ?bool = if (kw_object and enable != null) null else thinkingSwitch(body.field("thinking"));
+     var effort = body.field("reasoning_effort");
+     if (effort == null and kw_object) if (kwargs) |k| {
+         effort = k.field("reasoning_effort");
+@@ -219,6 +222,10 @@ pub fn thinkingFields(cx: *Cx, body: Value, levels: []const []const u8) errors.R
+         out.enable = on.truthy();
+         if (out.enable.? and out.effort != null and std.mem.eql(u8, out.effort.?, "none")) out.effort = null;
+     };
++    if (top) |on| {
++        out.enable = on;
++        if (on and out.effort != null and std.mem.eql(u8, out.effort.?, "none")) out.effort = null;
++    }
+     return out;
+ }
+ 
+@@ -313,3 +320,38 @@ test "efforts and numbers" {
+     try std.testing.expectEqualStrings("-12", (try pyIntText(arena.allocator(), " -0_12 ")).?);
+     try std.testing.expect(try pyIntText(arena.allocator(), "8.0") == null);
+ }
++
++fn thinkingOf(cx: *Cx, body: []const u8) !Thinking {
++    return thinkingFields(cx, (try json.parse(cx.a, body)).ok, &.{});
++}
++
++test "a body's own thinking type is the switch where chat_template_kwargs sets none" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    var cx: Cx = .{ .a = arena.allocator() };
++    // DeepSeek's API spelling, as dsh / pi-ai send it
++    var t = try thinkingOf(&cx, "{\"thinking\": {\"type\": \"disabled\"}}");
++    try std.testing.expectEqual(@as(?bool, false), t.enable);
++    try std.testing.expect(t.effort == null);
++    t = try thinkingOf(&cx, "{\"thinking\": {\"type\": \"enabled\"}}");
++    try std.testing.expectEqual(@as(?bool, true), t.enable);
++    // enabled clears an effort of none, as the kwargs switch does
++    t = try thinkingOf(&cx, "{\"thinking\": {\"type\": \"enabled\"}, \"reasoning_effort\": \"none\"}");
++    try std.testing.expectEqual(@as(?bool, true), t.enable);
++    try std.testing.expect(t.effort == null);
++    // the switch wins over an effort, as the kwargs switch does
++    t = try thinkingOf(&cx, "{\"thinking\": {\"type\": \"disabled\"}, \"reasoning_effort\": \"high\"}");
++    try std.testing.expectEqual(@as(?bool, false), t.enable);
++    // chat_template_kwargs' own switches win over the body's
++    t = try thinkingOf(&cx, "{\"thinking\": {\"type\": \"disabled\"}, \"chat_template_kwargs\": {\"enable_thinking\": true}}");
++    try std.testing.expectEqual(@as(?bool, true), t.enable);
++    t = try thinkingOf(&cx, "{\"thinking\": {\"type\": \"enabled\"}, \"chat_template_kwargs\": {\"thinking\": {\"type\": \"disabled\"}}}");
++    try std.testing.expectEqual(@as(?bool, false), t.enable);
++    // anything else leaves the server's default, as before
++    t = try thinkingOf(&cx, "{\"thinking\": {\"type\": \"adaptive\"}}");
++    try std.testing.expect(t.enable == null);
++    t = try thinkingOf(&cx, "{}");
++    try std.testing.expect(t.enable == null);
++    t = try thinkingOf(&cx, "{\"reasoning_effort\": \"high\"}");
++    try std.testing.expectEqual(@as(?bool, true), t.enable);
++}
