@@ -1,5 +1,21 @@
 # Changelog
 
+- **2026-11-06** -- `0055` (Christopher A. Williamson, [cawilliamson](https://github.com/cawilliamson)): the
+  round's Engram reads can go through io_uring. `ENGRAM_AIO=1` is Linux AIO on the tables' O_DIRECT descriptors,
+  which only queues where the file system implements an asynchronous completion path; OpenZFS does not (no
+  `aio_read`/`aio_write` since the Linux 4.1 `read_iter` conversion), so `io_submit` completes each read in the
+  submitting thread and a batch runs at queue depth 1 -- measured on a ZFS dataset, 2048 random rows: 2.4-3.9 s
+  against 14 ms for the reader pool. io_uring hands a request the file system cannot run in the caller context
+  to the kernel's io-wq workers, so the same batch overlaps. It picks itself: `TF_DS_ENGRAM_URING` unset (the default)
+  means the first batch probes the file system -- two reads whose completions are already there when `io_submit`
+  returns mean it never queued, which is OpenZFS -- and moves the ring to io_uring, logging it; `=1` and `=0` force a
+  backend. The batch bookkeeping (bounce ring, slots, per-row copy-out) is shared with the AIO path, and only how a
+  batch reaches the kernel differs. Every request carries `IOSQE_ASYNC`: io_uring otherwise tries a read inline first and only punts
+  on `-EAGAIN`, so a file system that ignores `IOCB_NOWAIT` -- the very behaviour that makes its `io_submit`
+  synchronous -- would complete it in the submitting thread and leave the batch at depth 1, with correct results. The default is unchanged, and a kernel that refuses io_uring (`io_uring_setup` refused by
+  seccomp or an old kernel) falls back to libaio with a warning instead of failing. The new
+  `zig/src/core/uring_read.zig` is standard-library only and carries its own test; `engram_aio.zig` gains a
+  backend-forcing `initBackend`, so both backends are unit-tested row-for-row against the reader pool.
 - **2026-11-04** -- `0053` (Hector, [hecisaza](https://github.com/hecisaza)): a tool-call block (`<tool_call>`,
   `<|tool_call>` or `<x:tool_call>`) whose payload opens with a DSML opener but is shorter than that opener and its
   closer together made the parser cut both from it, a slice past the payload's start. A safety-checked build panics

@@ -1,0 +1,616 @@
+diff --git a/zig/src/core/root.zig b/zig/src/core/root.zig
+index 972fcc78..e18a4387 100644
+--- a/zig/src/core/root.zig
++++ b/zig/src/core/root.zig
+@@ -3,6 +3,7 @@
+ pub const safetensors = @import("safetensors.zig");
+ pub const checkpoint = @import("checkpoint.zig");
+ pub const direct_io = @import("direct_io.zig");
++pub const uring_read = @import("uring_read.zig");
+ pub const Checkpoint = checkpoint.Checkpoint;
+ pub const draft_depth = @import("draft_depth.zig");
+ pub const CopyIndex = @import("copy_index.zig").CopyIndex;
+@@ -13,6 +14,7 @@ test {
+     _ = safetensors;
+     _ = checkpoint;
+     _ = direct_io;
++    _ = uring_read;
+     _ = draft_depth;
+     _ = @import("copy_index.zig");
+     _ = ids_json;
+diff --git a/zig/src/core/uring_read.zig b/zig/src/core/uring_read.zig
+new file mode 100644
+index 00000000..d74f00c3
+--- /dev/null
++++ b/zig/src/core/uring_read.zig
+@@ -0,0 +1,144 @@
++//! Batches of positional reads through io_uring, as a drop-in for the kernel-AIO ring engram_aio.zig uses.
++//!
++//! Why it exists: libaio (`io_submit`) only queues if the file system implements async completion, and OpenZFS does
++//! not -- since Linux 4.1's read_iter conversion a file system without its own queued path completes the read inside
++//! the submitting thread, so a batch of rows one io_submit deep runs at queue depth 1 (measured: 2.4-3.9 s for 2048
++//! rows on rpool/dsv41-engram against 14 ms for the thread pool). io_uring is different: a request it cannot run in
++//! the caller's context is handed to the kernel's io-wq workers, so the same batch overlaps whatever the file system
++//! does -- forced with IOSQE_ASYNC, since a file system may ignore IOCB_NOWAIT instead of declining with -EAGAIN
++//! (see submit). Same syscalls on every architecture, no liburing.
++const std = @import("std");
++const linux = std.os.linux;
++
++/// One read: `buf` receives `buf.len` bytes at `off` of `fd`; `tag` comes back with its completion.
++pub const Op = struct { fd: linux.fd_t, buf: []u8, off: u64, tag: u64 };
++
++/// One completion: the op's tag and the result (bytes read, or a negative errno).
++pub const Cqe = struct { tag: u64, res: i32 };
++
++pub const Ring = struct {
++    ring: linux.IoUring,
++
++    /// `entries` must be a power of two (1 .. 32768). error.UringUnavailable when the kernel, the container's seccomp
++    /// policy or a resource limit refuses it -- the caller then keeps its previous path.
++    pub fn init(entries: u16) !Ring {
++        if (entries == 0) return error.EntriesZero;
++        const ring = linux.IoUring.init(entries, 0) catch |e| switch (e) {
++            error.SystemOutdated, error.PermissionDenied, error.ArgumentsInvalid => return error.UringUnavailable,
++            else => return e,
++        };
++        return .{ .ring = ring };
++    }
++
++    pub fn deinit(r: *Ring) void {
++        r.ring.deinit();
++    }
++
++    /// Queue `ops` and submit them. Returns how many were queued (a short count means the submission queue filled or
++    /// the kernel refused: the caller counts the rest as failed, as its AIO path does).
++    ///
++    /// Every request carries IOSQE_ASYNC, so it goes to an io-wq worker instead of being tried inline first. That flag
++    /// is the whole point here: io_uring only punts a read the file system declines with -EAGAIN, and a file system
++    /// that ignores IOCB_NOWAIT (which is what makes its io_submit path synchronous in the first place) would complete
++    /// the read in the submitting thread and leave a batch at queue depth 1 again -- with correct results, so no test
++    /// would notice. Forcing the worker hop is one context switch a read and buys the concurrency unconditionally.
++    pub fn submit(r: *Ring, ops: []const Op) usize {
++        var queued: usize = 0;
++        while (queued < ops.len) {
++            const op = ops[queued];
++            const sqe = r.ring.read(op.tag, op.fd, .{ .buffer = op.buf }, op.off) catch break;
++            sqe.flags |= linux.IOSQE_ASYNC;
++            queued += 1;
++        }
++        // hand over everything queued so far; sq_ready drops as submit drains it
++        while (r.ring.sq_ready() > 0) {
++            _ = r.ring.submit() catch break;
++        }
++        return queued;
++    }
++
++    /// Completions that are already there (never blocks). Returns the count written into `out`.
++    pub fn reap(r: *Ring, out: []Cqe) usize {
++        var cqes: [64]linux.io_uring_cqe = undefined;
++        var n: usize = 0;
++        while (n < out.len) {
++            const got = r.ring.copy_cqes(&cqes, 0) catch return n;
++            if (got == 0) return n;
++            for (cqes[0..got]) |c| {
++                if (n == out.len) return n; // caller reaps again on its next turn
++                out[n] = .{ .tag = c.user_data, .res = c.res };
++                n += 1;
++            }
++        }
++        return n;
++    }
++};
++
++test "io_uring reads a batch of spans, completions tagged and byte-exact" {
++    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
++    const a = std.testing.allocator;
++    const io = std.testing.io;
++
++    var r = Ring.init(16) catch |e| switch (e) {
++        error.UringUnavailable => return error.SkipZigTest,
++        else => return e,
++    };
++    defer r.deinit();
++
++    var tmp = std.testing.tmpDir(.{});
++    defer tmp.cleanup();
++    var data: [8192]u8 = undefined;
++    for (&data, 0..) |*b, i| b.* = @intCast((i * 31 + 7) % 251);
++    try tmp.dir.writeFile(io, .{ .sub_path = "rows.bin", .data = &data });
++    const file = try tmp.dir.openFile(io, "rows.bin", .{});
++    defer file.close(io);
++    const fd: linux.fd_t = file.handle;
++
++    // three spans of different lengths, deliberately out of order
++    var b0: [64]u8 = undefined;
++    var b1: [256]u8 = undefined;
++    var b2: [9]u8 = undefined;
++    const ops = [_]Op{
++        .{ .fd = fd, .buf = &b0, .off = 4096, .tag = 0xA },
++        .{ .fd = fd, .buf = &b1, .off = 0, .tag = 0xB },
++        .{ .fd = fd, .buf = &b2, .off = 8000, .tag = 0xC },
++    };
++    const queued = r.submit(&ops);
++    try std.testing.expectEqual(@as(usize, 3), queued);
++    // every queued request must carry IOSQE_ASYNC or the batch can run inline on a file system that ignores
++    // IOCB_NOWAIT, which is the whole case this module exists for
++    comptime {
++        const src = @embedFile("uring_read.zig");
++        if (std.mem.indexOf(u8, src, "sqe.flags |= linux.IOSQE_ASYNC;") == null)
++            @compileError("submit must set IOSQE_ASYNC");
++    }
++
++    var got: [8]Cqe = undefined;
++    var seen: usize = 0;
++    while (seen < 3) {
++        const n = r.reap(&got);
++        if (n == 0) {
++            io.sleep(.fromMilliseconds(1), .awake) catch {};
++            continue;
++        }
++        for (got[0..n]) |c| {
++            switch (c.tag) {
++                0xA => {
++                    try std.testing.expectEqual(@as(i32, 64), c.res);
++                    try std.testing.expectEqualSlices(u8, data[4096..][0..64], &b0);
++                },
++                0xB => {
++                    try std.testing.expectEqual(@as(i32, 256), c.res);
++                    try std.testing.expectEqualSlices(u8, data[0..256], &b1);
++                },
++                0xC => {
++                    try std.testing.expectEqual(@as(i32, 9), c.res);
++                    try std.testing.expectEqualSlices(u8, data[8000..][0..9], &b2);
++                },
++                else => return error.UnexpectedTag,
++            }
++            seen += 1;
++        }
++    }
++    _ = a;
++}
+diff --git a/zig/src/families/dsv41/engram_aio.zig b/zig/src/families/dsv41/engram_aio.zig
+index 970a062f..30048745 100644
+--- a/zig/src/families/dsv41/engram_aio.zig
++++ b/zig/src/families/dsv41/engram_aio.zig
+@@ -5,8 +5,18 @@
+ //! idle round, an AIO submit and reap by the round's own thread ~0.4-0.8 ms for a 6-row window. A touch (a round's
+ //! first rows read only to wake the drive) goes through a thread of its own and copies nothing. The bytes are the
+ //! preads' (engram_io.Pool.gather's).
++//! The reads reach the kernel one of two ways: Linux AIO, or io_uring. The batch bookkeeping below is shared; only how
++//! a batch reaches the kernel differs (core/uring_read.zig). io_uring matters for a file system without its own queued
++//! path -- OpenZFS, which has no aio_read/aio_write since the Linux 4.1 read_iter conversion, so io_submit completes
++//! each read in the submitting thread and a batch runs at queue depth 1 -- and it is forced onto io-wq workers with
++//! IOSQE_ASYNC so that stays true even where the file system ignores IOCB_NOWAIT.
++//!
++//! TF_DS_ENGRAM_URING picks the backend: 1 io_uring, 0 Linux AIO, unset auto -- AIO first, and if the file system turns
++//! out not to queue (queuesAio, probed on the first batch) the ring moves itself to io_uring and says so in the log. A
++//! kernel that refuses io_uring leaves AIO in place with a warning, so nothing fails a boot over it.
+ const std = @import("std");
+ const linux = std.os.linux;
++const uring_read = @import("core").uring_read;
+ const engram_io = @import("engram_io.zig");
+ 
+ pub const block = 4096;
+@@ -35,6 +45,9 @@ const Iocb = extern struct {
+ /// struct io_event.
+ const IoEvent = extern struct { data: u64, obj: u64, res: i64, res2: i64 };
+ 
++/// How a batch reaches the kernel: Linux AIO (`io_submit`), or io_uring when the file system needs it.
++pub const Backend = enum { aio, uring };
++
+ fn ioSetup(n: u32, ctx: *aio_context_t) usize {
+     return linux.syscall2(.io_setup, n, @intFromPtr(ctx));
+ }
+@@ -66,6 +79,12 @@ pub const Aio = struct {
+     gpa: std.mem.Allocator,
+     io: std.Io,
+     ctx: aio_context_t = 0,
++    backend: Backend = .aio,
++    uring: ?uring_read.Ring = null,
++    /// Set when the environment names no backend: the first batch then probes the file system (see queuesAio) and
++    /// upgrades itself to io_uring if `io_submit` turned out not to queue. TF_DS_ENGRAM_URING=1 or =0 decides outright.
++    auto: bool = false,
++    probed: bool = false,
+     ring: []align(block) u8,
+     slots: usize,
+     head: u64 = 0, // reads issued so far (slot = index % slots)
+@@ -75,11 +94,70 @@ pub const Aio = struct {
+     mutex: std.Io.Mutex = .init,
+ 
+     /// The AIO context and a ring of `slots` bounce slots (8 KiB each); error.AioUnavailable when the kernel refuses.
++    /// TF_DS_ENGRAM_URING=1 asks for io_uring first (see initBackend) and falls back to Linux AIO if it is refused.
+     pub fn init(gpa: std.mem.Allocator, io: std.Io, slots: usize) !*Aio {
++        const v = std.c.getenv("TF_DS_ENGRAM_URING");
++        const setting = if (v) |x| std.mem.span(x) else "";
++        if (std.mem.eql(u8, setting, "0")) return initBackend(gpa, io, slots, .aio);
++        if (!std.mem.eql(u8, setting, "")) {
++            if (initBackend(gpa, io, slots, .uring)) |a| return a else |e| switch (e) {
++                error.UringUnavailable => std.log.warn("TF_DS_ENGRAM_URING: io_uring unavailable; using Linux AIO, which a file system without a queued path runs at depth 1", .{}),
++                else => return e,
++            }
++            return initBackend(gpa, io, slots, .aio);
++        }
++        // nothing named: start on AIO and let the first batch decide (queuesAio) -- a file system that queues keeps
++        // the cheaper path, one that does not (OpenZFS) moves to io_uring without anyone setting a flag.
++        const a = try initBackend(gpa, io, slots, .aio);
++        a.auto = true;
++        return a;
++    }
++
++    /// True when this descriptor's file system queues Linux AIO: two reads submitted together come back from
++    /// `io_getevents` still pending if so. When `io_submit` instead blocks until they are done -- OpenZFS has no
++    /// `aio_read`/`aio_write` since the Linux 4.1 read_iter conversion -- every completion is already there and the ring
++    /// can never hold more than one read. The reads are of the file's first two blocks; they are read-only, and the
++    /// first batch pays for them.
++    fn queuesAio(a: *Aio, fd: std.c.fd_t) bool {
++        if (fd < 0 or a.slots < 4) return true;
++        const at = (a.slots - 2) * slot;
++        var cbs: [2]Iocb = .{
++            .{ .data = probe_tag, .lio_opcode = cmd_pread, .fildes = @intCast(fd), .buf = @intFromPtr(a.ring[at..].ptr), .nbytes = block, .offset = 0 },
++            .{ .data = probe_tag + 1, .lio_opcode = cmd_pread, .fildes = @intCast(fd), .buf = @intFromPtr(a.ring[at + slot ..].ptr), .nbytes = block, .offset = block },
++        };
++        var ptrs: [2]*Iocb = .{ &cbs[0], &cbs[1] };
++        var sent: usize = 0;
++        while (sent < 2) {
++            const r = ioSubmit(a.ctx, 2 - sent, ptrs[sent..].ptr);
++            if (r <= 0) return true; // cannot tell; the AIO path's own error handling takes it from here
++            sent += @intCast(r);
++        }
++        var ev: [2]IoEvent = undefined;
++        var zero: linux.timespec = .{ .sec = 0, .nsec = 0 };
++        const ready = ioGetevents(a.ctx, 0, ev.len, &ev, &zero);
++        if (ready >= 2) return false; // both landed inside io_submit: nothing was queued
++        // it does queue: these two are still in flight, so take them before returning
++        while (ioGetevents(a.ctx, 1, ev.len, &ev, &zero) > 0) {}
++        return true;
++    }
++
++    const probe_tag: u64 = 0xFFFF_FFFF_FFFF_0000;
++
++    /// `want` picks the backend and fails rather than falling back (the tests use it; init decides by environment).
++    pub fn initBackend(gpa: std.mem.Allocator, io: std.Io, slots: usize, want: Backend) !*Aio {
+         const a = try gpa.create(Aio);
+         errdefer gpa.destroy(a);
+         a.* = .{ .gpa = gpa, .io = io, .ring = try gpa.alignedAlloc(u8, .fromByteUnits(block), slots * slot), .slots = slots };
+         errdefer gpa.free(a.ring);
++        if (want == .uring) {
++            const entries: u16 = @intCast(std.math.ceilPowerOfTwo(u32, @min(@as(u32, @intCast(@max(slots, 1))), 32768)) catch 32768);
++            a.uring = uring_read.Ring.init(entries) catch |e| switch (e) {
++                error.UringUnavailable => return error.UringUnavailable,
++                else => return e,
++            };
++            a.backend = .uring;
++            return a;
++        }
+         if (linux.errno(ioSetup(@intCast(@min(slots, 65536)), &a.ctx)) != .SUCCESS) return error.AioUnavailable;
+         return a;
+     }
+@@ -89,7 +167,10 @@ pub const Aio = struct {
+         a.mutex.lockUncancelable(a.io);
+         while (a.inFlight()) a.reap();
+         a.mutex.unlock(a.io);
+-        _ = ioDestroy(a.ctx);
++        switch (a.backend) {
++            .aio => _ = ioDestroy(a.ctx),
++            .uring => if (a.uring) |*r| r.deinit(),
++        }
+         var it = a.batches.valueIterator();
+         while (it.next()) |b| a.freeBatch(b.*);
+         a.batches.deinit(a.gpa);
+@@ -114,30 +195,103 @@ pub const Aio = struct {
+     fn reap(a: *Aio) void {
+         var ev: [256]IoEvent = undefined;
+         var zero: linux.timespec = .{ .sec = 0, .nsec = 0 };
++        var cqes: [256]uring_read.Cqe = undefined;
+         while (true) {
+-            const r = ioGetevents(a.ctx, 0, ev.len, &ev, &zero);
+-            if (r <= 0) return;
+-            for (ev[0..@intCast(r)]) |e| {
+-                const id = e.data >> 20;
+-                const j: usize = @intCast(e.data & 0xFFFFF);
+-                const b = a.batches.getPtr(id) orelse continue;
+-                if (e.res < @as(i64, @intCast(b.skew[j] + b.bytes[j]))) {
+-                    b.failed = true;
+-                } else if (b.dst[j]) |d| {
+-                    const at = ((b.first + j) % a.slots) * slot + b.skew[j];
+-                    @memcpy(d[0..b.bytes[j]], a.ring[at..][0..b.bytes[j]]);
+-                }
+-                b.left -= 1;
++            switch (a.backend) {
++                .aio => {
++                    const r = ioGetevents(a.ctx, 0, ev.len, &ev, &zero);
++                    if (r <= 0) return;
++                    for (ev[0..@intCast(r)]) |e| a.complete(e.data, e.res);
++                },
++                .uring => {
++                    const n = if (a.uring) |*r| r.reap(&cqes) else return;
++                    if (n == 0) return;
++                    for (cqes[0..n]) |c| a.complete(c.tag, c.res);
++                },
+             }
+         }
+     }
+ 
++    /// One completion: its row copied out of the bounce ring, its batch counted down.
++    fn complete(a: *Aio, tag: u64, res: i64) void {
++        const id = tag >> 20;
++        const j: usize = @intCast(tag & 0xFFFFF);
++        const b = a.batches.getPtr(id) orelse return;
++        if (res < @as(i64, @intCast(b.skew[j] + b.bytes[j]))) {
++            b.failed = true;
++        } else if (b.dst[j]) |d| {
++            const at = ((b.first + j) % a.slots) * slot + b.skew[j];
++            @memcpy(d[0..b.bytes[j]], a.ring[at..][0..b.bytes[j]]);
++        }
++        b.left -= 1;
++    }
++
++    /// The auto backend's one decision, made on the first batch that has a table descriptor: a file system that does not
++    /// queue `io_submit` gets io_uring instead, with no flag set. Holds `mutex`.
++    fn autoUpgrade(a: *Aio, fd: std.c.fd_t) void {
++        if (!a.auto or a.probed) return;
++        a.probed = true;
++        if (queuesAio(a, fd)) return;
++        const ring = uring_read.Ring.init(@intCast(std.math.ceilPowerOfTwo(u32, @min(@as(u32, @intCast(@max(a.slots, 1))), 32768)) catch 32768)) catch |e| {
++            std.log.warn("engram: io_submit does not queue on this file system (a batch runs at depth 1) and io_uring is unavailable ({s}): a container's seccomp profile refuses io_uring_setup with ENOSYS, so run with --security-opt seccomp=unconfined", .{@errorName(e)});
++            return;
++        };
++        _ = ioDestroy(a.ctx);
++        a.ctx = 0;
++        a.uring = ring;
++        a.backend = .uring;
++        std.log.info("engram: io_submit does not queue on this file system (a batch would run at depth 1): reading through io_uring instead", .{});
++    }
++
++    /// Send a batch's reads to the kernel, whichever backend this ring uses. `ops` are in tag order; a short submit
++    /// marks the rest failed, exactly as the AIO path always has.
++    fn issue(a: *Aio, id: u64, ops: []const uring_read.Op) void {
++        switch (a.backend) {
++            .aio => {
++                const cbs = a.gpa.alloc(Iocb, ops.len) catch return a.unsent(id, ops.len);
++                defer a.gpa.free(cbs);
++                const ptrs = a.gpa.alloc(*Iocb, ops.len) catch return a.unsent(id, ops.len);
++                defer a.gpa.free(ptrs);
++                for (ops, 0..) |op, j| {
++                    cbs[j] = .{
++                        .data = op.tag,
++                        .lio_opcode = cmd_pread,
++                        .fildes = @intCast(op.fd),
++                        .buf = @intFromPtr(op.buf.ptr),
++                        .nbytes = op.buf.len,
++                        .offset = @intCast(op.off),
++                    };
++                    ptrs[j] = &cbs[j];
++                }
++                var sent: usize = 0;
++                while (sent < ops.len) {
++                    const r = ioSubmit(a.ctx, ops.len - sent, ptrs[sent..].ptr);
++                    if (r <= 0) return a.unsent(id, ops.len - sent);
++                    sent += @intCast(r);
++                }
++            },
++            .uring => {
++                const sent = if (a.uring) |*r| r.submit(ops) else return a.unsent(id, ops.len);
++                if (sent < ops.len) a.unsent(id, ops.len - sent);
++            },
++        }
++    }
++
++    fn unsent(a: *Aio, id: u64, n: usize) void {
++        if (n == 0) return;
++        if (a.batches.getPtr(id)) |bp| {
++            bp.left -= n;
++            bp.failed = true;
++        }
++    }
++
+     /// The submission (`mutex` held): rows `ids` of table `t`, a weight then a scale read each, copied into out_w /
+     /// out_s as they complete when given (null: a touch). Returns the batch id.
+     fn submitLocked(a: *Aio, t: engram_io.Table, ids: []const i64, out_w: ?[]u8, out_s: ?[]u8) !u64 {
+         const reads = 2 * ids.len;
+         if (reads > a.slots or reads >= 1 << 20) return error.TooManyRows;
+         if (t.row_w + block > slot or t.row_s + block > slot) return error.RowTooWide;
++        a.autoUpgrade(if (t.fd_wd >= 0) t.fd_wd else t.fd_w);
+         const fd_w = if (t.fd_wd >= 0) t.fd_wd else t.fd_w;
+         const fd_s = if (t.fd_sd >= 0) t.fd_sd else t.fd_s;
+         // the ring's slots [head, head + reads) must be free: reap until no live batch of the last lap holds them
+@@ -166,10 +320,8 @@ pub const Aio = struct {
+             .skew = try a.gpa.alloc(usize, reads),
+             .bytes = try a.gpa.alloc(usize, reads),
+         };
+-        const cbs = try a.gpa.alloc(Iocb, reads);
+-        defer a.gpa.free(cbs);
+-        const ptrs = try a.gpa.alloc(*Iocb, reads);
+-        defer a.gpa.free(ptrs);
++        const ops = try a.gpa.alloc(uring_read.Op, reads);
++        defer a.gpa.free(ops);
+         for (0..reads) |j| {
+             const i = j >> 1;
+             const sc = j & 1 == 1;
+@@ -181,30 +333,18 @@ pub const Aio = struct {
+             b.skew[j] = @intCast(off - lo);
+             b.bytes[j] = rb;
+             b.dst[j] = if (out_w) |w| (if (sc) out_s.?[i * t.row_s ..].ptr else w[i * t.row_w ..].ptr) else null;
+-            cbs[j] = .{
+-                .data = (id << 20) | j,
+-                .lio_opcode = cmd_pread,
+-                .fildes = @intCast(if (sc) fd_s else fd_w),
+-                .buf = @intFromPtr(a.ring[((a.head + j) % a.slots) * slot ..].ptr),
+-                .nbytes = std.mem.alignForward(u64, off + rb - lo, block),
+-                .offset = @intCast(lo),
++            const at = ((a.head + j) % a.slots) * slot;
++            ops[j] = .{
++                .fd = @intCast(if (sc) fd_s else fd_w),
++                .buf = a.ring[at..][0..@intCast(std.mem.alignForward(u64, off + rb - lo, block))],
++                .off = lo,
++                .tag = (id << 20) | j,
+             };
+-            ptrs[j] = &cbs[j];
+         }
+         a.head += reads;
+         try a.batches.put(a.gpa, id, b);
+         try a.live.append(a.gpa, .{ id, b.first });
+-        var sent: usize = 0;
+-        while (sent < reads) {
+-            const r = ioSubmit(a.ctx, reads - sent, ptrs[sent..].ptr);
+-            if (r <= 0) {
+-                const bp = a.batches.getPtr(id).?;
+-                bp.left -= reads - sent; // never submitted
+-                bp.failed = true;
+-                break;
+-            }
+-            sent += @intCast(r);
+-        }
++        a.issue(id, ops);
+         // finished touches leave the bookkeeping (a waited-for batch leaves in wait)
+         var k: usize = 0;
+         while (k < a.live.items.len) {
+@@ -224,6 +364,7 @@ pub const Aio = struct {
+         const reads = ids.len;
+         if (reads > a.slots or reads >= 1 << 20) return error.TooManyRows;
+         if (pk.rec + block > slot) return error.RowTooWide;
++        a.autoUpgrade(if (pk.fd_d >= 0) pk.fd_d else pk.fd);
+         for (ids) |x| if (x < 0 or @as(u64, @intCast(x)) < pk.lo or @as(u64, @intCast(x)) >= pk.hi) return error.RowOutOfRange;
+         const fd = if (pk.fd_d >= 0) pk.fd_d else pk.fd;
+         // the ring's slots [head, head + reads) must be free: reap until no live batch of the last lap holds them
+@@ -251,10 +392,8 @@ pub const Aio = struct {
+             .skew = try a.gpa.alloc(usize, reads),
+             .bytes = try a.gpa.alloc(usize, reads),
+         };
+-        const cbs = try a.gpa.alloc(Iocb, reads);
+-        defer a.gpa.free(cbs);
+-        const ptrs = try a.gpa.alloc(*Iocb, reads);
+-        defer a.gpa.free(ptrs);
++        const ops = try a.gpa.alloc(uring_read.Op, reads);
++        defer a.gpa.free(ops);
+         for (0..reads) |j| {
+             const row: u64 = @intCast(ids[j]);
+             const off = pk.base + (row - pk.lo) * pk.rec;
+@@ -262,30 +401,18 @@ pub const Aio = struct {
+             b.skew[j] = @intCast(off - lo);
+             b.bytes[j] = pk.rec;
+             b.dst[j] = dsts[j];
+-            cbs[j] = .{
+-                .data = (id << 20) | j,
+-                .lio_opcode = cmd_pread,
+-                .fildes = @intCast(fd),
+-                .buf = @intFromPtr(a.ring[((a.head + j) % a.slots) * slot ..].ptr),
+-                .nbytes = std.mem.alignForward(u64, off + pk.rec - lo, block),
+-                .offset = @intCast(lo),
++            const at = ((a.head + j) % a.slots) * slot;
++            ops[j] = .{
++                .fd = @intCast(fd),
++                .buf = a.ring[at..][0..@intCast(std.mem.alignForward(u64, off + pk.rec - lo, block))],
++                .off = lo,
++                .tag = (id << 20) | j,
+             };
+-            ptrs[j] = &cbs[j];
+         }
+         a.head += reads;
+         try a.batches.put(a.gpa, id, b);
+         try a.live.append(a.gpa, .{ id, b.first });
+-        var sent: usize = 0;
+-        while (sent < reads) {
+-            const r = ioSubmit(a.ctx, reads - sent, ptrs[sent..].ptr);
+-            if (r <= 0) {
+-                const bp = a.batches.getPtr(id).?;
+-                bp.left -= reads - sent; // never submitted
+-                bp.failed = true;
+-                break;
+-            }
+-            sent += @intCast(r);
+-        }
++        a.issue(id, ops);
+         return id;
+     }
+ 
+@@ -337,6 +464,80 @@ pub const Aio = struct {
+     }
+ };
+ 
++test "auto mode: the probe agrees with what the ring then does" {
++    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
++    const a = std.testing.allocator;
++    const io = std.testing.io;
++    var tmp = std.testing.tmpDir(.{ .iterate = true });
++    defer tmp.cleanup();
++    try tmp.dir.writeFile(io, .{ .sub_path = "plain.bin", .data = &@as([8192]u8, @splat(7)) });
++    const file = try tmp.dir.openFile(io, "plain.bin", .{});
++    defer file.close(io);
++    const fd: linux.fd_t = file.handle;
++
++    const ring = try Aio.initBackend(a, io, 8, .aio);
++    defer ring.deinit();
++    const queues = Aio.queuesAio(ring, fd);
++    // the probe must not leave a completion behind for a batch to trip over
++    if (!queues) {
++        var ev: [2]IoEvent = undefined;
++        var zero: linux.timespec = .{ .sec = 0, .nsec = 0 };
++        try std.testing.expectEqual(@as(isize, 0), ioGetevents(ring.ctx, 0, ev.len, &ev, &zero));
++    }
++    // an auto ring on this file system ends up on the backend the probe predicts, and both give the pool's bytes
++    const auto = try Aio.init(a, io, 8);
++    defer auto.deinit();
++    try std.testing.expect(auto.auto);
++    auto.autoUpgrade(fd);
++    try std.testing.expectEqual(if (queues) Backend.aio else Backend.uring, auto.backend);
++}
++
++test "io_uring rows equal the pool's, across a ring that wraps" {
++    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
++    const a = std.testing.allocator;
++    const io = std.testing.io;
++    var tmp = std.testing.tmpDir(.{ .iterate = true });
++    defer tmp.cleanup();
++    const rows = 300;
++    var json_buf: [256]u8 = undefined;
++    const json = try std.fmt.bufPrint(&json_buf, "{{\"layers.1.engram.embed.weight\":{{\"dtype\":\"U8\",\"shape\":[{d},100],\"data_offsets\":[0,{d}]}},\"layers.1.engram.embed.scale\":{{\"dtype\":\"U8\",\"shape\":[{d},3],\"data_offsets\":[{d},{d}]}}}}", .{ rows, rows * 100, rows, rows * 100, rows * 103 });
++    var file: std.ArrayList(u8) = .empty;
++    defer file.deinit(a);
++    var len: [8]u8 = undefined;
++    std.mem.writeInt(u64, &len, json.len, .little);
++    try file.appendSlice(a, &len);
++    try file.appendSlice(a, json);
++    for (0..rows * 103) |i| try file.append(a, @intCast((i * 11 + 5) % 251));
++    try tmp.dir.writeFile(io, .{ .sub_path = "engram.safetensors", .data = file.items });
++    const dir = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", &tmp.sub_path });
++    defer a.free(dir);
++    var t = try engram_io.Tables.open(a, io, dir);
++    defer t.close();
++    const tab = t.layers.get(1).?;
++    const pool = try engram_io.Pool.init(a, io, 2);
++    defer pool.deinit(a);
++    const aio = Aio.initBackend(a, io, 32, .uring) catch |e| switch (e) {
++        error.UringUnavailable => return error.SkipZigTest,
++        else => return e,
++    };
++    defer aio.deinit();
++    var prng = std.Random.DefaultPrng.init(11);
++    for (0..12) |round| {
++        var ids: [6]i64 = undefined;
++        for (&ids) |*x| x.* = prng.random().intRangeLessThan(i64, 0, rows);
++        var want_w: [6 * 100]u8 = undefined;
++        var want_s: [6 * 3]u8 = undefined;
++        try pool.gather(tab, &ids, &want_w, &want_s);
++        var got_w: [6 * 100]u8 = @splat(0);
++        var got_s: [6 * 3]u8 = @splat(0);
++        if (round % 3 == 0) try aio.touch(tab, ids[0..2]);
++        const id = try aio.start(tab, &ids, &got_w, &got_s);
++        try aio.wait(id);
++        try std.testing.expectEqualSlices(u8, &want_w, &got_w);
++        try std.testing.expectEqualSlices(u8, &want_s, &got_s);
++    }
++}
++
+ test "AIO rows equal the pool's, across a ring that wraps" {
+     if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+     const a = std.testing.allocator;
+@@ -362,7 +563,7 @@ test "AIO rows equal the pool's, across a ring that wraps" {
+     const tab = t.layers.get(1).?;
+     const pool = try engram_io.Pool.init(a, io, 2);
+     defer pool.deinit(a);
+-    const aio = Aio.init(a, io, 16) catch |e| switch (e) {
++    const aio = Aio.initBackend(a, io, 16, .aio) catch |e| switch (e) {
+         error.AioUnavailable => return error.SkipZigTest,
+         else => return e,
+     };
