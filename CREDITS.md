@@ -325,7 +325,9 @@ BertholomusAI's fork ([bertholomus/TensorFold](https://github.com/bertholomus/Te
   - [PR #26](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/26): the preparation utilities on the runtime image (`scripts/prepare.sh`), with
     `tests/test_prepare_image.py`.
 - Contributed by **Christopher A. Williamson ([cawilliamson](https://github.com/cawilliamson))**: [PR #38](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/38),
-  [`docs/engram-zfs-dataset.md`](docs/engram-zfs-dataset.md), with its measurements.
+  [`docs/engram-zfs-dataset.md`](docs/engram-zfs-dataset.md), with its measurements;
+  [PR #56](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/56): `0055`, the io_uring backend for the
+  round's Engram reads (`engram_aio.zig`, `TF_DS_ENGRAM_URING`), with `tests/test_engram_uring.py`.
 - Written by **Hector Isaza ([hecisaza](https://github.com/hecisaza))** with the verify step of
   [inference-agent-kit](https://github.com/hecisaza/inference-agent-kit): the claim scripts in
   [`tools/claims`](tools/claims), from
