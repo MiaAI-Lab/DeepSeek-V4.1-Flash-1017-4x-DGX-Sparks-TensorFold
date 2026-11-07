@@ -43,11 +43,37 @@ packing, rank 0 reads the tables from its own checkpoint folder (`HF_CACHE`), no
 | `atime=off` | A read must not become a write. |
 | `com.sun:auto-snapshot=false` | A reproducible copy of a checkpoint's tables is never worth a snapshot. |
 
+## Not a dataset property: the vdev's sync read limit
+
+A dataset setting cannot help if the reads never reach the disk while they wait their turn, and on the recipe's path
+they can. The tables are opened `O_DIRECT`, which ZFS issues as a **sync** read, and the per-vdev cap on sync reads is
+`10` by default (`zfs_vdev_sync_read_max_active`). The reader pool is deeper than that for a reason -- its threads only
+overlap if the vdev accepts them -- so at the default the pool queues behind the cap:
+
+| `zfs_vdev_sync_read_max_active` / `_min_active` | 2048 random rows, layer 1 | rows/s |
+| --- | --- | --- |
+| 10 / 10 (default) | 27.2 ms | ~75,000 |
+| **64 / 32** | **14.3 ms** | **~143,000** |
+| 128 / 64 | 14.3 ms | ~143,000 |
+
+Set it in the module options (e.g. `options zfs zfs_vdev_sync_read_max_active=64 zfs_vdev_sync_read_min_active=32`);
+`zfs_vdev_sync_read_min_active` tracks it so the minimum does not starve the queue. Deeper than 64/32 bought nothing on
+one NVMe. Two other knobs were tried against the same workload and did **not** move it: `direct=always` on the dataset
+(ZFS 2.4 Direct IO, 14.0 ms) and `zfs_prefetch_disable=1` (14.4 ms; leave prefetch on, the checkpoint load uses it).
+
 ## What this does not fix
 
-ZFS is not the only layer. On this kernel Linux AIO completes inside `io_submit` (1.1k reads a second at queue depth
-1, re-measured 2026-10-26), so `ENGRAM_AIO=1`'s ring carries the concurrency and the reader pool's depth does the rest;
-neither is a dataset setting.
+ZFS is not the only layer, and the one thing a dataset cannot give back is asynchronous kernel AIO. On this kernel
+Linux AIO completes inside `io_submit` (1.1k reads a second at queue depth 1, re-measured 2026-10-26) because ZFS has
+no `aio_read`/`aio_write` since the Linux 4.1 `read_iter` conversion, so `ENGRAM_AIO=1` as shipped runs a batch at depth
+1: measured here, 2048 random rows took 2.4-3.9 s against 14 ms for the reader pool.
+
+io_uring is the way out (patch `0055`): it hands a request the file system cannot complete in the caller's context to
+the kernel's io-wq workers, so the batch overlaps whatever ZFS does. On this dataset you do not have to ask for it.
+`TF_DS_ENGRAM_URING` unset means auto — the ring's first batch submits two reads and checks `io_getevents`: completions
+already there mean `io_submit` never queued, which is exactly what ZFS does, and the ring switches to io_uring and says
+so in the log; completions still in flight mean the AIO path is fine and it stays there. `=1` and `=0` force a backend.
+Both paths are unit-tested row-for-row against the reader pool.
 
 A dataset's `recordsize` also cannot help a read that never reaches the disk, so check the descriptors before blaming
 the pool: `tf-dsv41-engram-check ENGRAM_DIR --rows 4096` reports, per layer, whether the reader opened the tables
@@ -55,5 +81,6 @@ through O_DIRECT (`gather_rows2_direct_at`) or fell back to the buffered path, w
 A filesystem that refuses O_DIRECT silently gives the buffered path, and the buffered path reads through the page
 cache at the dataset's recordsize, which is where the defaults cost their seconds.
 
-Provenance: one machine, one pool layout, the recipe's default Engram path and its packed alternative. Treat the
-absolute row counts as one Spark's and the ratios as the finding.
+Provenance: one machine, one pool layout, the recipe's default Engram path and its packed alternative; the vdev and
+`direct` numbers above come from one Spark with the tables on their dataset (median of six runs each, 2026-11-06).
+Treat the absolute row counts as one Spark's and the ratios as the finding.
